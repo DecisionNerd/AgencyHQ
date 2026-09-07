@@ -16,6 +16,7 @@ gets created once an operator runs the commands below.
 | `docker-compose.yml` | The webapp stack: `webapp`, `postgres`, `redis`, `electric`, `clickhouse`, `registry`, `minio`, and the `s2`/`s2-init` pair (self-hosted Realtime streams v2). Vendored from upstream Trigger.dev v4.5.16 with a small set of edits — see `UPSTREAM.md`. |
 | `.env.example` | Every environment variable the compose file reads, with pinned image-tag defaults and blank secrets. Copy this to `.env` before starting anything. |
 | `scripts/gen-env.sh` | Creates `.env` from `.env.example` if missing, and fills every blank secret with `openssl rand -hex 16`. Safe to re-run: it never overwrites a secret that already has a value. |
+| `scripts/bootstrap.sh` | Signs into the running dashboard (dev-mode magic link), finds or creates an org and project, mints a Personal Access Token, and writes `trigger/.env` — see "Bootstrap" below. |
 | `UPSTREAM.md` | Upstream source URLs, the date they were read, and every edit made vs. the vendored files, with a reason for each. |
 
 ## Service list
@@ -89,6 +90,32 @@ been used to sign in:
    (`proj_…`) and the **Dev API key** (`tr_dev_…`).
 4. Paste both into `trigger/.env` (see [`trigger/README.md`](../../trigger/README.md)
    for the exact variable names that consumes).
+
+### Bootstrap
+
+`scripts/bootstrap.sh` automates the sign-in-and-create steps above (dev-mode
+magic-link login, org, project, Dev API key, and Personal Access Token) and
+writes the results into `trigger/.env`, modeled on how a sibling project
+automates the same dashboard bootstrap.
+
+It requires `infra/trigger/.env` to have dev-mode login enabled — set
+`NODE_ENV=development`, `APP_ENV=development`, and `ADMIN_EMAILS` (see the
+"Dev-mode local login" section of `.env.example`) and (re)start the webapp
+with them before running the script. Those three variables make the webapp
+print the magic link to its own container logs instead of emailing it, and
+restrict sign-in to the one bootstrap address — they are for a local,
+single-operator dashboard only and must not be set on a shared deployment.
+
+```sh
+sh infra/trigger/scripts/bootstrap.sh --dry-run   # print the plan, write nothing
+sh infra/trigger/scripts/bootstrap.sh             # sign in and bootstrap for real
+```
+
+The script finds an existing org/project by slug prefix before creating one,
+so re-running it is safe. It never prints a token or key value — only the
+variable names it wrote and the org/project slugs. Run
+`sh infra/trigger/scripts/bootstrap.sh --help` for the full flag list
+(`--org`, `--project`, `--email`, `--env-file`, `--token-name`).
 
 ### CLI login
 
