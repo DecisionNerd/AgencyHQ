@@ -197,8 +197,8 @@ export const ReviewRowSchema = z
     diff_digest: NullableText,
     criteria_digest: NullableText,
     profile_digest: NullableText,
-    reviewer_model: NullableText,
-    profile: NullableText,
+    reviewer_model: z.string(),
+    profile: z.string(),
     findings: z.unknown(),
   })
   .merge(Timestamps);
@@ -212,8 +212,8 @@ export type ReviewRow = z.infer<typeof ReviewRowSchema>;
 export const DecisionRowSchema = z
   .object({
     id: z.string(),
-    kind: NullableText,
-    actor: NullableText,
+    kind: z.string(),
+    actor: z.string(),
     proposal_digest: NullableText,
     authority_version: NullableText,
     work_item_id: NullableText,
@@ -255,9 +255,9 @@ export const FindingRowSchema = z
   .object({
     id: z.string(),
     attempt_id: NullableText,
-    severity: NullableText,
-    kind: NullableText,
-    description: NullableText,
+    severity: z.string(),
+    kind: z.string(),
+    description: z.string(),
     evidence: NullableText,
     disposition: NullableText,
   })
@@ -272,11 +272,11 @@ export type FindingRow = z.infer<typeof FindingRowSchema>;
 export const FailureRowSchema = z
   .object({
     id: z.string(),
-    class: NullableText,
-    phase: NullableText,
+    class: z.string(),
+    phase: z.string(),
     attempt_id: NullableText,
     run_id: NullableText,
-    cause: NullableText,
+    cause: z.string(),
     evidence: NullableText,
   })
   .merge(Timestamps);
@@ -307,7 +307,7 @@ export type TransitionRow = z.infer<typeof TransitionRowSchema>;
 
 export const CommandRowSchema = z.object({
   command_id: z.string(),
-  kind: NullableText,
+  kind: z.string(),
   result: z.unknown().nullable(),
   at: z.date().nullable(),
   created_at: z.date(),
