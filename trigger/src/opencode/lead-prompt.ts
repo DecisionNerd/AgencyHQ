@@ -50,6 +50,15 @@ function authorityParagraph(authority: Authority): string {
  *
  * Results are deterministic (no timestamps, no random data).
  */
+function profileSection(payload: LeadPlanPayload): string {
+  const ids = payload.profileCatalog ?? [];
+  const lines =
+    ids.length > 0
+      ? ids.map((id) => `- ${id}`).join("\n")
+      : '- (none configured: return kind "needs_facts")';
+  return `\nAVAILABLE VERIFICATION PROFILES (choose profileId from this list only):\n${lines}\n`;
+}
+
 export function buildLeadPlanPrompt(
   payload: LeadPlanPayload,
   repoContext: RepoContext,
@@ -120,7 +129,7 @@ The proposal describes ONE step: a worker attempt in a fresh worktree at the
 base revision. The contract fields map as follows:
 
   criteria[]    — ordered acceptance criteria; at least one required
-  profileId     — a short human-readable name for this plan
+  profileId     — EXACTLY one id from AVAILABLE VERIFICATION PROFILES below; its checks become the frozen verification for this contract (never invent a name)
   changeClass   — "editorial" | "behavior" | "shared_interface"
   review        — "none" | "lead_inspection" | "adversarial" | "adversarial_distinct_model"
   boundary      — "artifact" | "merge" | "deploy" (what the worker produces)
@@ -176,5 +185,8 @@ base revision. The contract fields map as follows:
 
   const userPrompt = lines.join("\n");
 
-  return { systemContext, userPrompt };
+  return {
+    systemContext: systemContext + profileSection(payload),
+    userPrompt,
+  };
 }

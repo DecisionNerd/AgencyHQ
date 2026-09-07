@@ -22,6 +22,8 @@ export const LeadPlanPayloadSchema = z.object({
   authority: AuthoritySchema,
   /** Optional per-work-item narrowing of the authority. */
   narrowing: AuthorityNarrowingSchema.optional(),
+  /** Verification profile ids the Lead may select from (project catalog). */
+  profileCatalog: z.array(z.string().min(1)).optional(),
   operatorIntent: z.string().min(1),
   /** Optional reproduction of a known defect. */
   defect: z.string().optional(),

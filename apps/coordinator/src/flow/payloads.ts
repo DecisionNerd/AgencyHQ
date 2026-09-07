@@ -34,6 +34,7 @@ interface ProjectRecord {
   worktree_base: string | null;
   authority: Authority;
   authority_version: string;
+  profile_catalog?: unknown;
 }
 
 interface WorkItemRecord {
@@ -86,6 +87,9 @@ export function leadPlanPayload(
     baseRevision: opts.baseRevision,
     worktreeBase: opts.worktreeBase,
     authority: project.authority,
+    profileCatalog: Array.isArray(project.profile_catalog)
+      ? (project.profile_catalog as string[])
+      : ["node-pnpm-v1"],
     operatorIntent: workItem.intent,
     ...(workItem.defect ? { defect: workItem.defect } : {}),
     model: opts.model,

@@ -35,8 +35,8 @@ export async function seedProjectAndWorkItem(
 
   await client.query(
     `INSERT INTO projects
-       (id, remote, clone_path, worktree_base, allowed_refs, authority, authority_version)
-     VALUES ($1, NULL, '/repo', '/worktrees', $2::jsonb, $3::jsonb, '1')`,
+       (id, remote, clone_path, worktree_base, allowed_refs, authority, authority_version, profile_catalog)
+     VALUES ($1, NULL, '/repo', '/worktrees', $2::jsonb, $3::jsonb, '1', '["default"]'::jsonb)`,
     [
       projectId,
       JSON.stringify({ main: "0000000000000000000000000000000000000000" }),

@@ -75,6 +75,7 @@ interface ProjectRow {
   worktree_base: string | null;
   authority: Authority;
   authority_version: string;
+  profile_catalog?: unknown;
   allowed_refs: unknown;
 }
 
@@ -448,7 +449,41 @@ export class BoundedRepairFlow {
         return;
       }
 
-      const resolvedProfile = await profileResolver(proposal.profileId);
+      const catalog = Array.isArray(projectRow.profile_catalog)
+        ? (projectRow.profile_catalog as string[])
+        : [];
+      let resolvedProfile: Awaited<ReturnType<typeof profileResolver>> | null = null;
+      if (catalog.includes(proposal.profileId)) {
+        try {
+          resolvedProfile = await profileResolver(proposal.profileId);
+        } catch {
+          resolvedProfile = null;
+        }
+      }
+      if (!resolvedProfile) {
+        // A profile outside the project catalog is outside authority (the
+        // catalog is the ceiling for verification); record a pending human
+        // decision rather than freezing a contract whose checks do not exist.
+        // Observed 2026-09-07: the Lead invented "reject-empty-parser-input".
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO decisions (id, kind, actor, work_item_id, outcome, at)
+           VALUES ($1, 'plan', 'coordinator', $2, 'pending_human', $3)`,
+          [String(decisionId), workItemId, at],
+        );
+        await client.query("COMMIT");
+        await completeCommand(client, commandId, {
+          decisionId: String(decisionId),
+          violations: [
+            {
+              code: "PROFILE_NOT_IN_CATALOG",
+              path: "profileId",
+              detail: `${proposal.profileId} is not in the project catalog [${catalog.join(", ")}]`,
+            },
+          ],
+        });
+        return;
+      }
       const profileDigest = resolvedProfile.digest as Digest;
       const criteriaDigest = digestOf(criteriaDigestInput(proposal.criteria)) as Digest;
       const baseRevision = await baseRevisionFromProject(projectRow);
