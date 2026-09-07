@@ -12,7 +12,7 @@
  * Prints JSON { projectId, workItemId } to stdout.
  */
 
-import { execFile as execFileCb } from "node:child_process";
+import { execFile as execFileCb, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { HOST_TRIAL_AUTHORITY } from "@agencyhq/contracts";
 import { createPool, insertProject, insertWorkItem, runMigrations } from "@agencyhq/db";
@@ -105,12 +105,15 @@ try {
     const remote = await resolveRemote(repo);
 
     projectId = newId("prj");
+    const headRevision = execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
     await insertProject(client, {
       id: projectId,
       remote: remote,
       clone_path: repo,
       worktree_base: worktreeBase,
-      allowed_refs: { main: "0000000000000000000000000000000000000000" },
+      allowed_refs: { main: headRevision },
       profile_catalog: ["node-pnpm-v1", "minimal-v1"],
       authority: authority === "host-trial" ? HOST_TRIAL_AUTHORITY : HOST_TRIAL_AUTHORITY,
       authority_version: "1",

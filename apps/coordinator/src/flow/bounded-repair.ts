@@ -11,6 +11,9 @@
  * - No @trigger.dev/sdk or @opencode-ai/sdk imports.
  */
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
 import type {
   Authority,
   BoundaryKind,
@@ -153,16 +156,30 @@ type Pool = ReturnType<typeof createPool>;
 // Helpers
 // ---------------------------------------------------------------------------
 
-function baseRevisionFromProject(projectRow: ProjectRow): string {
+const execFileAsync = promisify(execFile);
+
+async function baseRevisionFromProject(projectRow: ProjectRow): Promise<string> {
   if (
     projectRow.allowed_refs &&
     typeof projectRow.allowed_refs === "object" &&
     "main" in (projectRow.allowed_refs as Record<string, unknown>)
   ) {
     const v = (projectRow.allowed_refs as Record<string, string>).main;
-    if (typeof v === "string") return v;
+    if (typeof v === "string" && /^[0-9a-f]{40}$/.test(v)) return v;
   }
-  return "0000000000000000000000000000000000000000";
+  // No stored revision: the base is the clone's current HEAD (host profile,
+  // one clone per project). Observed 2026-09-07 in the Slice 3 trial: a zero
+  // revision made the Lead worktree add fail before any model call.
+  if (projectRow.clone_path) {
+    const { stdout } = await execFileAsync("git", [
+      "-C",
+      projectRow.clone_path,
+      "rev-parse",
+      "HEAD",
+    ]);
+    return stdout.trim();
+  }
+  throw new Error(`project ${projectRow.id} has no base revision and no clone path`);
 }
 
 async function loadProject(pool: Pool, projectId: string): Promise<ProjectRow> {
@@ -285,7 +302,7 @@ export class BoundedRepairFlow {
 
       const wiRow = await loadWorkItem(pool, workItemId);
       const projectRow = await loadProject(pool, wiRow.project_id);
-      const baseRevision = baseRevisionFromProject(projectRow);
+      const baseRevision = await baseRevisionFromProject(projectRow);
 
       const payload = LeadPlanPayloadSchema.parse({
         workItemId: wiRow.id,
@@ -434,7 +451,7 @@ export class BoundedRepairFlow {
       const resolvedProfile = await profileResolver(proposal.profileId);
       const profileDigest = resolvedProfile.digest as Digest;
       const criteriaDigest = digestOf(criteriaDigestInput(proposal.criteria)) as Digest;
-      const baseRevision = baseRevisionFromProject(projectRow);
+      const baseRevision = await baseRevisionFromProject(projectRow);
 
       const contractId = ids.next("sc") as StepContractId;
 

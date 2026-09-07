@@ -103,16 +103,24 @@ export class Reconciler {
           } else if (intent.task === TASK_IDS.leadAccept) {
             await this.flow.onAcceptFinal(obs, commandId);
           } else if (intent.task === TASK_IDS.leadPlan) {
-            // Parse output and route
-            if (obs.output !== undefined && obs.output !== null) {
-              const parsed = parseLeadPlanOutput(obs.output);
-              if (parsed) {
-                await this.flow.onLeadPlanOutput(intent.id, parsed, commandId);
-              }
+            const parsed =
+              obs.status === "COMPLETED" && obs.output !== undefined && obs.output !== null
+                ? parseLeadPlanOutput(obs.output)
+                : null;
+            if (parsed) {
+              await this.flow.onLeadPlanOutput(intent.id, parsed, commandId);
+            } else {
+              // A Lead run that failed or produced no parseable output is an
+              // execution failure of the plan step: record it and close the
+              // intent so the reconciler stops re-polling it (observed
+              // 2026-09-07: a FAILED lead.plan run stayed "triggered" forever).
+              await this.recordIntentFailure(intent.id, "plan", obs);
+              continue;
             }
           }
-        } catch {
-          // Handler failure — log but don't stop polling
+          await this.closeIntent(intent.id, "observed");
+        } catch (error: unknown) {
+          console.error("[reconciler] handler failed", intent.task, intent.id, error);
         }
       }
 
@@ -121,6 +129,47 @@ export class Reconciler {
       this._pollHealthy = false;
     } finally {
       this._lastPollAt = new Date().toISOString();
+    }
+  }
+
+  /** Mark an intent no longer open once its final observation was routed. */
+  private async closeIntent(intentId: string, status: "observed" | "failed"): Promise<void> {
+    const client = await this.deps.pool.connect();
+    try {
+      await client.query(
+        "UPDATE dispatch_intents SET status = $2, updated_at = now() WHERE id = $1 AND status = 'triggered'",
+        [intentId, status],
+      );
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Record an execution failure for a task run that ended without usable output. */
+  private async recordIntentFailure(
+    intentId: string,
+    phase: string,
+    obs: RunObservation,
+  ): Promise<void> {
+    const client = await this.deps.pool.connect();
+    try {
+      await client.query(
+        `INSERT INTO failures (id, class, phase, run_id, cause, evidence)
+         VALUES ($1, 'execution', $2, $3, $4, $5)`,
+        [
+          this.deps.ids.next("fl"),
+          phase,
+          obs.runId,
+          obs.error?.message?.slice(0, 500) ?? `run ${obs.status} without output`,
+          JSON.stringify({ status: obs.status, observedAt: obs.observedAt }),
+        ],
+      );
+      await client.query(
+        "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+        [intentId],
+      );
+    } finally {
+      client.release();
     }
   }
 
