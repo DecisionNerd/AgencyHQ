@@ -141,3 +141,10 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Trigger.dev
+.trigger/
+
+# Claude Code worktrees
+.claude/worktrees/
+node_modules
