@@ -72,6 +72,30 @@ export function resolveWorkerRuleset(payload: Pick<WorkerAttemptPayload, "permis
   return { ruleset, source: "contract" };
 }
 
+// ---------------------------------------------------------------------------
+// Model resolution — no Trigger SDK usage
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the worker's model string from payload or environment.
+ *
+ * Resolution order: payload.model → AGENCYHQ_OPENCODE_MODEL env var.
+ * Throws a plain `Error` when neither is set; the task converts this into an
+ * `AbortTaskRunError` (setup failure) before any spawn.
+ */
+export function resolveModel(args: {
+  payloadModel: string | undefined | null;
+  envModel: string | undefined;
+}): string {
+  const m = args.payloadModel ?? args.envModel;
+  if (!m) {
+    throw new Error(
+      "worker.attempt setup error: no model configured — set payload.model or AGENCYHQ_OPENCODE_MODEL",
+    );
+  }
+  return m;
+}
+
 /** Where an attempt's worktree lives: `<worktreeBase>/attempts/<attemptId>`. */
 export function resolveWorktreePath(args: { worktreeBase: string; attemptId: string }): string {
   return `${args.worktreeBase}/attempts/${args.attemptId}`;

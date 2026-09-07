@@ -50,12 +50,11 @@ import {
   getRunState,
   outcomeFromViolations,
   registerRunState,
+  resolveModel,
   resolveRunDir,
   resolveWorkerRuleset,
   resolveWorktreePath,
 } from "./worker-attempt-core.ts";
-
-const DEFAULT_MODEL = "openai/gpt-5.6-terra";
 
 /** Adapter soft deadline before Trigger's hard maxDuration. Observed
  * 2026-09-07 (trial item 3, trigger.dev 4.5.16 dev): on maxDuration the
@@ -198,7 +197,18 @@ export const workerAttempt = task({
     await worktreeAdd({ repoPath: payload.repoPath, worktreePath, rev: payload.baseRev });
     metadata.set("phase", "worktree_ready");
 
-    const model = payload.model ?? process.env.AGENCYHQ_OPENCODE_MODEL ?? DEFAULT_MODEL;
+    // Resolve the model — payload.model takes priority, then AGENCYHQ_OPENCODE_MODEL;
+    // neither being set is a setup failure (AbortTaskRunError, no retry).
+    let model: string;
+    try {
+      model = resolveModel({
+        payloadModel: payload.model,
+        envModel: process.env.AGENCYHQ_OPENCODE_MODEL,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new AbortTaskRunError(message);
+    }
 
     // Use the contract's permission ruleset (always required; always-deny entries
     // are merged on top for defense-in-depth so a malformed payload cannot widen

@@ -13,6 +13,7 @@ import {
   getRunState,
   outcomeFromViolations,
   registerRunState,
+  resolveModel,
   resolveRunDir,
   resolveWorkerRuleset,
   resolveWorktreePath,
@@ -402,4 +403,54 @@ test("writeRunConfig: permission field in opencode.worker.json matches the rules
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// resolveModel: CR-9
+// ---------------------------------------------------------------------------
+
+test("resolveModel: returns payloadModel when both payload and env are set (payload wins)", () => {
+  const result = resolveModel({
+    payloadModel: "provider/model-payload",
+    envModel: "provider/model-env",
+  });
+  assert.equal(result, "provider/model-payload");
+});
+
+test("resolveModel: returns envModel when payloadModel is undefined", () => {
+  const result = resolveModel({ payloadModel: undefined, envModel: "provider/model-env" });
+  assert.equal(result, "provider/model-env");
+});
+
+test("resolveModel: returns envModel when payloadModel is null", () => {
+  const result = resolveModel({ payloadModel: null, envModel: "provider/model-env" });
+  assert.equal(result, "provider/model-env");
+});
+
+test("resolveModel: throws when both payloadModel and envModel are absent", () => {
+  assert.throws(
+    () => resolveModel({ payloadModel: undefined, envModel: undefined }),
+    /no model configured/,
+  );
+});
+
+test("resolveModel: throws when payloadModel is null and envModel is undefined", () => {
+  assert.throws(
+    () => resolveModel({ payloadModel: null, envModel: undefined }),
+    /no model configured/,
+  );
+});
+
+test("resolveModel: error message references payload.model and AGENCYHQ_OPENCODE_MODEL", () => {
+  let message = "";
+  try {
+    resolveModel({ payloadModel: undefined, envModel: undefined });
+  } catch (e: unknown) {
+    message = e instanceof Error ? e.message : String(e);
+  }
+  assert.ok(message.includes("payload.model"), "error should mention payload.model");
+  assert.ok(
+    message.includes("AGENCYHQ_OPENCODE_MODEL"),
+    "error should mention AGENCYHQ_OPENCODE_MODEL",
+  );
 });

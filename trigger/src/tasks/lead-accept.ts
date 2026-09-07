@@ -5,6 +5,8 @@
 // dispositions for all non-blocking findings.
 // Outputs are proposals; the coordinator validates them deterministically.
 
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import type { LeadAcceptPayload } from "@agencyhq/contracts";
 import { LeadAcceptPayloadSchema } from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
@@ -50,6 +52,8 @@ export const leadAccept = task({
           ...input,
           variant: input.variant ?? variant,
         }),
+      mkdtemp: (prefix: string) => mkdtemp(`${tmpdir()}/${prefix}`),
+      rmdir: (path: string) => rm(path, { recursive: true, force: true }),
     });
 
     if ("kind" in result && result.kind === "invalid_output") {

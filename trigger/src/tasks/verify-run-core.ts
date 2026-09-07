@@ -75,6 +75,17 @@ export type RunVerificationOutput = VerifyRunOutput & {
   integrity: {
     diffDigestMatches: boolean;
     tamperedPaths: string[];
+    /**
+     * Which source supplied the protected-paths list used for tamper detection.
+     * - "payload": the coordinator sent an explicit `protectedPaths` field (the
+     *   normal production path, ADR H-6).
+     * - "default": the coordinator did not send `protectedPaths` (older payload;
+     *   the domain `DEFAULT_PROTECTED_PATHS` list was used as a fallback).
+     *
+     * Recorded so the coordinator's evidence is explicit about which list
+     * governed tamper detection for this verification run.
+     */
+    protectedPathsSource: "payload" | "default";
   };
 };
 
@@ -158,7 +169,9 @@ export async function runVerification(
       );
       return {
         results,
-        integrity: { diffDigestMatches: false, tamperedPaths: [] },
+        // protectedPathsSource is not meaningful on a digest-mismatch path since
+        // tamper detection is skipped; use "default" as a safe sentinel.
+        integrity: { diffDigestMatches: false, tamperedPaths: [], protectedPathsSource: "default" },
       };
     }
 
@@ -167,9 +180,13 @@ export async function runVerification(
       worktreePath,
       baseRev: payload.baseRevision,
     });
-    // F-6: use the payload's frozen protectedPaths (from the profile, set by the
+    // H-6: use the payload's frozen protectedPaths (from the profile, set by the
     // coordinator) as the single source of truth. Fall back to the domain default
     // only when the coordinator did not supply the field (older payloads).
+    // Record which source was used in the output so the coordinator's evidence
+    // is explicit about which list governed tamper detection.
+    const protectedPathsSource: "payload" | "default" =
+      payload.protectedPaths !== undefined ? "payload" : "default";
     const tamperedFindings = detectVerifierTampering(
       changed,
       payload.protectedPaths ?? DEFAULT_PROTECTED_PATHS,
@@ -213,7 +230,7 @@ export async function runVerification(
 
     return {
       results: validated,
-      integrity: { diffDigestMatches: true, tamperedPaths },
+      integrity: { diffDigestMatches: true, tamperedPaths, protectedPathsSource },
     };
   } finally {
     // Verification worktrees are disposable; the attempt worktree is the
