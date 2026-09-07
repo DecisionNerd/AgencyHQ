@@ -118,3 +118,13 @@ survivors and the worktree retained; item 4 checks a `git push` is blocked
 paths (`../`, `/tmp/...`, a denied in-worktree path) are quarantined, and
 that the `task` tool is denied. Each item prints `EVIDENCE ...` lines and one
 final `RESULT item=<n> PASS|FAIL reason=...` line.
+## Trial
+
+Trial items 1–4 ran against a live `trigger dev` on 2026-09-07 using Trigger.dev
+4.5.16, OpenCode 1.18.29, and Node 24.16.0. Items 1–4 PASS. The full record,
+including earlier failing runs and the adapter changes they prompted, is in
+[docs/engineering/trials/2026-09-slice1.md](../docs/engineering/trials/2026-09-slice1.md).
+Items 5–7 require the Slice 2 domain kernel and have not run.
+
+The trial script is `scripts/trial.ts`; run one item at a time with
+`pnpm trial <item>` once `trigger dev` and the webapp stack are running.

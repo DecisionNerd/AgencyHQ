@@ -128,7 +128,9 @@ and image versions on the real self-hosted stack:
    human Approval, and show it in the minimal operator view.
 
 Deterministic fakes cover these in CI; the recorded real trial qualifies the
-version set. No trial has run yet.
+version set. Items 1–4 ran on 2026-09-07 with Trigger.dev 4.5.16, OpenCode
+1.18.29, and Node 24.16.0; the full record is in
+[trials/2026-09-slice1.md](trials/2026-09-slice1.md). Items 5–7 have not run.
 
 ## Baseline check
 

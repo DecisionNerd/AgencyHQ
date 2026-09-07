@@ -4,7 +4,7 @@
 - Date: 2026-09-07
 - Extends: ADR-0004 (simplifies the replacement gate by removing worker-side
   external effects) and ADR-0005.
-- Implementation status: Planned; qualified by the Slice 1 execution trial.
+- Implementation status: Slice 1 spike implemented; qualified by the Slice 1 execution trial on 2026-09-07 (items 1–4), see [../trials/2026-09-slice1.md](../trials/2026-09-slice1.md).
 
 ## Context
 

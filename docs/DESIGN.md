@@ -43,7 +43,7 @@ The first executable slice needs a minimal view for this journey:
 5. Pause explains that no new steps start and the current step may finish. Stop
    shows requested/stopping until Trigger reports a final run status, then
    stopped. A stopped worker cannot have touched a shared ref; any checkpoint
-   ref it pushed remains visible and is not implied discarded.
+   ref it committed remains visible and is not implied discarded.
 
 The acceptance scenario is an operator who can correctly identify what advanced,
 what needs them, what continues, and why completion is justified without opening

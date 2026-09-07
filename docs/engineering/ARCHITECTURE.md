@@ -134,11 +134,15 @@ clients. `trigger/` and `packages/db` depend on `packages/contracts` and
 ## Deployment shape
 
 Host profile: one AgencyHQ process (web + coordinator), one AgencyHQ Postgres,
-the Trigger webapp stack (webapp, Postgres, Redis, Electric, registry, object
-storage, socket proxy; ClickHouse optional), and `trigger dev` kept running on
-the OpenCode host. No supervisor or worker machine. AgencyHQ and Trigger never
+the Trigger webapp stack (webapp, Postgres, Redis, Electric, ClickHouse, S2
+realtime streams, registry, object storage), and `trigger dev` kept running on
+the OpenCode host. The Docker socket proxy belongs to the worker stack and is
+not deployed on the host profile. No worker machine. AgencyHQ and Trigger never
 share a database or credentials; AgencyHQ uses only Trigger's SDK and
-management API.
+management API. On the host profile, the Trigger API reports a final run status
+before the adapter finishes cleanup; confirmation comes from the adapter's stop
+record on disk (`<runDir>/stop.ndjson`), not from run status alone — see the
+[Slice 1 execution trial](trials/2026-09-slice1.md).
 
 ## Security baseline
 

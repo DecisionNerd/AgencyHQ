@@ -25,8 +25,11 @@ on it.
   `maxDuration` behave as documented.
 - Record results. If the contract cannot be met, supersede ADR-0005 with the
   evidence before any further slice.
+- Outcome (2026-09-07): items 1–4 PASS; contract held on the host profile;
+  ADR-0005 and ADR-0007 stand. Full record:
+  [trials/2026-09-slice1.md](../engineering/trials/2026-09-slice1.md).
 
-## Slice 2 — domain kernel and ledger
+## Slice 2 — domain kernel and ledger (current)
 
 - Implement the slice-2 aggregates in `packages/domain` with the authority
   subset check, transition validation, failure classification over Trigger

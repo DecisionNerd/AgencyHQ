@@ -15,7 +15,7 @@ contracts are deliberate; product implementation has not started.
 | Engineering judgment: definition of done, review, acceptance proposals | The Lead — OpenCode sessions in a read-only agent, validated by the coordinator |
 | Execution: queues, isolation, limits, retries, cancellation, run status, logs, realtime | Self-hosted Trigger.dev |
 | Coding-agent execution and model/provider abstraction | OpenCode |
-| Code, branches, commits, diffs | Git; attempt refs pushed by task adapters, shared refs by integration tasks only |
+| Code, branches, commits, diffs | Git; attempt and checkpoint refs committed locally by task adapters; shared refs pushed only by integration tasks |
 
 Trigger.dev is trusted for how work runs and whether it is still running. It is
 never trusted for whether work is done. OpenCode is the agent runtime, not the

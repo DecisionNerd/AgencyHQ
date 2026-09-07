@@ -76,10 +76,18 @@ Because workers cannot cause external effects (ADR-0007), replacement is short:
    sends SIGTERM then SIGKILL to the OpenCode process group, and records
    whether any process survived. `runs.cancel` also cancels child runs.
 3. **Confirm.** Subscribe until the run status is final and the adapter's
-   last metadata reports no survivors. The UI shows *stopping* until then and
-   *stopped* after. If the adapter could not confirm (for example the host
-   itself is unreachable), the state is *uncertain* and no replacement runs on
-   that repository.
+   last metadata reports no survivors. On the host profile, the Trigger API
+   reports a final status before adapter cleanup completes (observed 22–38 ms
+   after `runs.cancel` in the Slice 1 trial); the adapter's on-disk stop record
+   (`<runDir>/stop.ndjson`) is the confirmation source because run metadata is
+   frozen once the run is final. The adapter also applies a soft deadline
+   (`maxDuration` minus 15 s, minimum 5 s) to stop the worker before the CLI
+   delivers SIGTERM on `maxDuration`, returning outcome `timed_out` with the run
+   COMPLETED; the hard `maxDuration` remains the backstop. See the
+   [Slice 1 execution trial](../engineering/trials/2026-09-slice1.md). The UI
+   shows *stopping* until confirmation and *stopped* after. If the adapter could
+   not confirm (for example the host itself is unreachable), the state is
+   *uncertain* and no replacement runs on that repository.
 4. **Replace.** Record the final status and any checkpoint revision, then
    admit a new Attempt under the remaining step budget in a new worktree,
    starting from the base revision or a Lead-selected checkpoint. The old

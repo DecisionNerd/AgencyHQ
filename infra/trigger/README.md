@@ -21,16 +21,16 @@ gets created once an operator runs the commands below.
 
 ## Service list
 
-| Service | Image (pinned via `.env`) | Host port(s) |
-| --- | --- | --- |
-| `webapp` | `ghcr.io/triggerdotdev/trigger.dev:${TRIGGER_IMAGE_TAG}` | `8030` (→ container `3000`) |
-| `postgres` | `postgres:${POSTGRES_IMAGE_TAG}` | `5433` (→ container `5432`) |
-| `redis` | `redis:${REDIS_IMAGE_TAG}` | `6389` (→ container `6379`) |
-| `electric` | `electricsql/electric:${ELECTRIC_IMAGE_TAG}` | none published |
-| `clickhouse` | `clickhouse/clickhouse-server:${CLICKHOUSE_IMAGE_TAG}` | `9123` (HTTP), `9090` (native) |
-| `registry` | `registry:${REGISTRY_IMAGE_TAG}` | `5001` (→ container `5000`; host `5000` is macOS AirPlay Receiver — see Notes) |
-| `minio` | `bitnamilegacy/minio:${MINIO_IMAGE_TAG}` | `9000` (S3 API), `9001` (console) |
-| `s2-init`, `s2` | `busybox:${BUSYBOX_IMAGE_TAG}`, `${S2_IMAGE}` (digest-pinned) | none published |
+| Service | Image (pinned via `.env`) | Host port(s) | Qualified by |
+| --- | --- | --- | --- |
+| `webapp` | `ghcr.io/triggerdotdev/trigger.dev:${TRIGGER_IMAGE_TAG}` | `8030` (→ container `3000`) | [Slice 1 trial](../../docs/engineering/trials/2026-09-slice1.md) (2026-09-07) |
+| `postgres` | `postgres:${POSTGRES_IMAGE_TAG}` | `5433` (→ container `5432`) | same trial |
+| `redis` | `redis:${REDIS_IMAGE_TAG}` | `6389` (→ container `6379`) | same trial |
+| `electric` | `electricsql/electric:${ELECTRIC_IMAGE_TAG}` | none published | same trial |
+| `clickhouse` | `clickhouse/clickhouse-server:${CLICKHOUSE_IMAGE_TAG}` | `9123` (HTTP), `9090` (native) | same trial |
+| `registry` | `registry:${REGISTRY_IMAGE_TAG}` | `5001` (→ container `5000`; host `5000` is macOS AirPlay Receiver — see Notes) | same trial |
+| `minio` | `bitnamilegacy/minio:${MINIO_IMAGE_TAG}` | `9000` (S3 API), `9001` (console) | same trial |
+| `s2-init`, `s2` | `busybox:${BUSYBOX_IMAGE_TAG}`, `${S2_IMAGE}` (digest-pinned) | none published | same trial |
 
 All host ports above are bound to `127.0.0.1` (or `${WEBAPP_PUBLISH_IP}` for
 the webapp) by the defaults in `.env.example`, so nothing here is reachable
