@@ -4,8 +4,7 @@ AgencyHQ is an engineering coordination control plane. It turns intent into
 bounded, durable work while keeping completion tied to source-controlled
 changes and reproducible evidence.
 
-This repository is at **architecture baseline** stage. The structure and
-contracts are deliberate; product implementation has not started.
+The Slice 1 execution spike and Slice 2 domain kernel are implemented; Slice 3 is in progress. See the [roadmap](docs/strategy/roadmap.md) for the current state.
 
 ## System boundary
 

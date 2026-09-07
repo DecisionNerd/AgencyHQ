@@ -50,6 +50,7 @@ Row schemas with inferred TypeScript types live in `src/rows.ts`. `mapRow` helpe
 ### Operator command idempotency (`src/repos/commands.ts`)
 
 `claimCommand(client, commandId, kind)` inserts a `commands` row with `ON CONFLICT DO NOTHING`. Returns `{ claimed: true }` on the first call. Subsequent calls return `{ claimed: false, result }` when a result has been stored, or `{ claimed: false, result: null, inFlight: true }` when the original is still executing. `completeCommand(client, commandId, result)` writes the final result.
+
 ## Repositories
 
 Each table has a typed repository module in `src/repos/`. Every function takes a `pg.PoolClient` as its first argument so callers control transactions.

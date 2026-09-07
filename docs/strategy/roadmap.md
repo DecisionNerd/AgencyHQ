@@ -29,7 +29,7 @@ on it.
   ADR-0005 and ADR-0007 stand. Full record:
   [trials/2026-09-slice1.md](../engineering/trials/2026-09-slice1.md).
 
-## Slice 2 — domain kernel and ledger (current)
+## Slice 2 — domain kernel and ledger
 
 - Implement the slice-2 aggregates in `packages/domain` with the authority
   subset check, transition validation, failure classification over Trigger
@@ -39,8 +39,12 @@ on it.
   duplicate observation, and stale-generation refusal.
 - Add the Trigger client wrapper with a deterministic fake and the worktree
   retention policy.
+- Outcome (2026-09-07): contracts 184 tests, domain 344 tests, trigger 89 tests
+  (+1 skipped live), db 8 unit + 41 integration on Postgres 17.6; `pnpm check`
+  11/11; authority subset check with 15 violation codes, acceptance rule with 13
+  reason codes, FakeExecutionRuntime and RealExecutionRuntime, 15-table ledger.
 
-## Slice 3 — one complete bounded repair
+## Slice 3 — one complete bounded repair (current)
 
 - Implement `lead.plan`, `verify.run`, `lead.review`, `lead.accept`, and the
   coordinator flow through acceptance at the `artifact` boundary.

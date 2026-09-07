@@ -4,7 +4,7 @@
 - Date: 2026-09-07
 - Extends: ADR-0004 (defines what the "supervisor" is and renames it)
 - Amends: R-005 wording (see REQUIREMENTS.md)
-- Implementation status: Planned.
+- Implementation status: Authority subset check with 15 violation codes, fast-check property laws, and human-approval determination implemented in `packages/domain/src/authority/` (Slice 2). Lead task (`lead.plan`) and coordinator flow not yet implemented.
 
 ## Context
 

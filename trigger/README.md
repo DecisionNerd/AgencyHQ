@@ -118,6 +118,7 @@ survivors and the worktree retained; item 4 checks a `git push` is blocked
 paths (`../`, `/tmp/...`, a denied in-worktree path) are quarantined, and
 that the `task` tool is denied. Each item prints `EVIDENCE ...` lines and one
 final `RESULT item=<n> PASS|FAIL reason=...` line.
+
 ## Trial
 
 Trial items 1–4 ran against a live `trigger dev` on 2026-09-07 using Trigger.dev

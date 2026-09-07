@@ -30,6 +30,7 @@ Package name: `@agencyhq/domain`. Scripts: `typecheck` runs `tsc --noEmit`; `tes
 **Stale observations** (`observedGeneration !== generation`) return `class: "none"` with `stale: true` and `attemptStatus: "uncertain"`. Callers must not apply stale classifications to attempt state.
 
 The `CLASSIFICATION_TABLE` constant exports all rules as a data array (`status`, `outcome`, `stopRequested`, `errorType`, `class`, `attemptStatus`, `autoNewAttemptWhenBudget`). `classifyObservation(obs, ctx)` looks up this table to ensure the test can assert exhaustiveness.
+
 ## Dispatch ordering (`src/dispatch/`)
 
 `selectDispatch` implements R-008: given a ranked list of work items and the
@@ -74,6 +75,7 @@ Each violation carries a `ViolationCode`, a dot-path, and a detail string. Codes
 `requiredBoundariesFor(bounds)` returns the `BoundaryKind[]` the runtime profile must enforce for a given contract. Always includes: `worktree`, `output_paths`, `push`, `termination`, `capability`, `duration`. Conditionally adds `fs_isolation` and `egress_spend` when external network tools are enabled or a spend ceiling exists.
 
 `enforceable(profile, requiredBoundaries)` checks whether a runtime profile can enforce all required boundaries. Returns `ok: false` with an `advisory` list if any required boundary is marked advisory in the profile (R-016: the `HOST_PROFILE` marks `fs_isolation`, `cpu_memory`, and `egress_spend` as advisory — contracts requiring those must run in a container).
+
 ## Modules
 
 - **`ids.ts`** — Branded id types (`ProjectId`, `WorkItemId`, `StepContractId`, `AttemptId`, `DispatchIntentId`, `ArtifactId`, `VerificationResultId`, `ReviewId`, `DecisionId`, `ApprovalId`, `FindingId`, `FailureId`, `CommandId`). `newId(prefix)` generates a UUID-backed id. `asXId(s)` performs a prefix-check cast.
@@ -93,6 +95,7 @@ Each violation carries a `ViolationCode`, a dot-path, and a detail string. Codes
 - **`aggregates/verification-result.ts`** — Re-export of `VerificationResult` from `@agencyhq/contracts`.
 - **`transitions/attempt.ts`** — Pure attempt transitions: `markDispatched`, `observe`, `revoke`, `confirmStopped`, `markUncertain`. `ATTEMPT_TRANSITIONS` table drives all legal-transition checks. Returns `Result<{attempt, events}, TransitionError>`.
 - **`transitions/work-item.ts`** — Pure work-item transitions: `admit`, `activate`, `complete`, `halt`, `reopen`, `markCondition`. `WORK_ITEM_TRANSITIONS` table drives all legal-transition checks.
+
 ## Evidence and findings
 
 `packages/domain/src/evidence/` implements the acceptance gate and evidence-integrity checks:

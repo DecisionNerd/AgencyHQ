@@ -23,6 +23,8 @@ Concepts marked *deferred* are vocabulary now and code later.
 | ProcessDefinition | Versioned step/gate sequence. The bounded repair process is code until a second process exists. *Deferred.* | 4 |
 | ProviderCapacity | Timestamped capacity observation with validity window. *Deferred.* | 6 |
 
+*Implementation: all Slice 2 aggregates in `packages/domain/src/aggregates/`; lifecycle transitions namespaced per aggregate in `packages/domain/src/transitions/`.*
+
 ## Relationships
 
 - A WorkItem belongs to one Project (multi-repository WorkItems arrive in
@@ -60,6 +62,8 @@ The schema is defined in ADR-0006. Two rules govern it here:
 2. Widening any bound is a new StepContract version and, where `humanRequired`
    applies, an Approval. Workers cannot request widening; they report Findings.
 
+*Implementation: authority subset check with 15 violation codes in `packages/domain/src/authority/subset.ts`; human-approval determination in `packages/domain/src/authority/human-required.ts`; dispatch enforceability in `packages/domain/src/authority/runtime.ts`.*
+
 ## Allocation
 
 Until slice 6, allocation is: the coordinator dispatches at most the
@@ -88,6 +92,8 @@ The Lead classifies each Finding; the coordinator records the disposition.
 
 Match Findings by subject and cause before creating another.
 
+*Implementation: finding dispositions in `packages/domain/src/findings/disposition.ts`; acceptance rule with 13 reason codes in `packages/domain/src/evidence/acceptance.ts`; verifier-tampering detection in `packages/domain/src/evidence/integrity.ts`.*
+
 ## Version repair
 
 | Change | Transition |
@@ -107,3 +113,5 @@ Every policy-relevant transition is validated in `packages/domain`, committed
 to Postgres with actor, causation, and an idempotency key, and only then
 followed by a DispatchIntent. Trigger runs are consumed as observations with
 the run id and attempt generation as the dedupe identity.
+
+*Implementation: failure classification table over 13 Trigger statuses in `packages/domain/src/failure/classify.ts`; dispatch selection in `packages/domain/src/dispatch/`.*

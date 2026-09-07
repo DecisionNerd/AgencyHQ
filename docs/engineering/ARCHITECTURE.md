@@ -109,7 +109,10 @@ Postgres stores commit ids and digests, never source.
 ## Enforcement boundaries
 
 Host profile as declared. A contract that requires a boundary the profile
-marks advisory is rejected at dispatch.
+marks advisory is rejected at dispatch. A spend estimate is advisory on the
+host profile and does not cause R-016 rejection; only contracts that enable
+`webfetch` or `websearch` tools additionally require `fs_isolation` and
+`egress_spend` to be enforceable (`packages/domain/src/authority/runtime.ts`).
 
 | Boundary | Host profile | Kind | Container profile |
 | --- | --- | --- | --- |
@@ -129,7 +132,8 @@ marks advisory is rejected at dispatch.
 
 `packages/domain` imports nothing from Trigger, OpenCode, React, or Postgres
 clients. `trigger/` and `packages/db` depend on `packages/contracts` and
-`packages/domain`. The coordinator composes them.
+`packages/domain`. The coordinator composes them. This is verified by
+`tests/dependency-rules.test.mjs` (11 cases), which runs as part of `pnpm check`.
 
 ## Deployment shape
 

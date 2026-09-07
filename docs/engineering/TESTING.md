@@ -16,6 +16,8 @@ Trigger run is never acceptance.
 | Execution trial | The runtime meets the recovery and isolation contract. | Recorded manual trial per pinned version set. |
 | Operator behavior | Distinct states, evidence inspection, decisions, stop status. | Browser tests against the composed system. |
 
+**Implemented test layers (Slice 2):** Architecture baseline + dependency rules (`tests/architecture-baseline.test.mjs`, `tests/dependency-rules.test.mjs`); domain unit and property tests (`packages/domain`); persistence integration tests against Postgres 17.6 (`packages/db`); adapter fakes (`trigger/src/client/fake.ts`, `trigger/test/worker-attempt-core.test.ts`). Execution trial items 1–4 recorded (2026-09-07). Operator behavior tests not yet implemented.
+
 ## Behavior coverage
 
 | Requirement | Given / When / Then | Evidence |
@@ -134,6 +136,4 @@ version set. Items 1–4 ran on 2026-09-07 with Trigger.dev 4.5.16, OpenCode
 
 ## Baseline check
 
-`pnpm check` verifies documentation integrity only. Each slice extends it with
-executable tests, and CI must run the check and slice tests before the first
-feature merge.
+`pnpm check` runs the architecture baseline check and the dependency rules (11 cases: `tests/dependency-rules.test.mjs`). Each slice extends it with executable tests, and CI must run the check and slice tests before the first feature merge.
