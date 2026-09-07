@@ -31,6 +31,7 @@ function makeConfig(overrides: Partial<CoordinatorConfig> = {}): CoordinatorConf
     reviewerModel: "claude-sonnet-4",
     reconcileIntervalMs: 5000,
     freshnessStaleMs: 30000,
+    uncertainAfterMs: 120000,
     port: 8787,
     ...overrides,
   };

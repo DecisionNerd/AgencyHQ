@@ -751,6 +751,9 @@ export class BoundedRepairFlow {
           attemptId: attemptRow.id,
           generation: attemptRow.generation,
           observation: obs,
+          // Anchor the uncertainty deadline to the run's observation time so
+          // elapsed time is computed correctly on repeated poll cycles.
+          finalObservedAt: obs.observedAt,
         });
 
         if (csResult.status === "pending_confirmation") {

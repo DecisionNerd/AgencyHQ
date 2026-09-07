@@ -75,6 +75,7 @@ function makeConfig() {
     reviewerModel: "openai/gpt-5.6-sol",
     reconcileIntervalMs: 60000,
     freshnessStaleMs: 30000,
+    uncertainAfterMs: 120000,
     port: 0,
   };
 }

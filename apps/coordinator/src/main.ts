@@ -91,7 +91,7 @@ const flowDeps: FlowDeps = {
 
 // Construct flow and reconciler
 const flow = new BoundedRepairFlow(flowDeps);
-const reconciler = new Reconciler(flowDeps, flow);
+const reconciler = new Reconciler(flowDeps, flow, { uncertainAfterMs: config.uncertainAfterMs });
 reconciler.start(config.reconcileIntervalMs);
 
 // Construct command handlers
