@@ -29,8 +29,12 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    output. (Container profile: fresh clone, then push with a generation-bound
    token.)
 5. **Observe.** The coordinator subscribes to runs by tag. On a final status it
-   retrieves the run, stores the report and Artifact, and classifies the
-   outcome (below). Duplicate deliveries are no-ops keyed by run id.
+   retrieves the run, stores the report, and classifies the outcome (below).
+   A worker output with a null commit id (nothing changed) is classified as a
+   failure; no Artifact is created. A completed run with a valid commit id has
+   its Artifact stored. Duplicate deliveries are no-ops keyed by run id and
+   attempt generation; a delivery for a revoked generation is stored as
+   history-only (stale) and does not advance state.
 6. **Verify.** `verify.run` is dispatched against the attempt revision with the
    approved profile; results are stored as VerificationResults.
 7. **Review.** `lead.review` is dispatched with the diff, criteria, and results;
@@ -38,7 +42,9 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
 8. **Accept.** `lead.accept` proposes acceptance; the coordinator checks the
    proposal names every criterion, cites passing results, and has no blocking
    Review finding, then records the acceptance Decision. If the authority
-   schema requires it, a human Approval is requested first.
+   schema requires it (`humanRequired` is true), the work item is parked as
+   `pending_human` until a matching Approval exists. No Approval write path
+   (command or API) exists yet; this is Slice 4 scope.
 9. **Integrate** (merge or deploy boundaries only). `integrate.merge` runs with
    an operation-scoped credential, serialized per repository, idempotent by
    attempt and target revision.
@@ -78,21 +84,30 @@ Because workers cannot cause external effects (ADR-0007), replacement is short:
    grace period: it commits the worktree to `agencyhq/checkpoints/<attempt-id>`,
    sends SIGTERM then SIGKILL to the OpenCode process group, and records
    whether any process survived. `runs.cancel` also cancels child runs.
-3. **Confirm.** Subscribe until the run status is final and the adapter's
-   last metadata reports no survivors. On the host profile, the Trigger API
-   reports a final status before adapter cleanup completes (observed 22–38 ms
-   after `runs.cancel` in the Slice 1 trial); the adapter's on-disk stop record
-   (`<runDir>/stop.ndjson`) is the confirmation source because run metadata is
-   frozen once the run is final. The adapter also applies a soft deadline
-   (`maxDuration` minus 15 s, minimum 5 s) to stop the worker before the CLI
-   delivers SIGTERM on `maxDuration`, returning outcome `timed_out` with the run
-   COMPLETED; the hard `maxDuration` remains the backstop. See the
+3. **Confirm.** The reconciler calls `confirmStop` with the run's final
+   metadata (`checkpointCommit`, `survivors`) as evidence and records the
+   checkpoint commit on the attempt row. Subscribe until the run status is
+   final and the adapter's last metadata reports no survivors. On the host
+   profile, the Trigger API reports a final status before adapter cleanup
+   completes (observed 22–38 ms after `runs.cancel` in the Slice 1 trial);
+   the adapter's on-disk stop record (`<runDir>/stop.ndjson`) is the
+   confirmation source because run metadata is frozen once the run is final.
+   The adapter also applies a soft deadline (`maxDuration` minus 15 s,
+   minimum 5 s) to stop the worker before the CLI delivers SIGTERM on
+   `maxDuration`, returning outcome `timed_out` with the run COMPLETED; the
+   hard `maxDuration` remains the backstop. See the
    [Slice 1 execution trial](../engineering/trials/2026-09-slice1.md). The UI
    shows *stopping* until confirmation and *stopped* after. If the adapter could
    not confirm (for example the host itself is unreachable), the state is
-   *uncertain* and no replacement runs on that repository.
-4. **Replace.** Record the final status and any checkpoint revision, then
-   admit a new Attempt under the remaining step budget in a new worktree,
+   *uncertain* and no replacement runs on that repository. The cancelled
+   observation is recorded as history-only (stale) so it does not advance state
+   on a later delivery. Stop command replay returns `replayed: true`.
+4. **Operator-stop: no replacement.** On an operator-initiated stop the
+   coordinator records the final status and checkpoint revision but does not
+   admit a new Attempt. The work item stays at its pre-stop lifecycle state
+   (no auto-replacement). A new Attempt requires an explicit operator or Lead
+   decision. For *automatic* retry on execution failure (not an operator stop),
+   the coordinator may admit a new Attempt under the remaining step budget,
    starting from the base revision or a Lead-selected checkpoint. The old
    worktree is retained for inspection, never reused.
 

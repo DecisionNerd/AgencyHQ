@@ -53,6 +53,14 @@ what they attempted, exact outputs, checks run, unmet criteria, limitations,
 and Findings. An honest partial or failed report is valid execution evidence,
 not acceptance. Missing results remain unknown.
 
+A worker output with a null commit id (nothing changed) is classified as a
+failure; no Artifact is created for that attempt.
+
+When the authority schema sets `humanRequired` true, the work item is parked as
+`pending_human` after acceptance is proposed, and stays there until a matching
+Approval bound to the same contract version and attempt exists. No Approval
+write path (command or API) exists yet; this is Slice 4 scope.
+
 ## Delegated authority
 
 The schema is defined in ADR-0006. Two rules govern it here:

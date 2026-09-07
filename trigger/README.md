@@ -288,6 +288,8 @@ The task:
    digests and revision (a mismatch → `{ kind: "invalid_output" }`).
 7. Removes the review worktree in a `finally` block.
 
+Reviewer identity: the `reviewerModel` field in the output is the invoked `payload.model` (not a self-reported model from the session).
+
 Output: `ReviewOutput & { reviewerModel: string }` on success, or
 `{ kind: "invalid_output"; reason: string; reviewerModel: string }` on failure.
 

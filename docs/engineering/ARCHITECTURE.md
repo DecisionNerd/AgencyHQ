@@ -84,9 +84,9 @@ Thin, versioned task definitions with no policy:
 | Task | Does | Returns as run output |
 | --- | --- | --- |
 | `lead.plan` | Read-only OpenCode session in a worktree at the base revision; proposes StepContract, criteria, profile, review depth, boundary. | Structured proposal with source citations. |
-| `worker.attempt` | `git worktree add` at the base revision; spawn OpenCode with scrubbed env and the contract's permission rules; on exit diff, path-check, commit `agencyhq/attempts/<id>`; on cancel commit a checkpoint and kill the process group. | Worker report, commit id, diff digest, path violations. |
-| `verify.run` | Separate worktree at the attempt revision; run the approved profile's checks; capture bounded logs. | VerificationResult records. |
-| `lead.review` | Read-only session over the diff and evidence; adversarial review. | Review findings against exact versions. |
+| `worker.attempt` | `git worktree add` at the base revision; spawn OpenCode with scrubbed env applying `payload.permissionRules` merged with the always-deny set (`WORKER_ALWAYS_DENY_BASH`, `WORKER_ALWAYS_DENY_PATHS`); on exit diff, path-check (`paths.deny` from the payload enforced in classification — violations quarantine), commit `agencyhq/attempts/<id>`; on cancel commit a checkpoint and kill the process group. | Worker report, commit id, diff digest, path violations. |
+| `verify.run` | Separate worktree at the attempt revision; run the approved profile's checks; `protectedPaths` from the payload (defaults: `test/**`, `**/*.test.*`, `**/*.spec.*`) detect verifier tampering; capture bounded logs. | VerificationResult records. |
+| `lead.review` | Read-only session over the diff and evidence; adversarial review. Reviewer identity is the invoked `payload.model`. | Review findings against exact versions. |
 | `lead.accept` | Judges criteria against evidence and review. | Acceptance proposal with rationale. |
 | `integrate.merge` | After a recorded acceptance: merge to the target ref, compare-and-set on expected base, push with host credentials. | Resulting revision or conflict evidence. |
 
