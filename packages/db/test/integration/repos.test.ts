@@ -653,6 +653,8 @@ test("reviews: insert and get round-trip", async (t) => {
     const inserted = await insertReview(client, {
       id: "rev-1",
       attempt_id: "att-rev",
+      reviewer_model: "claude-opus-4-5",
+      profile: "lead_inspection",
       findings: [{ severity: "low", description: "Minor nit" }],
     });
 
@@ -736,6 +738,7 @@ test("approvals: insert and get round-trip", async (t) => {
     await insertDecision(client, {
       id: "dec-appr",
       kind: "human",
+      actor: "human",
       at: new Date(),
     });
 
