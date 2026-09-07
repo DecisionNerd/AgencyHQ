@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { WORKER_ALWAYS_DENY_BASH, WORKER_ALWAYS_DENY_PATHS } from "@agencyhq/contracts";
+import { writeRunConfig } from "../src/lib/opencode.ts";
 import type { KillTreeResult, RunState, StopDeps } from "../src/tasks/worker-attempt-core.ts";
 import {
   buildOutput,
   checkpointAndKill,
+  enforceAlwaysDeny,
   getRunState,
   outcomeFromViolations,
   registerRunState,
   resolveRunDir,
+  resolveWorkerRuleset,
   resolveWorktreePath,
 } from "../src/tasks/worker-attempt-core.ts";
 
@@ -210,4 +217,189 @@ test("checkpointAndKill is idempotent under concurrent callers racing on the sam
   assert.deepEqual(fromOnCancel, fromAbortListener);
   assert.equal(killCalls, 1);
   assert.equal(commitCalls, 1);
+});
+
+// ---------------------------------------------------------------------------
+// resolveWorkerRuleset tests (G-3)
+// ---------------------------------------------------------------------------
+
+const SAMPLE_CONTRACT_RULESET = {
+  "*": "deny" as const,
+  read: "allow" as const,
+  glob: "allow" as const,
+  grep: "allow" as const,
+  list: "allow" as const,
+  edit: {
+    "*": "deny" as const,
+    "src/a.ts": "allow" as const,
+  },
+  bash: {
+    "*": "deny" as const,
+    "pnpm test*": "allow" as const,
+  },
+  task: "deny" as const,
+  webfetch: "deny" as const,
+  websearch: "deny" as const,
+  skill: "deny" as const,
+  external_directory: "deny" as const,
+  doom_loop: "deny" as const,
+};
+
+test("resolveWorkerRuleset: source is always 'contract'", () => {
+  const { source } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  assert.equal(source, "contract");
+});
+
+test("resolveWorkerRuleset: bash allow entry from contract is preserved", () => {
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  assert.equal(ruleset.bash["pnpm test*"], "allow");
+});
+
+test("resolveWorkerRuleset: bash default deny from contract is preserved", () => {
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  assert.equal(ruleset.bash["*"], "deny");
+});
+
+test("resolveWorkerRuleset: edit allow entry from contract is preserved", () => {
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  assert.equal(ruleset.edit["src/a.ts"], "allow");
+});
+
+test("resolveWorkerRuleset: all WORKER_ALWAYS_DENY_BASH entries are denied", () => {
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  for (const pattern of WORKER_ALWAYS_DENY_BASH) {
+    assert.equal(
+      ruleset.bash[pattern],
+      "deny",
+      `WORKER_ALWAYS_DENY_BASH pattern "${pattern}" must be "deny" (got "${ruleset.bash[pattern]}")`,
+    );
+  }
+});
+
+test("resolveWorkerRuleset: all WORKER_ALWAYS_DENY_PATHS entries are denied in edit map", () => {
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  for (const glob of WORKER_ALWAYS_DENY_PATHS) {
+    assert.equal(
+      ruleset.edit[glob],
+      "deny",
+      `WORKER_ALWAYS_DENY_PATHS pattern "${glob}" must be "deny" in edit map (got "${ruleset.edit[glob]}")`,
+    );
+  }
+});
+
+test("resolveWorkerRuleset: edit denies opencode.json* and .opencode/**", () => {
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  assert.equal(ruleset.edit["opencode.json*"], "deny");
+  assert.equal(ruleset.edit[".opencode/**"], "deny");
+});
+
+test("resolveWorkerRuleset: task is always deny even if contract set it allow", () => {
+  const maliciousRuleset = { ...SAMPLE_CONTRACT_RULESET, task: "allow" as const };
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: maliciousRuleset });
+  assert.equal(ruleset.task, "deny");
+});
+
+test("resolveWorkerRuleset: external_directory is always deny even if contract set it allow", () => {
+  const maliciousRuleset = { ...SAMPLE_CONTRACT_RULESET, external_directory: "allow" as const };
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: maliciousRuleset });
+  assert.equal(ruleset.external_directory, "deny");
+});
+
+test("resolveWorkerRuleset: webfetch propagated from contract (deny)", () => {
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  assert.equal(ruleset.webfetch, "deny");
+});
+
+test("resolveWorkerRuleset: websearch propagated from contract (deny)", () => {
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+  assert.equal(ruleset.websearch, "deny");
+});
+
+test("resolveWorkerRuleset: malicious bash allow for *git push* is overridden to deny", () => {
+  const maliciousRuleset = {
+    ...SAMPLE_CONTRACT_RULESET,
+    bash: { ...SAMPLE_CONTRACT_RULESET.bash, "*git push*": "allow" as const },
+  };
+  const { ruleset } = resolveWorkerRuleset({ permissionRules: maliciousRuleset });
+  assert.equal(ruleset.bash["*git push*"], "deny");
+});
+
+test("resolveWorkerRuleset: throws when permissionRules is absent at runtime", () => {
+  assert.throws(
+    () =>
+      resolveWorkerRuleset({ permissionRules: undefined } as unknown as {
+        permissionRules: typeof SAMPLE_CONTRACT_RULESET;
+      }),
+    /permissionRules is required/,
+  );
+});
+
+test("resolveWorkerRuleset: throws when permissionRules is null at runtime", () => {
+  assert.throws(
+    () =>
+      resolveWorkerRuleset({ permissionRules: null } as unknown as {
+        permissionRules: typeof SAMPLE_CONTRACT_RULESET;
+      }),
+    /permissionRules is required/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// enforceAlwaysDeny: malicious allow entries are overridden
+// ---------------------------------------------------------------------------
+
+test("enforceAlwaysDeny: all WORKER_ALWAYS_DENY_BASH entries overridden to deny even if allow in input", () => {
+  const maliciousBash: Record<string, "allow" | "deny"> = { "*": "allow" };
+  for (const pattern of WORKER_ALWAYS_DENY_BASH) {
+    maliciousBash[pattern] = "allow";
+  }
+  const input = { ...SAMPLE_CONTRACT_RULESET, bash: maliciousBash };
+  const result = enforceAlwaysDeny(input);
+  for (const pattern of WORKER_ALWAYS_DENY_BASH) {
+    assert.equal(
+      result.bash[pattern],
+      "deny",
+      `enforceAlwaysDeny must override "${pattern}" to deny`,
+    );
+  }
+});
+
+test("enforceAlwaysDeny: all WORKER_ALWAYS_DENY_PATHS entries overridden to deny even if allow in input", () => {
+  const maliciousEdit: Record<string, "allow" | "deny"> = { "*": "deny" };
+  for (const glob of WORKER_ALWAYS_DENY_PATHS) {
+    maliciousEdit[glob] = "allow";
+  }
+  const input = { ...SAMPLE_CONTRACT_RULESET, edit: maliciousEdit };
+  const result = enforceAlwaysDeny(input);
+  for (const glob of WORKER_ALWAYS_DENY_PATHS) {
+    assert.equal(
+      result.edit[glob],
+      "deny",
+      `enforceAlwaysDeny must override "${glob}" to deny in edit map`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// writeRunConfig round-trip: ruleset written and read back correctly (G-3)
+// ---------------------------------------------------------------------------
+
+test("writeRunConfig: permission field in opencode.worker.json matches the ruleset exactly", async () => {
+  const tmpDir = await mkdtemp(join(tmpdir(), "agencyhq-writerunconfig-test-"));
+  try {
+    const { ruleset } = resolveWorkerRuleset({ permissionRules: SAMPLE_CONTRACT_RULESET });
+    await writeRunConfig({ runDir: tmpDir, model: "openai/gpt-5.6-terra", ruleset });
+
+    const configPath = join(tmpDir, "opencode.worker.json");
+    const raw = await readFile(configPath, "utf8");
+    const config = JSON.parse(raw) as { permission: unknown };
+
+    assert.deepEqual(
+      config.permission,
+      ruleset,
+      "permission in opencode.worker.json must deep-equal the ruleset passed to writeRunConfig",
+    );
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
 });

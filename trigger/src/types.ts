@@ -73,14 +73,14 @@ export type WorkerAttemptPayload = {
   model?: string;
   worktreeBase?: string;
   /** Frozen contract bounds (paths, capabilities, boundary, budget, etc.).
-   * Optional: the spike trial harness may omit. When present, `permissionRules`
-   * should also be present and is used as the authoritative ruleset. */
+   * Optional for backward compatibility with legacy callers; should always be
+   * present for contract-path runs. */
   bounds?: ContractBounds;
-  /** Contract-derived OpenCode permission ruleset. When present, written to
-   * opencode.worker.json verbatim (with always-deny entries merged on top for
-   * defense in depth). When absent, the spike fallback `buildPermissionRuleset`
-   * is used and `permissionSource` is recorded as "fallback". */
-  permissionRules?: ContractsPermissionRuleset;
+  /** Contract-derived OpenCode permission ruleset. Required: a payload without
+   * this field fails setup with AbortTaskRunError before any spawn.
+   * Written to opencode.worker.json verbatim (with always-deny entries merged
+   * on top for defense in depth). */
+  permissionRules: ContractsPermissionRuleset;
 };
 
 /** Result of one `worker.attempt` run. `survivors` is only ever non-empty

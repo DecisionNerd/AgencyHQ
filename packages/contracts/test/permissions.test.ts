@@ -273,3 +273,66 @@ test("runConfigFor: produces correct config shape for agencyhq-lead agent", () =
   assert.equal(leadAgent.mode, "primary");
   assert.equal(leadAgent.model, "openai/gpt-5.6-sol");
 });
+
+// ---------------------------------------------------------------------------
+// F-9: Lead ruleset — removed allows are absent (regression)
+// ---------------------------------------------------------------------------
+
+// These patterns were considered for the Lead but must NOT be allowed.
+// If any of them appear as "allow" in the bash map, a regression has occurred.
+const LEAD_FORBIDDEN_BASH_PATTERNS = [
+  "cat *",
+  "head *",
+  "tail *",
+  "pnpm test*",
+  "pnpm typecheck*",
+  "node --test*",
+];
+
+test("leadAgentPermissions: forbidden bash patterns (cat, head, tail, pnpm test*, pnpm typecheck*, node --test*) are absent or deny", () => {
+  const ruleset = leadAgentPermissions();
+  for (const pattern of LEAD_FORBIDDEN_BASH_PATTERNS) {
+    const action = ruleset.bash[pattern];
+    assert.notEqual(
+      action,
+      "allow",
+      `Lead bash map must not allow "${pattern}" — it must be absent (undefined) or "deny", got "${String(action)}"`,
+    );
+  }
+});
+
+// The exact set of bash allows defined in leadAgentPermissions() as of
+// 2026-09-07. Enumerate them from the source to detect accidental additions
+// or removals.
+const LEAD_ALLOWED_BASH_PATTERNS = [
+  "git status*",
+  "git diff*",
+  "git log*",
+  "git show*",
+  "git ls-files*",
+  "ls*",
+  "wc *",
+  "rg *",
+  "grep *",
+  "find *",
+] as const;
+
+test("leadAgentPermissions: exactly the read-only git/ls patterns are allowed in bash map", () => {
+  const ruleset = leadAgentPermissions();
+
+  // Every pattern in the canonical allow list must be "allow".
+  for (const pattern of LEAD_ALLOWED_BASH_PATTERNS) {
+    assert.equal(ruleset.bash[pattern], "allow", `Lead bash map must allow "${pattern}"`);
+  }
+
+  // No entry other than these and WORKER_ALWAYS_DENY_BASH (which are "deny")
+  // should be "allow".
+  const allowEntries = Object.entries(ruleset.bash).filter(([, v]) => v === "allow");
+  const allowKeys = allowEntries.map(([k]) => k).sort();
+  const expectedKeys = [...LEAD_ALLOWED_BASH_PATTERNS].sort();
+  assert.deepEqual(
+    allowKeys,
+    expectedKeys,
+    `Lead bash map allow keys must be exactly ${JSON.stringify(expectedKeys)}, got ${JSON.stringify(allowKeys)}`,
+  );
+});
