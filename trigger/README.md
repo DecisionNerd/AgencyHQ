@@ -168,3 +168,48 @@ Key features:
   survivors arriving post-completion).
 - **Deterministic run ids** — `run_fake_<n>` for easy assertions.
 - **`calls` log** — every method call in order for assertion.
+
+### `RealExecutionRuntime` (`src/client/real.ts`)
+
+Production adapter that wraps the real `@trigger.dev/sdk`.  Constructed with
+`{ apiUrl, secretKey, taskIds? }` and an optional injectable `SdkSurface` for
+unit tests (so tests never need a live Trigger instance).
+
+- Calls `configure({ baseURL, secretKey })` once on construction.
+- `trigger()` calls `idempotencyKeys.create(key, { scope: "global" })` then
+  `tasks.trigger` with `idempotencyKeyTTL` defaulting to `"24h"`, plus
+  `concurrencyKey`, `tags`, and `maxDuration` forwarded from the options.
+- `retrieve()` maps `runs.retrieve`'s result to `RunObservation`, passing
+  `status` through as-is (the 13-value SDK enum matches `TriggerRunStatus`),
+  and sets `observedAt` to the current ISO timestamp.
+- `cancel()` delegates to `runs.cancel`; resolves even if the run is final.
+- `createPublicToken()` calls `auth.createPublicToken` with
+  `{ scopes: { read: { tags } }, expirationTime: expiresIn }`.
+- All SDK errors are wrapped in `RuntimeError { name, cause }` and re-thrown;
+  no retries or error swallowing here.
+
+## Worktree retention policy (`src/retention.ts`)
+
+Implements the retention logic from ADR-0007 §56-63.
+
+### `retentionCandidates(input)`
+
+Pure function — no side-effects, no git I/O.  Given a list of attempts with
+their status, commit SHAs, finalAt timestamps, and a protected set, it returns
+`{ remove, keep }`:
+
+- **Remove** when: status ∈ `{completed, quarantined, failed, stopped,
+  timed_out}`, `finalAt` is non-null and older than `keepFinalForMs`, not in
+  `protectedAttemptIds`, and `attemptCommit ?? checkpointCommit` is non-null
+  (commits must already be retained in the repository).
+- **Keep** otherwise, including for `uncertain` and `stopping` statuses.
+
+### `removeRetained(repoPath, candidates, deps?)`
+
+Async effect function.  For each candidate from `retentionCandidates().remove`
+it first checks that the commit is reachable in the repository
+(`git cat-file -e <sha>^{commit}`), then calls `git worktree remove --force`.
+Candidates with an unreachable commit are skipped (kept for inspection).
+Returns `{ removed, skipped }`.  The `deps` parameter accepts injectable
+`worktreeRemove` and `refExists` implementations so the function is
+unit-testable without a real git repository.

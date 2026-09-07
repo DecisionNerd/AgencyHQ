@@ -32,3 +32,46 @@ Migration `migrations/0001_ledger.sql` creates the following tables in the `agen
 | `run_observations` | Trigger run events deduped by `(run_id, generation)` primary key. |
 
 Row schemas with inferred TypeScript types live in `src/rows.ts`. `mapRow` helpers parse jsonb columns (`authority`, `bounds`, `criteria`, `record`) through their contracts Zod schemas.
+
+## Fencing and idempotency
+
+### Authority-generation fencing (`src/fencing.ts`)
+
+`revokeGeneration(client, attemptId, expectedGeneration)` advances an attempt's authority generation with a compare-and-set UPDATE. If `generation` in the row equals `expectedGeneration`, it increments generation and sets `status = 'stopping'`, then appends a `transitions` audit row. Returns `{ ok: true, generation }` on success, `{ ok: false, reason: "stale_generation", current? }` when the expected generation is stale, or `{ ok: false, reason: "not_found" }` when no such attempt exists.
+
+`applyObservation(client, obs)` deduplicates a run observation and generation-fences it in one SQL sequence. It inserts into `run_observations (run_id, generation)` with `ON CONFLICT DO NOTHING`; a no-op insert means the observation is a `"duplicate"`. If inserted, it reads the attempt's current generation (SELECT FOR UPDATE). When `obs.generation < current` it marks the new row `stale = true` and returns `"stale"` (history-only; state is never advanced). Otherwise it returns `"applied"` and leaves state transition to the caller.
+
+`confirmStopped(client, attemptId, generation, input)` CAS-transitions an attempt from `'stopping'` to `'stopped'` (when `survivorsConfirmedGone`) or `'uncertain'` (when not), writes `checkpoint_commit`, and appends a `transitions` row. Returns `{ ok: false, reason: "stale_generation" }` when generation is wrong, or `{ ok: false, reason: "state_mismatch" }` when the attempt is not in `'stopping'`.
+
+### Run observations (`src/repos/observations.ts`)
+
+`listObservations(client, runId)` returns all observations for a run ordered by generation. `latestObservation(client, runId, generation)` returns the single row for a `(run_id, generation)` pair, or `null` if absent. Stale observations are preserved as history.
+
+### Operator command idempotency (`src/repos/commands.ts`)
+
+`claimCommand(client, commandId, kind)` inserts a `commands` row with `ON CONFLICT DO NOTHING`. Returns `{ claimed: true }` on the first call. Subsequent calls return `{ claimed: false, result }` when a result has been stored, or `{ claimed: false, result: null, inFlight: true }` when the original is still executing. `completeCommand(client, commandId, result)` writes the final result.
+## Repositories
+
+Each table has a typed repository module in `src/repos/`. Every function takes a `pg.PoolClient` as its first argument so callers control transactions.
+
+| Module | Key functions |
+| --- | --- |
+| `repos/projects.ts` | `insertProject`, `getProject`, `listProjects` |
+| `repos/work-items.ts` | `insertWorkItem`, `getWorkItem`, `listWorkItemsByProject` |
+| `repos/step-contracts.ts` | `insertStepContract`, `getStepContract`, `listStepContractsByWorkItem`, `updateStepContractStatus` |
+| `repos/attempts.ts` | `insertAttempt`, `getAttempt`, `listAttemptsByContract`, `updateAttemptStatus` |
+| `repos/dispatch-intents.ts` | `insertDispatchIntent`, `getDispatchIntent`, `listOpenDispatchIntents`, `updateDispatchIntentStatus` |
+| `repos/artifacts.ts` | `insertArtifact`, `getArtifact`, `listArtifactsByAttempt` |
+| `repos/verification-results.ts` | `insertVerificationResult`, `getVerificationResult`, `listVerificationResultsByAttempt` |
+| `repos/reviews.ts` | `insertReview`, `getReview`, `listReviewsByAttempt` |
+| `repos/decisions.ts` | `insertDecision`, `getDecision`, `listDecisionsByWorkItem` |
+| `repos/approvals.ts` | `insertApproval`, `getApproval`, `listApprovalsByDecision` |
+| `repos/findings.ts` | `insertFinding`, `getFinding`, `listFindingsByAttempt` |
+| `repos/failures.ts` | `insertFailure`, `getFailure`, `listFailuresByAttempt` |
+| `repos/transitions.ts` | `insertTransition` (append-only audit) |
+
+Every `updateXStatus(client, id, from, to, audit)` applies `UPDATE … WHERE id=$1 AND status=$2`. Zero rows updated returns `{ ok: false, reason: "state_mismatch" }` and writes no audit row. On success it appends a `transitions` row with `actor`, `causation_id`, and `command_id`.
+
+## Unit of Work
+
+`src/unit-of-work.ts` exports `recordDecisionAndIntent(client, input)`, which implements R-002: it commits a Decision, an optional StepContract, an optional Attempt, and a DispatchIntent in a single transaction before any trigger call. When `audit.commandId` matches an existing `commands` row the stored result is returned immediately (idempotent replay). Accepts `pg.Pool` (manages BEGIN/COMMIT/ROLLBACK) or `pg.PoolClient` (caller controls the transaction).

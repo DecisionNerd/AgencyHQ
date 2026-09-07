@@ -98,3 +98,7 @@ export interface ExecutionRuntime {
   /** Create a short-lived public access token filtered to the given tags. */
   createPublicToken(input: { tags: string[]; expiresIn: string }): Promise<string>;
 }
+
+// Re-export the real runtime and its error type.
+export type { SdkSurface } from "./real.ts";
+export { RealExecutionRuntime, RuntimeError } from "./real.ts";
