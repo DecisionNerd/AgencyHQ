@@ -66,3 +66,55 @@ model (ADR-0007): no Trigger SDK usage, node built-ins only.
 `scripts/opencode-smoke.ts` exercises `opencode.ts` end to end against a
 disposable temp fixture repo and worktree: an allowed edit, three
 escape-path attempts, a `git push`, and a `task`-tool attempt, run once each.
+
+## Tasks and scripts
+
+`src/tasks/worker-attempt.ts` defines `worker.attempt`, the task ADR-0007
+describes: `maxDuration: 600`, a single-concurrency `worker` queue, and one
+attempt (`retry: { maxAttempts: 1 }`, contract failures do not retry). `run`
+resolves the attempt's worktree and run directory, fails fast with
+`AbortTaskRunError` if the worktree path already exists, `worktreeAdd`s it,
+writes the permission ruleset and scrubbed env, and `spawnOpenCode`s the
+prompt, publishing `phase` (`worktree_ready` → `opencode_running` →
+`diffing` → `committed`/`path_violation`/`opencode_error`) and, once known,
+`pid`/`pgid`/`sessionID` to run metadata. On exit it diffs the worktree,
+`classifyPaths`, quarantines and reverts any violation before committing the
+remainder to `refs/heads/agencyhq/attempts/<attempt-id>`. An abort listener
+registered inside `run` (fires on cancel and on exceeding `maxDuration`) and
+the separate `onCancel` hook both call the same
+`checkpointAndKill`/`RunState` map from `src/tasks/worker-attempt-core.ts`,
+so whichever reaches a given run first commits the checkpoint to
+`refs/heads/agencyhq/checkpoints/<attempt-id>` and kills the process group
+exactly once; the loser is a no-op. `worker-attempt-core.ts` holds every
+piece of this that does not need the Trigger SDK (path resolution, output
+shape, the checkpoint-and-kill routine) so it can be unit-tested with fake
+git/proc functions instead of a running Trigger instance — see
+`test/worker-attempt-core.test.ts`.
+
+`scripts/lib/trigger-client.ts` wraps the SDK calls the trial script needs:
+`configureFromEnv` (`TRIGGER_API_URL`/`TRIGGER_SECRET_KEY`), `triggerAttempt`
+(dispatches `worker.attempt` with a global-scope `idempotencyKeys.create`
+key), `waitFinal` (polls `runs.retrieve` every 2s for a final status),
+`cancel`, and `metadataOf`. It imports the task's *type* only, so loading it
+never runs the task file's own top-level registration code.
+
+`scripts/fixture-repo.ts`'s `createFixture` builds a disposable one-commit
+git repo with an allowed area (`src/`, `docs/`), a denied area (`secrets/`),
+and `scripts/slow.js` (a node process that stays alive for 15 minutes, for
+exercising cancel/timeout); run directly (`node --env-file=.env
+scripts/fixture-repo.ts`) it prints `{repoPath, baseRev}` as JSON using
+`AGENCYHQ_WORKTREE_BASE` and `AGENCYHQ_FIXTURE_REMOTE`.
+
+`scripts/trial.ts <item> [--repo <path>] [--base-rev <sha>]` (also `pnpm
+trial <item>`) runs one item of docs/engineering/TESTING.md's required
+execution trial (lines 104-121) at a time against a real `trigger dev` and
+`opencode`: item 1 dispatches the same payload twice concurrently under one
+idempotency key and confirms one run, one worktree, one attempts ref; item 2
+cancels a `scripts/slow.js` run mid-flight and confirms a checkpoint ref, no
+survivors, and no live descendants of the OpenCode process group; item 3
+repeats that prompt with `maxDuration: 30` and confirms `TIMED_OUT` with no
+survivors and the worktree retained; item 4 checks a `git push` is blocked
+(plus a control `assertPushBlocked` run outside any attempt), that escape
+paths (`../`, `/tmp/...`, a denied in-worktree path) are quarantined, and
+that the `task` tool is denied. Each item prints `EVIDENCE ...` lines and one
+final `RESULT item=<n> PASS|FAIL reason=...` line.
