@@ -6,7 +6,8 @@
  *
  * Test cases:
  * (a) claims-pass + verify fails + honest accept → reject CITED_RESULT_NOT_PASSING
- * (b) tampers-verifier → blocking Finding kind=verifier_tampered before any review
+ * (b) tampers-verifier → blocking Finding kind=verifier_tampered + accept rejects VERIFIER_TAMPERED
+ * (b+) test-only diff → no verifier_tampered finding, acceptance not integrity-blocked
  * (c) blocking review → reject REVIEW_BLOCKING
  * (d) stale digest → reject RESULT_VERSION_MISMATCH
  * (e) overclaims → reject CITED_RESULT_MISSING + CRITERION_UNCITED
@@ -24,7 +25,12 @@ import { FakeExecutionRuntime } from "../../../../trigger/src/client/fake.ts";
 
 import { BoundedRepairFlow } from "../../src/flow/bounded-repair.ts";
 import type { FlowDeps } from "../../src/flow/types.ts";
-import { goodPlanOutput, goodReviewOutput, workerCompletedOutput } from "../helpers/fake-lead.ts";
+import {
+  goodAcceptanceProposal,
+  goodPlanOutput,
+  goodReviewOutput,
+  workerCompletedOutput,
+} from "../helpers/fake-lead.ts";
 import { seedProjectAndWorkItem } from "../helpers/seed.ts";
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -368,10 +374,10 @@ test("flow.false-success (a): verify fails → reject CITED_RESULT_NOT_PASSING (
 });
 
 // ---------------------------------------------------------------------------
-// Test (b): tampers-verifier → blocking Finding kind=verifier_tampered
+// Test (b): tampers-verifier → blocking Finding kind=verifier_tampered + accept rejects VERIFIER_TAMPERED
 // ---------------------------------------------------------------------------
 
-test("flow.false-success (b): tampers-verifier → verifier_tampered finding before review (R-014)", async (t) => {
+test("flow.false-success (b): tampers-verifier → verifier_tampered finding AND acceptance rejected VERIFIER_TAMPERED (R-014, R-017)", async (t) => {
   if (!DATABASE_URL) {
     t.skip("DATABASE_URL is not set");
     return;
@@ -410,8 +416,25 @@ test("flow.false-success (b): tampers-verifier → verifier_tampered finding bef
         };
       });
 
-      // Script lead.review to QUEUED (we check findings before review completes)
-      fake.script(TASK_IDS.leadReview, () => ({ status: "QUEUED" as const }));
+      // Script lead.review to complete with clean findings (no blocking review findings —
+      // the integrity gate, not the review, must block acceptance).
+      fake.script(TASK_IDS.leadReview, (payload: unknown) => {
+        const p = payload as {
+          attemptRevision: string;
+          diffDigest: string;
+          criteriaDigest: string;
+          profileDigest: string;
+        };
+        return {
+          status: "COMPLETED" as const,
+          output: goodReviewOutput({
+            attemptRevision: p.attemptRevision,
+            diffDigest: p.diffDigest,
+            criteriaDigest: p.criteriaDigest,
+            profileDigest: FAKE_PROFILE_DIGEST,
+          }),
+        };
+      });
 
       const { flow, workerRunId } = await runUntilWorkerDispatched(
         pool,
@@ -428,6 +451,9 @@ test("flow.false-success (b): tampers-verifier → verifier_tampered finding bef
 
       const workerFinalCmdId = newId("cmd");
       await flow.onWorkerFinal(workerObs, workerFinalCmdId);
+
+      const { rows: artifactRows } = await client.query("SELECT * FROM artifacts");
+      const artifactRow = artifactRows[0] as { revision: string; diff_digest: string };
 
       const { rows: verifyIntents } = await client.query(
         "SELECT * FROM dispatch_intents WHERE task = $1",
@@ -450,14 +476,248 @@ test("flow.false-success (b): tampers-verifier → verifier_tampered finding bef
       assert.equal(finding.severity, "blocking", "finding is blocking");
       assert.ok(finding.description.includes("package.json"), "finding mentions package.json");
 
-      // Review WAS dispatched (flow proceeds despite tampering — review will catch it)
+      // Review WAS dispatched (flow still runs review despite tampering finding)
       const { rows: reviewIntents } = await client.query(
         "SELECT * FROM dispatch_intents WHERE task = $1",
         [TASK_IDS.leadReview],
       );
       assert.equal(reviewIntents.length, 1, "lead.review dispatched");
 
+      // Complete the review step
+      const reviewRunId = (reviewIntents[0] as { run_id: string }).run_id;
+      fake.advance(reviewRunId);
+      fake.advance(reviewRunId);
+      const reviewObs = await fake.retrieve(reviewRunId);
+
+      // Script lead.accept with a valid proposal referencing the verification result
+      const vrRef = `agencyhq-verifier:pnpm-test:${artifactRow.revision}`;
+      fake.script(TASK_IDS.leadAccept, () => ({
+        status: "COMPLETED" as const,
+        output: goodAcceptanceProposal(["c1"], [vrRef]),
+      }));
+
+      const reviewFinalCmdId = newId("cmd");
+      await flow.onReviewFinal(reviewObs, reviewFinalCmdId);
+
+      const { rows: acceptIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.leadAccept],
+      );
+      const acceptRunId = (acceptIntents[0] as { run_id: string }).run_id;
+      fake.advance(acceptRunId);
+      fake.advance(acceptRunId);
+      const acceptObs = await fake.retrieve(acceptRunId);
+
+      const acceptFinalCmdId = newId("cmd");
+      await flow.onAcceptFinal(acceptObs, acceptFinalCmdId);
+
+      // Decision must be rejected (VERIFIER_TAMPERED blocks acceptance)
+      const { rows: decisionRows } = await client.query(
+        "SELECT * FROM decisions WHERE kind = 'accept'",
+      );
+      assert.equal(decisionRows.length, 1, "accept decision recorded");
+      assert.equal(
+        (decisionRows[0] as { outcome: string }).outcome,
+        "rejected",
+        "decision rejected due to verifier tampering",
+      );
+
+      // WorkItem NOT completed (stays in proposed lifecycle)
+      const { rows: wiRows } = await client.query(
+        "SELECT lifecycle FROM work_items WHERE id = $1",
+        [workItemId],
+      );
+      assert.equal(
+        (wiRows[0] as { lifecycle: string }).lifecycle,
+        "proposed",
+        "WorkItem NOT completed",
+      );
+
+      // Command result has VERIFIER_TAMPERED reason code
+      const { rows: acceptCmdRows } = await client.query(
+        "SELECT result FROM commands WHERE command_id = $1",
+        [acceptFinalCmdId],
+      );
+      const acceptCmdResult = (
+        acceptCmdRows[0] as { result: { reasons?: Array<{ code: string }> } }
+      ).result;
+      const reasonCodes = (acceptCmdResult.reasons ?? []).map((r: { code: string }) => r.code);
+      assert.ok(
+        reasonCodes.includes("VERIFIER_TAMPERED"),
+        `VERIFIER_TAMPERED in reasons; got: ${reasonCodes.join(", ")}`,
+      );
+
       // R-014: checksRun must NOT appear in any decision or command result
+      await assertNoChecksRunInDecisions(client);
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test (b+): test-only diff → no verifier_tampered finding, not integrity-blocked
+// (FAKE_PROFILE_RESOLVER only protects ["package.json"]; test files are not protected)
+// ---------------------------------------------------------------------------
+
+test("flow.false-success (b+): diff touching only test files produces no verifier_tampered finding and acceptance is not integrity-blocked", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+      const fake = new FakeExecutionRuntime();
+
+      // Worker output with only test files changed (no protected paths)
+      const workerOutput = workerCompletedOutput("placeholder", {
+        commitId: "aabbcc1234567890aabbcc1234567890aabbcc12",
+        changedPaths: ["test/parser/x.test.ts", "tests/y.spec.ts"],
+      });
+
+      // verify.run passes
+      fake.script(TASK_IDS.verifyRun, (payload: unknown) => {
+        const p = payload as {
+          contractId: string;
+          attemptId: string;
+          criteriaDigest: string;
+          profileDigest: string;
+          baseRevision: string;
+          attemptRevision: string;
+          diffDigest: string;
+        };
+        return {
+          status: "COMPLETED" as const,
+          output: { results: [makeVerifyResult(p, "pass")] },
+        };
+      });
+
+      // Review returns clean (no blocking findings)
+      fake.script(TASK_IDS.leadReview, (payload: unknown) => {
+        const p = payload as {
+          attemptRevision: string;
+          diffDigest: string;
+          criteriaDigest: string;
+          profileDigest: string;
+        };
+        return {
+          status: "COMPLETED" as const,
+          output: goodReviewOutput({
+            attemptRevision: p.attemptRevision,
+            diffDigest: p.diffDigest,
+            criteriaDigest: p.criteriaDigest,
+            profileDigest: FAKE_PROFILE_DIGEST,
+          }),
+        };
+      });
+
+      const { flow, workerRunId } = await runUntilWorkerDispatched(
+        pool,
+        fake,
+        workItemId,
+        workerOutput,
+        goodPlanOutput(),
+        client,
+      );
+
+      fake.advance(workerRunId);
+      fake.advance(workerRunId);
+      const workerObs = await fake.retrieve(workerRunId);
+
+      const workerFinalCmdId = newId("cmd");
+      await flow.onWorkerFinal(workerObs, workerFinalCmdId);
+
+      const { rows: artifactRows } = await client.query("SELECT * FROM artifacts");
+      const artifactRow = artifactRows[0] as { revision: string; diff_digest: string };
+
+      const { rows: verifyIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.verifyRun],
+      );
+      const verifyRunId = (verifyIntents[0] as { run_id: string }).run_id;
+      fake.advance(verifyRunId);
+      fake.advance(verifyRunId);
+      const verifyObs = await fake.retrieve(verifyRunId);
+
+      const verifyFinalCmdId = newId("cmd");
+      await flow.onVerifyFinal(verifyObs, verifyFinalCmdId);
+
+      // No verifier_tampered findings (test files are not protected verifier config)
+      const { rows: findingRows } = await client.query(
+        "SELECT * FROM findings WHERE kind = 'verifier_tampered'",
+      );
+      assert.equal(findingRows.length, 0, "no verifier_tampered finding for test-only diff");
+
+      // Complete review step
+      const { rows: reviewIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.leadReview],
+      );
+      assert.equal(reviewIntents.length, 1, "lead.review dispatched");
+      const reviewRunId = (reviewIntents[0] as { run_id: string }).run_id;
+      fake.advance(reviewRunId);
+      fake.advance(reviewRunId);
+      const reviewObs = await fake.retrieve(reviewRunId);
+
+      // Script a valid acceptance proposal
+      const vrRef = `agencyhq-verifier:pnpm-test:${artifactRow.revision}`;
+      fake.script(TASK_IDS.leadAccept, () => ({
+        status: "COMPLETED" as const,
+        output: goodAcceptanceProposal(["c1"], [vrRef]),
+      }));
+
+      const reviewFinalCmdId = newId("cmd");
+      await flow.onReviewFinal(reviewObs, reviewFinalCmdId);
+
+      const { rows: acceptIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.leadAccept],
+      );
+      const acceptRunId = (acceptIntents[0] as { run_id: string }).run_id;
+      fake.advance(acceptRunId);
+      fake.advance(acceptRunId);
+      const acceptObs = await fake.retrieve(acceptRunId);
+
+      const acceptFinalCmdId = newId("cmd");
+      await flow.onAcceptFinal(acceptObs, acceptFinalCmdId);
+
+      // Decision must be accepted (no integrity blocker, review passes)
+      const { rows: decisionRows } = await client.query(
+        "SELECT * FROM decisions WHERE kind = 'accept'",
+      );
+      assert.equal(decisionRows.length, 1, "accept decision recorded");
+      assert.equal(
+        (decisionRows[0] as { outcome: string }).outcome,
+        "accepted",
+        "decision accepted — test-file diff is not integrity-blocked",
+      );
+
+      // WorkItem completed
+      const { rows: wiRows } = await client.query(
+        "SELECT lifecycle FROM work_items WHERE id = $1",
+        [workItemId],
+      );
+      assert.equal(
+        (wiRows[0] as { lifecycle: string }).lifecycle,
+        "completed",
+        "WorkItem completed",
+      );
+
+      // No VERIFIER_TAMPERED reason in command result
+      const { rows: acceptCmdRows } = await client.query(
+        "SELECT result FROM commands WHERE command_id = $1",
+        [acceptFinalCmdId],
+      );
+      const acceptCmdResult = (acceptCmdRows[0] as { result: { accepted?: boolean } }).result;
+      assert.equal(acceptCmdResult.accepted, true, "command result is accepted:true");
+
       await assertNoChecksRunInDecisions(client);
     } finally {
       await pool.end();
