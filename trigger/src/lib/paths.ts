@@ -47,12 +47,20 @@ function isSuspicious(path: string): boolean {
   return segments.some((segment) => segment === "..");
 }
 
-export function classifyPaths(args: { changed: string[]; allowed: string[] }): {
+export function classifyPaths(args: {
+  changed: string[];
+  allowed: string[];
+  /** Glob patterns the worker must NOT edit. A path matching any denied glob
+   * is a violation even when it also matches an allowed glob (last-match-wins
+   * on-output layer mirrors the before-action permission ruleset). */
+  denied?: string[];
+}): {
   allowed: string[];
   violations: string[];
 } {
   const allowed: string[] = [];
   const violations: string[] = [];
+  const denied = args.denied ?? [];
 
   for (const path of args.changed) {
     if (isSuspicious(path)) {
@@ -60,10 +68,17 @@ export function classifyPaths(args: { changed: string[]; allowed: string[] }): {
       continue;
     }
     const isAllowed = args.allowed.some((pattern) => matchesGlob(pattern, path));
-    if (isAllowed) {
-      allowed.push(path);
-    } else {
+    if (!isAllowed) {
       violations.push(path);
+      continue;
+    }
+    // Deny overrides allow: a path matching any denied glob is quarantined even
+    // when it also matches an allowed pattern (last-match-wins).
+    const isDenied = denied.some((pattern) => matchesGlob(pattern, path));
+    if (isDenied) {
+      violations.push(path);
+    } else {
+      allowed.push(path);
     }
   }
 

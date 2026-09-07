@@ -445,3 +445,49 @@ test("lead-review-core.ts does not reference checkProposal or evaluateAcceptance
   assert.ok(!src.includes("checkProposal"), "must not reference checkProposal");
   assert.ok(!src.includes("evaluateAcceptance"), "must not reference evaluateAcceptance");
 });
+
+// ---------------------------------------------------------------------------
+// F-8: reviewerModel is the invoked payload.model, not the self-reported one
+// ---------------------------------------------------------------------------
+
+test("F-8: reviewerModel uses payload.model even when reviewer self-reports a different model", async () => {
+  const tmpBase = mkdtempSync(join(tmpdir(), "agencyhq-test-"));
+  try {
+    const payload = makePayload({ worktreeBase: tmpBase });
+    // The model self-reports a DIFFERENT identifier than what was invoked.
+    const selfReportedModel = "some-other-model/that-the-llm-claimed";
+    const sessionOutput: ReviewOutput = {
+      reviewer: { model: selfReportedModel },
+      subject: {
+        attemptRevision: payload.attemptRevision,
+        diffDigest: payload.diffDigest,
+        criteriaDigest: payload.criteriaDigest,
+        profileDigest: payload.profileDigest,
+      },
+      findings: [],
+    };
+    const deps = makeFakeDeps({ worktreeBase: tmpBase, sessionOutput });
+
+    const result = await runReview(payload, deps);
+
+    assert.ok(!("kind" in result), "valid review should not produce invalid_output");
+    // reviewerModel must be the INVOKED model, not the self-reported one.
+    assert.equal(
+      result.reviewerModel,
+      payload.model,
+      "reviewerModel must equal payload.model (invoked model), not the self-reported model",
+    );
+    assert.notEqual(
+      result.reviewerModel,
+      selfReportedModel,
+      "reviewerModel must not equal the self-reported model identifier",
+    );
+    // The self-reported model is still in the raw output's reviewer field.
+    assert.ok(
+      "reviewer" in result && (result as ReviewOutput).reviewer.model === selfReportedModel,
+      "self-reported reviewer.model should still be preserved in the result's reviewer field",
+    );
+  } finally {
+    rmSync(tmpBase, { recursive: true, force: true });
+  }
+});

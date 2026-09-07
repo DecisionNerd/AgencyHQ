@@ -46,22 +46,34 @@ model (ADR-0007): no Trigger SDK usage, node built-ins only.
   the credential helper and disable prompting/SSH); `assertPushBlocked` is
   the before-action control that proves a scrubbed env cannot push.
 - `paths.ts`: a minimal glob matcher (`*`, `**`, `?`, exact) plus
-  `classifyPaths` (allow/violation split against `paths.allow`, rejecting
-  `..` and absolute paths) and `quarantinePatch` (captures violating paths
+  `classifyPaths` (allow/violation split against `paths.allow`, with an
+  optional `denied` list — a path matching any denied glob is a violation
+  even if it also matches an allowed glob, mirroring the ruleset's last-match-
+  wins deny layer; rejects `..` and absolute paths) and `quarantinePatch`
+  (captures violating paths
   as a diff/patch for the record before they are reverted).
 - `procs.ts`: `descendants`, `killTree` (SIGTERM the process group and every
   descendant, wait out the grace period, then SIGKILL survivors), and
   `survivorScan` (finds any process still tagged with an attempt's
   `AGENCYHQ_ATTEMPT_ID`) for the stop sequence in EXECUTION_MODEL.md.
-- `opencode.ts`: `buildPermissionRuleset` and `writeRunConfig` produce the
-  worker's permission ruleset and `opencode.worker.json`; `spawnOpenCode`
-  runs `opencode run --format json` as a detached process group against a
-  worktree with the scrubbed env, `OPENCODE_DISABLE_PROJECT_CONFIG`,
-  `--pure`, and `OPENCODE_PERMISSION`, streaming events and stderr to the
-  run directory; `parseEvents`/`summarize` reduce the NDJSON stream to
-  denials, errors, tool uses, and a text tail. See the file's header comment
-  for the OpenCode CLI/config/permission facts this encodes and their
-  source dates, and for what the required smoke run actually observed.
+- `opencode.ts`: `buildPermissionRuleset` (spike fallback) and `writeRunConfig`
+  produce the worker's permission ruleset and `opencode.worker.json`.
+  Permission source: when `WorkerAttemptPayload.permissionRules` is present
+  (set by the coordinator from a frozen StepContract), that contract ruleset is
+  written verbatim after `enforceAlwaysDeny` merges `WORKER_ALWAYS_DENY_BASH`
+  and `WORKER_ALWAYS_DENY_PATHS` on top for defense in depth. When absent,
+  `buildPermissionRuleset` is used as a spike fallback. `permissionSource`
+  ("contract" | "fallback") is recorded in run metadata. Deny enforcement
+  applies at two layers: before-action (the ruleset's edit/bash pattern map,
+  last-match-wins) and on-output (`classifyPaths` with `denied` list from
+  `payload.bounds?.paths.deny`). `spawnOpenCode` runs `opencode run --format
+  json` as a detached process group against a worktree with the scrubbed env,
+  `OPENCODE_DISABLE_PROJECT_CONFIG`, `--pure`, and `OPENCODE_PERMISSION`,
+  streaming events and stderr to the run directory;
+  `parseEvents`/`summarize` reduce the NDJSON stream to denials, errors, tool
+  uses, and a text tail. See the file's header comment for the OpenCode
+  CLI/config/permission facts this encodes and their source dates, and for
+  what the required smoke run actually observed.
 
 `scripts/opencode-smoke.ts` exercises `opencode.ts` end to end against a
 disposable temp fixture repo and worktree: an allowed edit, three

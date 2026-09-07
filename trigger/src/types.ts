@@ -72,6 +72,15 @@ export type WorkerAttemptPayload = {
   allowedPaths: string[];
   model?: string;
   worktreeBase?: string;
+  /** Frozen contract bounds (paths, capabilities, boundary, budget, etc.).
+   * Optional: the spike trial harness may omit. When present, `permissionRules`
+   * should also be present and is used as the authoritative ruleset. */
+  bounds?: ContractBounds;
+  /** Contract-derived OpenCode permission ruleset. When present, written to
+   * opencode.worker.json verbatim (with always-deny entries merged on top for
+   * defense in depth). When absent, the spike fallback `buildPermissionRuleset`
+   * is used and `permissionSource` is recorded as "fallback". */
+  permissionRules?: ContractsPermissionRuleset;
 };
 
 /** Result of one `worker.attempt` run. `survivors` is only ever non-empty
@@ -113,7 +122,12 @@ export type WorkerAttemptOutput = {
 // Appended for lead review and accept tasks (Packet 3.D).
 // These types support the lead.review and lead.accept Trigger tasks.
 
-import type { AcceptanceProposal, ReviewOutput } from "@agencyhq/contracts";
+import type {
+  AcceptanceProposal,
+  ContractBounds,
+  PermissionRuleset as ContractsPermissionRuleset,
+  ReviewOutput,
+} from "@agencyhq/contracts";
 
 /**
  * The exact LeadSession signature implemented by trigger/src/opencode/sdk.ts.

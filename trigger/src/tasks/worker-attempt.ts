@@ -30,6 +30,13 @@ import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
 
+import type {
+  PermissionAction,
+  PermissionPatternMap,
+  PermissionRuleset as ContractsPermissionRuleset,
+} from "@agencyhq/contracts";
+import { WORKER_ALWAYS_DENY_BASH, WORKER_ALWAYS_DENY_PATHS } from "@agencyhq/contracts";
+
 import { scrubbedChildEnv } from "../lib/env.ts";
 import {
   changedPaths,
@@ -62,6 +69,33 @@ import {
 } from "./worker-attempt-core.ts";
 
 const DEFAULT_MODEL = "openai/gpt-5.6-terra";
+
+/**
+ * Defense-in-depth: merge always-deny entries on top of a contract ruleset.
+ * Ensures that task and external_directory are always denied, and that bash
+ * patterns from WORKER_ALWAYS_DENY_BASH and file patterns from
+ * WORKER_ALWAYS_DENY_PATHS are denied after any allows, even if the payload
+ * ruleset explicitly allowed them. Last-match-wins is OpenCode's rule.
+ */
+function enforceAlwaysDeny(ruleset: ContractsPermissionRuleset): ContractsPermissionRuleset {
+  const bash: PermissionPatternMap = { ...ruleset.bash };
+  for (const pattern of WORKER_ALWAYS_DENY_BASH) {
+    bash[pattern] = "deny";
+  }
+
+  const edit: PermissionPatternMap = { ...ruleset.edit };
+  for (const glob of WORKER_ALWAYS_DENY_PATHS) {
+    edit[glob] = "deny";
+  }
+
+  return {
+    ...ruleset,
+    bash,
+    edit,
+    task: "deny" as PermissionAction,
+    external_directory: "deny" as PermissionAction,
+  };
+}
 
 /** Adapter soft deadline before Trigger's hard maxDuration. Observed
  * 2026-09-07 (trial item 3, trigger.dev 4.5.16 dev): on maxDuration the
@@ -205,9 +239,26 @@ export const workerAttempt = task({
     metadata.set("phase", "worktree_ready");
 
     const model = payload.model ?? process.env.AGENCYHQ_OPENCODE_MODEL ?? DEFAULT_MODEL;
-    const ruleset = buildPermissionRuleset({ allowedPaths: payload.allowedPaths, worktreePath });
+
+    // F-1: Use the contract's permission ruleset when present (coordinator path);
+    // fall back to the spike's buildPermissionRuleset when absent.
+    // Defense-in-depth: always-deny entries are merged on top of the contract
+    // ruleset regardless, so a malformed payload cannot widen permissions.
+    const permissionSource: "contract" | "fallback" = payload.permissionRules
+      ? "contract"
+      : "fallback";
+    const ruleset =
+      payload.permissionRules !== undefined
+        ? enforceAlwaysDeny(payload.permissionRules)
+        : buildPermissionRuleset({
+            allowedPaths: payload.allowedPaths,
+            worktreePath,
+            deniedPaths: payload.bounds?.paths.deny ?? [],
+          });
+
     await mkdir(runDir, { recursive: true });
     await writeRunConfig({ runDir, model, ruleset });
+    metadata.set("permissionSource", permissionSource);
 
     const env = scrubbedChildEnv({ attemptId: payload.attemptId });
     const { child, pid, pgid } = await spawnOpenCode({
@@ -334,7 +385,13 @@ export const workerAttempt = task({
     }
 
     const changed = await changedPaths({ worktreePath, baseRev: payload.baseRev });
-    const { violations } = classifyPaths({ changed, allowed: payload.allowedPaths });
+    // F-4: pass denied paths so the on-output classification matches the
+    // before-action permission ruleset's deny layer (last-match-wins).
+    const { violations } = classifyPaths({
+      changed,
+      allowed: payload.allowedPaths,
+      denied: payload.bounds?.paths.deny ?? [],
+    });
 
     if (violations.length > 0) {
       const patch = await quarantinePatch({
