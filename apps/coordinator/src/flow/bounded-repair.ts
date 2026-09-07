@@ -63,6 +63,8 @@ import {
   type WorkItemId,
 } from "@agencyhq/domain";
 
+import { confirmStop } from "../commands/confirm-stop.ts";
+import type { CommandDeps } from "../commands/stop.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -272,6 +274,37 @@ function workItemIdFromPlanIntentKey(ikey: string): string | null {
   const parts = ikey.split(":");
   if (parts.length < 3) return null;
   return parts[1] ?? null;
+}
+
+/**
+ * Extract the dispatched generation from a worker intent's idempotency key.
+ *
+ * Worker intent keys use the format `<intentId>:g<generation>` so the
+ * coordinator can tell the observation's dispatched generation from the
+ * attempt's current (possibly revoked) generation (F-2).
+ *
+ * Returns 1 as a backward-compatible default for intents without a suffix.
+ */
+export function generationOfIntent(intentRow: { idempotency_key: string }): number {
+  const match = /:g(\d+)$/.exec(intentRow.idempotency_key);
+  if (match?.[1]) return Number.parseInt(match[1], 10);
+  return 1;
+}
+
+/** Build the standard trigger tags for a contract attempt. */
+function triggerTags(opts: {
+  projectId: string;
+  workItemId: string;
+  contractId: string;
+  contractVersion: number;
+  attemptId: string;
+}): string[] {
+  return [
+    `project:${opts.projectId}`,
+    `workItem:${opts.workItemId}`,
+    `contract:${opts.contractId}:${opts.contractVersion}`,
+    `attempt:${opts.attemptId}`,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +616,9 @@ export class BoundedRepairFlow {
         [String(attemptId), String(contractId), contract.version, budgetRemaining],
       );
 
+      // Worker intent idempotency_key encodes the dispatched generation (F-2).
+      const workerIntentKey = `${String(workerIntentId)}:g1`;
+
       await client.query(
         `INSERT INTO dispatch_intents
            (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
@@ -592,8 +628,14 @@ export class BoundedRepairFlow {
           TASK_IDS.workerAttempt,
           String(workerPayloadDigest),
           String(attemptId),
-          String(workerIntentId),
+          workerIntentKey,
         ],
+      );
+
+      // Close the incoming lead.plan intent inside the same transaction (F-5).
+      await client.query(
+        "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+        [intentId],
       );
 
       await client.query("COMMIT");
@@ -603,7 +645,18 @@ export class BoundedRepairFlow {
         intentId: workerIntentId,
         task: TASK_IDS.workerAttempt,
         payload: workerPayload,
-        options: { idempotencyKey: String(workerIntentId) },
+        options: {
+          idempotencyKey: workerIntentKey,
+          maxDurationSeconds: contract.bounds.budget.maxDurationSeconds,
+          concurrencyKey: String(contract.projectId),
+          tags: triggerTags({
+            projectId: String(contract.projectId),
+            workItemId: String(contract.workItemId),
+            contractId: String(contractId),
+            contractVersion: contract.version,
+            attemptId: String(attemptId),
+          }),
+        },
       });
 
       await pool.query(
@@ -650,9 +703,15 @@ export class BoundedRepairFlow {
       const contractRow = await loadContract(pool, attemptRow.contract_id);
       const projectRow = await loadProject(pool, contractRow.project_id);
 
+      // F-2: Load the dispatch intent to recover the dispatched generation from the
+      // idempotency key suffix (`:g<n>`).  This is distinct from the attempt's
+      // current generation which may have been bumped by revokeGeneration (stop).
+      const workerIntentRow = await loadIntentByRunAndTask(pool, obs.runId, TASK_IDS.workerAttempt);
+      const observedGeneration = generationOfIntent(workerIntentRow);
+
       const obsResult = await applyObservation(client, {
         runId: obs.runId,
-        generation: attemptRow.generation,
+        generation: observedGeneration, // dispatched generation, not current (F-2)
         attemptId: attemptRow.id,
         status: obs.status,
         payload: obs,
@@ -673,14 +732,53 @@ export class BoundedRepairFlow {
         ...(obs.error !== undefined ? { error: obs.error } : {}),
       };
       const classification = classifyObservation(obsForClassify, {
-        generation: attemptRow.generation,
-        observedGeneration: attemptRow.generation,
+        generation: attemptRow.generation, // current (possibly revoked) generation
+        observedGeneration, // dispatched generation (F-2)
         budgetRemaining: attemptRow.budget_remaining,
-        stopRequested: false,
+        stopRequested: attemptRow.status === "stopping", // F-2: derive from actual status
       });
 
       if (classification.stale) {
         await completeCommand(client, commandId, { skipped: "stale" });
+        return;
+      }
+
+      // F-2: CANCELED/TIMED_OUT when a stop was requested → call confirmStop;
+      // never dispatch a replacement on this path.
+      if (classification.attemptStatus === "stopping") {
+        const commandDeps: CommandDeps = { pool, runtime, clock: this.deps.clock };
+        const csResult = await confirmStop(commandDeps, client, {
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          observation: obs,
+        });
+
+        if (csResult.status === "pending_confirmation") {
+          // Evidence not yet available; leave intent open for next poll.
+          await completeCommand(client, commandId, { skipped: "pending_confirmation" });
+          return;
+        }
+
+        if (csResult.status === "uncertain") {
+          // Survivors remain — block dispatch until a human resolves.
+          await pool.query(
+            `UPDATE work_items
+             SET condition = 'uncertain', version = version + 1, updated_at = now()
+             WHERE id = (
+               SELECT sc.work_item_id FROM step_contracts sc
+               JOIN attempts a ON a.contract_id = sc.id WHERE a.id = $1
+             )`,
+            [attemptRow.id],
+          );
+        }
+
+        // Close the incoming worker intent (F-5).
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+          [workerIntentRow.id],
+        );
+
+        await completeCommand(client, commandId, { confirmStop: csResult.status });
         return;
       }
 
@@ -691,9 +789,43 @@ export class BoundedRepairFlow {
         }
         const output = workerOutput.data;
 
+        // F-14: a null commitId means the worker produced no artifact.  Treat
+        // this as a contract failure (no Artifact row, no verify dispatch).
+        if (!output.commitId) {
+          const failureId = ids.next("fail") as FailureId;
+          await client.query("BEGIN");
+          await client.query(
+            `INSERT INTO failures (id, class, phase, attempt_id, run_id, cause)
+             VALUES ($1, 'contract', 'final', $2, $3, $4)`,
+            [
+              String(failureId),
+              attemptRow.id,
+              obs.runId,
+              "worker completed without a commit (null commitId — no artifact)",
+            ],
+          );
+          await client.query(
+            "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1",
+            [attemptRow.id, String(failureId)],
+          );
+          // Close the incoming worker intent (F-5).
+          await client.query(
+            "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+            [workerIntentRow.id],
+          );
+          await client.query("COMMIT");
+          await completeCommand(client, commandId, {
+            failureId: String(failureId),
+            nullCommit: true,
+          });
+          return;
+        }
+
         const artifactId = ids.next("art") as ArtifactId;
-        const revision = output.commitId ?? obs.runId;
+        const revision = output.commitId;
         const diffDigest = output.diffDigest ?? String(digestOf({ revision }));
+
+        const resolvedProfile = await profileResolver(contractRow.profile_id);
 
         await client.query("BEGIN");
         await client.query(
@@ -720,9 +852,8 @@ export class BoundedRepairFlow {
             output.opencode.sessionID,
           ],
         );
-        await client.query("COMMIT");
 
-        const resolvedProfile = await profileResolver(contractRow.profile_id);
+        const verifyIntentId = ids.next("di") as DispatchIntentId;
         const verifyPayload = VerifyRunPayloadSchema.parse({
           attemptId: attemptRow.id,
           generation: attemptRow.generation,
@@ -736,11 +867,10 @@ export class BoundedRepairFlow {
           attemptRevision: revision,
           diffDigest,
           checks: resolvedProfile.checks,
+          protectedPaths: resolvedProfile.protectedPaths, // F-6
         });
 
-        const verifyIntentId = ids.next("di") as DispatchIntentId;
-
-        await pool.query(
+        await client.query(
           `INSERT INTO dispatch_intents
              (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
            VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
@@ -753,11 +883,30 @@ export class BoundedRepairFlow {
           ],
         );
 
+        // Close the incoming worker intent inside the transaction (F-5).
+        await client.query(
+          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+          [workerIntentRow.id],
+        );
+
+        await client.query("COMMIT");
+
         const { runId: verifyRunId } = await runtime.trigger({
           intentId: verifyIntentId,
           task: TASK_IDS.verifyRun,
           payload: verifyPayload,
-          options: { idempotencyKey: String(verifyIntentId) },
+          options: {
+            idempotencyKey: String(verifyIntentId),
+            maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+            concurrencyKey: contractRow.project_id,
+            tags: triggerTags({
+              projectId: contractRow.project_id,
+              workItemId: contractRow.work_item_id,
+              contractId: contractRow.id,
+              contractVersion: contractRow.version,
+              attemptId: attemptRow.id,
+            }),
+          },
         });
 
         await pool.query(
@@ -806,6 +955,12 @@ export class BoundedRepairFlow {
           [attemptRow.id, String(failureId)],
         );
 
+        // Close the incoming worker intent (F-5).
+        await client.query(
+          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+          [workerIntentRow.id],
+        );
+
         await client.query("COMMIT");
         await completeCommand(client, commandId, { failureId: String(failureId), pathViolations });
       } else if (classification.autoNewAttempt) {
@@ -829,6 +984,8 @@ export class BoundedRepairFlow {
         });
 
         const newIntentId = ids.next("di") as DispatchIntentId;
+        // New attempt starts at generation 1; encode it in the idempotency key (F-2).
+        const newIntentKey = `${String(newIntentId)}:g1`;
 
         await client.query("BEGIN");
         await client.query(
@@ -850,8 +1007,13 @@ export class BoundedRepairFlow {
             TASK_IDS.workerAttempt,
             String(digestOf(newWorkerPayload)),
             String(newAttemptId),
-            String(newIntentId),
+            newIntentKey,
           ],
+        );
+        // Close the incoming worker intent inside the transaction (F-5).
+        await client.query(
+          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+          [workerIntentRow.id],
         );
         await client.query("COMMIT");
 
@@ -859,7 +1021,18 @@ export class BoundedRepairFlow {
           intentId: newIntentId,
           task: TASK_IDS.workerAttempt,
           payload: newWorkerPayload,
-          options: { idempotencyKey: String(newIntentId) },
+          options: {
+            idempotencyKey: newIntentKey,
+            maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+            concurrencyKey: contractRow.project_id,
+            tags: triggerTags({
+              projectId: contractRow.project_id,
+              workItemId: contractRow.work_item_id,
+              contractId: contractRow.id,
+              contractVersion: contractRow.version,
+              attemptId: String(newAttemptId),
+            }),
+          },
         });
 
         await pool.query(
@@ -893,6 +1066,11 @@ export class BoundedRepairFlow {
         await client.query(
           "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1",
           [attemptRow.id, String(failureId)],
+        );
+        // Close the incoming worker intent (F-5).
+        await client.query(
+          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+          [workerIntentRow.id],
         );
         await client.query("COMMIT");
         await completeCommand(client, commandId, { failureId: String(failureId) });
@@ -966,8 +1144,6 @@ export class BoundedRepairFlow {
           ],
         );
       }
-      await client.query("COMMIT");
-
       const reviewIntentId = ids.next("di") as DispatchIntentId;
       const reviewPayload = LeadReviewPayloadSchema.parse({
         attemptId: attemptRow.id,
@@ -986,7 +1162,8 @@ export class BoundedRepairFlow {
         baseRevision: contractRow.base_revision,
       });
 
-      await pool.query(
+      // Insert review intent and close incoming verify intent in the same tx (F-5).
+      await client.query(
         `INSERT INTO dispatch_intents
            (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
          VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
@@ -998,12 +1175,29 @@ export class BoundedRepairFlow {
           String(reviewIntentId),
         ],
       );
+      await client.query(
+        "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+        [intentRow.id],
+      );
+
+      await client.query("COMMIT");
 
       const { runId: reviewRunId } = await runtime.trigger({
         intentId: reviewIntentId,
         task: TASK_IDS.leadReview,
         payload: reviewPayload,
-        options: { idempotencyKey: String(reviewIntentId) },
+        options: {
+          idempotencyKey: String(reviewIntentId),
+          maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+          concurrencyKey: contractRow.project_id,
+          tags: triggerTags({
+            projectId: contractRow.project_id,
+            workItemId: contractRow.work_item_id,
+            contractId: contractRow.id,
+            contractVersion: contractRow.version,
+            attemptId: attemptRow.id,
+          }),
+        },
       });
 
       await pool.query(
@@ -1053,27 +1247,6 @@ export class BoundedRepairFlow {
       }
       const review = reviewOutput.data;
 
-      const reviewId = ids.next("rev") as ReviewId;
-      await client.query("BEGIN");
-      await client.query(
-        `INSERT INTO reviews
-           (id, attempt_id, attempt_revision, diff_digest, criteria_digest,
-            profile_digest, reviewer_model, profile, findings)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
-        [
-          String(reviewId),
-          attemptRow.id,
-          artifactRow?.revision ?? null,
-          artifactRow?.diff_digest ?? null,
-          contractRow.criteria_digest,
-          resolvedProfile.digest,
-          review.reviewer.model,
-          contractRow.bounds.review,
-          JSON.stringify(review.findings),
-        ],
-      );
-      await client.query("COMMIT");
-
       const verificationResults = await loadVerificationResults(pool, attemptRow.id);
 
       const acceptIntentId = ids.next("di") as DispatchIntentId;
@@ -1091,7 +1264,28 @@ export class BoundedRepairFlow {
         model: config.leadModel,
       });
 
-      await pool.query(
+      const reviewId = ids.next("rev") as ReviewId;
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO reviews
+           (id, attempt_id, attempt_revision, diff_digest, criteria_digest,
+            profile_digest, reviewer_model, profile, findings)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+        [
+          String(reviewId),
+          attemptRow.id,
+          artifactRow?.revision ?? null,
+          artifactRow?.diff_digest ?? null,
+          contractRow.criteria_digest,
+          resolvedProfile.digest,
+          config.reviewerModel, // F-8: use the invoked model, not self-reported
+          contractRow.bounds.review,
+          JSON.stringify(review.findings),
+        ],
+      );
+
+      // Insert accept intent and close incoming review intent in same tx (F-5).
+      await client.query(
         `INSERT INTO dispatch_intents
            (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
          VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
@@ -1103,12 +1297,29 @@ export class BoundedRepairFlow {
           String(acceptIntentId),
         ],
       );
+      await client.query(
+        "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+        [intentRow.id],
+      );
+
+      await client.query("COMMIT");
 
       const { runId: acceptRunId } = await runtime.trigger({
         intentId: acceptIntentId,
         task: TASK_IDS.leadAccept,
         payload: acceptPayload,
-        options: { idempotencyKey: String(acceptIntentId) },
+        options: {
+          idempotencyKey: String(acceptIntentId),
+          maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+          concurrencyKey: contractRow.project_id,
+          tags: triggerTags({
+            projectId: contractRow.project_id,
+            workItemId: contractRow.work_item_id,
+            contractId: contractRow.id,
+            contractVersion: contractRow.version,
+            attemptId: attemptRow.id,
+          }),
+        },
       });
 
       await pool.query(
@@ -1218,6 +1429,41 @@ export class BoundedRepairFlow {
       const at = new Date();
       const decisionId = ids.next("dec") as DecisionId;
 
+      // F-14: humanRequired contract reaching accept without an Approval emits
+      // pending_human (not silently rejected) so the work item stays active.
+      if (
+        contractRow.human_required &&
+        !acceptResult.ok &&
+        acceptResult.reasons?.some((r) => r.code === "APPROVAL_REQUIRED")
+      ) {
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO decisions
+             (id, kind, actor, work_item_id, contract_id, contract_version, attempt_id, outcome, at)
+           VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'pending_human', $6)`,
+          [
+            String(decisionId),
+            contractRow.work_item_id,
+            contractRow.id,
+            contractRow.version,
+            attemptRow.id,
+            at,
+          ],
+        );
+        // Close incoming accept intent (F-5).
+        await client.query(
+          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+          [intentRow.id],
+        );
+        await client.query("COMMIT");
+        await completeCommand(client, commandId, {
+          accepted: false,
+          humanRequired: true,
+          decisionId: String(decisionId),
+        });
+        return;
+      }
+
       if (acceptResult.ok) {
         const revision = artifactRow?.revision ?? "";
 
@@ -1241,6 +1487,11 @@ export class BoundedRepairFlow {
                version = version + 1, updated_at = now()
            WHERE id = $1`,
           [contractRow.work_item_id],
+        );
+        // Close incoming accept intent (F-5).
+        await client.query(
+          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+          [intentRow.id],
         );
         await client.query("COMMIT");
         await completeCommand(client, commandId, {
@@ -1273,6 +1524,11 @@ export class BoundedRepairFlow {
             );
           }
         }
+        // Close incoming accept intent (F-5).
+        await client.query(
+          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+          [intentRow.id],
+        );
         await client.query("COMMIT");
         await completeCommand(client, commandId, {
           accepted: false,
@@ -1333,7 +1589,20 @@ export class BoundedRepairFlow {
       intentId: intentId as DispatchIntentId,
       task: intentRow.task,
       payload,
-      options: { idempotencyKey: intentId },
+      // Use the stored idempotency_key (which encodes generation) so retryDispatch
+      // returns the same run as the original trigger when the key is still live (F-2/F-3).
+      options: {
+        idempotencyKey: intentRow.idempotency_key,
+        maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+        concurrencyKey: contractRow.project_id,
+        tags: triggerTags({
+          projectId: contractRow.project_id,
+          workItemId: contractRow.work_item_id,
+          contractId: contractRow.id,
+          contractVersion: contractRow.version,
+          attemptId: attemptRow.id,
+        }),
+      },
     });
 
     await pool.query(
