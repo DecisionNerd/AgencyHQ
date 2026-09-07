@@ -29,6 +29,10 @@ The `BoundedRepairFlow` class drives the plan → admit → dispatch → verify 
 - **R-001**: Lead outputs are proposals — `checkProposal` and `evaluateAcceptance` run before any Decision is recorded.
 - **R-014**: Worker run reports are never used as acceptance evidence; only `VerificationResult` rows from `verify.run` count.
 - **Idempotency**: all methods use `claimCommand` / `completeCommand` so re-delivery is safe.
+- **Dispatch options**: `runtime.trigger()` is called with `concurrencyKey` (repository id), `tags` (project, workItem, contract version, attempt), and `maxDurationSeconds` from the contract.
+- **Observation dedupe**: run observations are keyed by Trigger run id and attempt generation; a delivery for a revoked generation is stored as history-only (stale). Deterministic observation command ids are `cmd_obs_<runId>_<gen>`. An in-flight guard prevents concurrent poll deliveries for the same run.
+- **Stop path**: `confirmStop` is called from the reconciler with the run's final metadata (`survivors`, `checkpointCommit`) as evidence; the checkpoint commit is recorded on the attempt row; the cancelled observation is stored as history-only (stale); no replacement attempt is dispatched on an operator-initiated stop.
+- **Stop command replay**: a repeated stop command with the same command id returns `replayed: true`.
 
 ### Testing
 

@@ -5,7 +5,7 @@
 - Extends: ADR-0001 (names the runtime authority that ADR-0001 left implicit)
 - Amends: ADR-0002 (Trigger.dev is the one infrastructure component admitted
   without a measured scaling requirement, for the reasons below)
-- Implementation status: Slice 1 spike implemented; Slice 3 complete task adapters (`lead.plan`, `verify.run`, `lead.review`, `lead.accept`) and coordinator flow implemented. Qualified by the Slice 1 execution trial on 2026-09-07 (items 1–4), see [../trials/2026-09-slice1.md](../trials/2026-09-slice1.md); and by the Slice 3 trial on 2026-09-07 (items 1–7), see [../trials/2026-09-slice3.md](../trials/2026-09-slice3.md).
+- Implementation status: Slice 1 spike implemented; Slice 3 complete task adapters (`lead.plan`, `verify.run`, `lead.review`, `lead.accept`) and coordinator flow implemented. Qualified by the Slice 1 execution trial on 2026-09-07 (items 1–4 PASS), see [../trials/2026-09-slice1.md](../trials/2026-09-slice1.md); and by the Slice 3 trial on 2026-09-07 (items 1–3 PASS live, 4a PASS live, 4b/4c not exercised live, 5 PASS live, 6 PARTIAL — weakened-test path not exercised live and covered by deterministic tests, 7 PASS live), see [../trials/2026-09-slice3.md](../trials/2026-09-slice3.md). Rework re-check 2026-09-07: worker ruleset from the contract, stop path, and full flow re-verified live; see the [rework section](../trials/2026-09-slice3.md#rework-after-independent-review-1-2026-09-07).
 
 ## Context
 

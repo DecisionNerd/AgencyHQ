@@ -4,7 +4,7 @@
 - Date: 2026-09-07
 - Extends: ADR-0004 (defines what the "supervisor" is and renames it)
 - Amends: R-005 wording (see REQUIREMENTS.md)
-- Implementation status: Authority subset check with 15 violation codes, fast-check property laws, and human-approval determination implemented in `packages/domain/src/authority/` (Slice 2). Lead tasks (`lead.plan`, `lead.review`, `lead.accept`) implemented via the OpenCode SDK with structured output; `BoundedRepairFlow` coordinator flow implemented (Slice 3). Qualified by the Slice 3 execution trial items 5–7 on 2026-09-07; see [../trials/2026-09-slice3.md](../trials/2026-09-slice3.md).
+- Implementation status: Authority subset check with 15 violation codes, fast-check property laws, and human-approval determination implemented in `packages/domain/src/authority/` (Slice 2). Lead tasks (`lead.plan`, `lead.review`, `lead.accept`) implemented via the OpenCode SDK with structured output; `BoundedRepairFlow` coordinator flow implemented (Slice 3). Qualified by the Slice 3 execution trial on 2026-09-07: item 5 PASS live, item 6 PARTIAL (worker resisted adversarial house rules — weakened-test path not exercised live; covered by deterministic tests), item 7 PASS live; see [../trials/2026-09-slice3.md](../trials/2026-09-slice3.md). Rework re-check 2026-09-07: full flow (plan → attempt → verify → review → accept) re-verified live; see the [rework section](../trials/2026-09-slice3.md#rework-after-independent-review-1-2026-09-07).
 
 ## Context
 

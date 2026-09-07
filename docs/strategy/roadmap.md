@@ -53,11 +53,12 @@ on it.
   Realtime for execution state and links to Trigger runs for logs.
 - Run the full execution trial on the real stack and record it. CI runs the
   baseline check and all slice tests.
-- Outcome (2026-09-07): items 1–7 run; items 1–5 PASS, item 6 PARTIAL
-  (weakened-test path not exercised live; deterministic tests cover the gate),
-  item 7 PASS (work item `89cfe999-9710-4388-8dd1-caf520d26d49` completed at
-  artifact, no Approval, ~150 s end to end). 787 unit tests, 86 integration
-  tests. Full record:
+- Outcome (2026-09-07): items 1–7 run; items 1–3 PASS, item 4a PASS (4b/4c not
+  exercised live — worker model declined to write via bash; Slice 1 record and
+  unit tests are the evidence), item 5 PASS, item 6 PARTIAL (weakened-test path
+  not exercised live; deterministic tests cover the gate), item 7 PASS (work item
+  `89cfe999-9710-4388-8dd1-caf520d26d49` completed at artifact, no Approval,
+  ~150 s end to end). 787 unit tests, 86 integration tests. Full record:
   [trials/2026-09-slice3.md](../engineering/trials/2026-09-slice3.md).
 
 ## Slice 4 — integration boundaries and multiple repositories (current)
