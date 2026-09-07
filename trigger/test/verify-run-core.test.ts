@@ -518,16 +518,15 @@ test("protectedPaths explicit: custom list overrides DEFAULT_PROTECTED_PATHS", a
   }
 });
 
-// T13: test/parser/reject.test.ts is flagged by the default list.
-// DEFAULT_PROTECTED_PATHS includes test/** and **/*.test.* — both patterns cover this path.
-test("protectedPaths default: test/parser/reject.test.ts is covered by DEFAULT_PROTECTED_PATHS", async () => {
+// T13: test files are NOT verifier configuration. After review 2 (G-1) the
+// default list covers verifier config only; weakened tests are the adversarial
+// review's job and are governed by the contract's paths.allow.
+test("protectedPaths default: test/parser/reject.test.ts is not covered by DEFAULT_PROTECTED_PATHS", async () => {
   const { DEFAULT_PROTECTED_PATHS } = await import("@agencyhq/domain");
   const { matchesGlob } = await import("../src/lib/paths.ts");
 
   const testFilePath = "test/parser/reject.test.ts";
   const covered = DEFAULT_PROTECTED_PATHS.some((p) => matchesGlob(p, testFilePath));
-  assert.ok(
-    covered,
-    `${testFilePath} must be covered by at least one DEFAULT_PROTECTED_PATHS pattern`,
-  );
+  assert.equal(covered, false, `${testFilePath} must not be a protected verifier path`);
+  assert.ok(DEFAULT_PROTECTED_PATHS.some((p) => matchesGlob(p, "package.json")));
 });
