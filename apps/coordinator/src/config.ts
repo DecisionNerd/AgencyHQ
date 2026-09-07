@@ -17,6 +17,7 @@ export type CoordinatorConfig = {
   leadVariant?: string | undefined;
   reconcileIntervalMs: number;
   freshnessStaleMs: number;
+  uncertainAfterMs: number;
   webDist?: string;
   port: number;
 };
@@ -117,6 +118,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
 
   const reconcileIntervalMs = integer("RECONCILE_INTERVAL_MS", 5000);
   const freshnessStaleMs = integer("FRESHNESS_STALE_MS", 30000);
+  const uncertainAfterMs = integer("AGENCYHQ_UNCERTAIN_AFTER_MS", 120_000);
   const webDist = optional("WEB_DIST");
   const port = portNum("PORT", 8787);
 
@@ -136,6 +138,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     leadVariant,
     reconcileIntervalMs,
     freshnessStaleMs,
+    uncertainAfterMs,
     port,
   };
 

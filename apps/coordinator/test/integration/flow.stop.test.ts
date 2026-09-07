@@ -13,6 +13,9 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { digestOf, TASK_IDS } from "@agencyhq/contracts";
 import { applyObservation, createPool, withTestSchema } from "@agencyhq/db";
@@ -634,6 +637,455 @@ test("flow.stop: CANCELED + metadata survivors non-empty (R-013) → attempt unc
       // No replacement attempt (R-013: no retry on uncertain)
       const { rows: allA } = await client.query("SELECT id FROM attempts");
       assert.equal(allA.length, 1, "no replacement attempt");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RW-4b tests (i)-(iv): uncertain stop outcome, stop.ndjson fallback, G-6
+// ---------------------------------------------------------------------------
+
+// Shared helper: make FlowDeps with injectable clock and optional worktreeBase
+function makeFlowDepsWithClock(
+  pool: ReturnType<typeof createPool>,
+  fake: FakeExecutionRuntime,
+  clock2: { now: () => string },
+  worktreeBase = "/worktrees",
+): FlowDeps {
+  return {
+    pool,
+    runtime: fake,
+    clock: clock2,
+    ids,
+    profile: {
+      id: "host",
+      enforcement: {
+        worktree: "before_action",
+        fs_isolation: "advisory",
+        cpu_memory: "advisory",
+        duration: "before_action",
+        capability: "before_action",
+        output_paths: "on_output",
+        push: "before_action",
+        integrate: "before_action",
+        termination: "trusted_observation",
+        egress_spend: "advisory",
+        nested_agents: "before_action",
+      },
+    },
+    config: {
+      worktreeBase,
+      workerModel: "openai/gpt-5.6-terra",
+      leadModel: "openai/gpt-5.6-sol",
+      reviewerModel: "openai/gpt-5.6-sol",
+      verifierName: "agencyhq-verifier",
+    },
+    profileResolver: FAKE_PROFILE_RESOLVER,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// RW-4b test (i): stop → CANCELED no evidence → pending → clock → uncertain
+// ---------------------------------------------------------------------------
+
+test("flow.stop (rw4b-i): stop + CANCELED no evidence → pending poll 1; past deadline → uncertain poll 2 (R-010)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      let nowMs = Date.now();
+      const clock2 = { now: () => new Date(nowMs).toISOString() };
+      const fake = new FakeExecutionRuntime(() => new Date(nowMs).toISOString());
+      const uncertainAfterMs = 500;
+
+      fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDepsWithClock(pool, fake, clock2);
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { uncertainAfterMs });
+
+      const { workerRunId, attemptId } = await setupWorkerRunning(
+        deps,
+        flow,
+        fake,
+        workItemId,
+        client,
+      );
+
+      await stopAttempt(
+        { pool, runtime: fake, clock: clock2 },
+        { attemptId, commandId: newId("cmd"), actor: "human", reason: "rw4b-i" },
+      );
+
+      // CANCELED with no output, no metadata → no evidence
+
+      // Poll 1: within deadline → pending_confirmation; intent stays triggered
+      await reconciler.pollOnce();
+
+      const { rows: a1 } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(a1[0]?.status, "stopping", "(rw4b-i) attempt still stopping after poll 1");
+
+      const { rows: i1 } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(i1[0]?.status, "triggered", "(rw4b-i) intent still triggered after poll 1");
+
+      const { rows: o1 } = await client.query<{ generation: number }>(
+        "SELECT generation FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      assert.equal(o1.length, 1, "(rw4b-i) exactly one run_observations row after poll 1");
+
+      // Advance clock past deadline
+      nowMs += uncertainAfterMs + 200;
+
+      // Poll 2: past deadline → uncertain
+      await reconciler.pollOnce();
+
+      const { rows: a2 } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(a2[0]?.status, "uncertain", "(rw4b-i) attempt uncertain after poll 2");
+
+      const { rows: wi } = await client.query<{ condition: string }>(
+        "SELECT condition FROM work_items WHERE id = $1",
+        [workItemId],
+      );
+      assert.equal(wi[0]?.condition, "uncertain", "(rw4b-i) work_item condition uncertain");
+
+      const { rows: i2 } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(i2[0]?.status, "observed", "(rw4b-i) intent closed after poll 2");
+
+      const { rows: o2 } = await client.query<{ generation: number }>(
+        "SELECT generation FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      assert.equal(o2.length, 1, "(rw4b-i) still exactly one run_observations row (R-010)");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RW-4b test (ii): stop.ndjson survivors [] → stopped, checkpoint from file (G-7)
+// ---------------------------------------------------------------------------
+
+test("flow.stop (rw4b-ii): stop.ndjson stop_done survivors [] → stopped, checkpoint_commit from file (G-7)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    const worktreeBase = join(tmpdir(), `agencyhq-rw4b-ii-${process.pid}-${Date.now()}`);
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+      const clock2 = { now: () => new Date().toISOString() };
+      const fake = new FakeExecutionRuntime();
+
+      fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDepsWithClock(pool, fake, clock2, worktreeBase);
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { uncertainAfterMs: 120_000 });
+
+      const { workerRunId, attemptId } = await setupWorkerRunning(
+        deps,
+        flow,
+        fake,
+        workItemId,
+        client,
+      );
+
+      await stopAttempt(
+        { pool, runtime: fake, clock: clock2 },
+        { attemptId, commandId: newId("cmd"), actor: "human", reason: "rw4b-ii" },
+      );
+
+      // Write stop.ndjson with empty survivors and a checkpoint commit
+      const runDir = join(worktreeBase, "runs", attemptId);
+      await mkdir(runDir, { recursive: true });
+      const lines = [
+        JSON.stringify({ event: "checkpoint", commit: "filecommit99" }),
+        JSON.stringify({ event: "stop_done", survivors: [] }),
+      ].join("\n");
+      await writeFile(join(runDir, "stop.ndjson"), lines, "utf-8");
+
+      // No metadata on the run — file is the only evidence source
+
+      await reconciler.pollOnce();
+
+      const { rows: ar } = await client.query<{ status: string; checkpoint_commit: string | null }>(
+        "SELECT status, checkpoint_commit FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(ar[0]?.status, "stopped", "(rw4b-ii) attempt stopped from stop.ndjson");
+      assert.equal(ar[0]?.checkpoint_commit, "filecommit99", "(rw4b-ii) checkpoint from file");
+
+      const { rows: ir } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(ir[0]?.status, "observed", "(rw4b-ii) intent closed");
+
+      const { rows: allA } = await client.query("SELECT id FROM attempts");
+      assert.equal(allA.length, 1, "(rw4b-ii) no replacement attempt");
+
+      const { rows: obs } = await client.query<{ generation: number }>(
+        "SELECT generation FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      assert.equal(obs.length, 1, "(rw4b-ii) one run_observations row");
+    } finally {
+      await pool.end();
+      await rm(worktreeBase, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RW-4b test (iii): stop.ndjson survivors [123] → uncertain (G-7)
+// ---------------------------------------------------------------------------
+
+test("flow.stop (rw4b-iii): stop.ndjson survivors [123] → attempt uncertain, work_item uncertain (G-7)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    const worktreeBase = join(tmpdir(), `agencyhq-rw4b-iii-${process.pid}-${Date.now()}`);
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+      const clock2 = { now: () => new Date().toISOString() };
+      const fake = new FakeExecutionRuntime();
+
+      fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDepsWithClock(pool, fake, clock2, worktreeBase);
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { uncertainAfterMs: 120_000 });
+
+      const { workerRunId, attemptId } = await setupWorkerRunning(
+        deps,
+        flow,
+        fake,
+        workItemId,
+        client,
+      );
+
+      await stopAttempt(
+        { pool, runtime: fake, clock: clock2 },
+        { attemptId, commandId: newId("cmd"), actor: "human", reason: "rw4b-iii" },
+      );
+
+      // Write stop.ndjson with non-empty survivors
+      const runDir = join(worktreeBase, "runs", attemptId);
+      await mkdir(runDir, { recursive: true });
+      await writeFile(
+        join(runDir, "stop.ndjson"),
+        JSON.stringify({ event: "stop_done", survivors: [123] }),
+        "utf-8",
+      );
+
+      await reconciler.pollOnce();
+
+      const { rows: ar } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(
+        ar[0]?.status,
+        "uncertain",
+        "(rw4b-iii) attempt uncertain from stop.ndjson survivors",
+      );
+
+      const { rows: wi } = await client.query<{ condition: string }>(
+        "SELECT condition FROM work_items WHERE id = $1",
+        [workItemId],
+      );
+      assert.equal(wi[0]?.condition, "uncertain", "(rw4b-iii) work_item condition uncertain");
+
+      const { rows: ir } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(ir[0]?.status, "observed", "(rw4b-iii) intent closed");
+
+      const { rows: obs } = await client.query<{ generation: number }>(
+        "SELECT generation FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      assert.equal(obs.length, 1, "(rw4b-iii) one run_observations row");
+    } finally {
+      await pool.end();
+      await rm(worktreeBase, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RW-4b test (iv): TIMED_OUT dispatched → auto-stop (coordinator) → uncertain (G-6)
+// ---------------------------------------------------------------------------
+
+test("flow.stop (rw4b-iv): TIMED_OUT dispatched attempt → auto-stop (actor coordinator), then uncertain; no replacement (G-6)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      let nowMs = Date.now();
+      const clock2 = { now: () => new Date(nowMs).toISOString() };
+      const fake = new FakeExecutionRuntime(() => new Date(nowMs).toISOString());
+      const uncertainAfterMs = 500;
+
+      fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }, { status: "TIMED_OUT" }]);
+
+      const deps = makeFlowDepsWithClock(pool, fake, clock2);
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { uncertainAfterMs });
+
+      const { workerRunId, attemptId } = await setupWorkerRunning(
+        deps,
+        flow,
+        fake,
+        workItemId,
+        client,
+      );
+
+      // No stop command — run times out externally
+      fake.advance(workerRunId); // QUEUED→EXECUTING
+      fake.advance(workerRunId); // EXECUTING→TIMED_OUT
+
+      const timedOutObs = await fake.retrieve(workerRunId);
+      assert.equal(timedOutObs.status, "TIMED_OUT", "(rw4b-iv) run is TIMED_OUT");
+
+      const { rows: pre } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(pre[0]?.status, "dispatched", "(rw4b-iv) attempt dispatched before poll");
+
+      // Poll 1: reconciler auto-stops the attempt (actor coordinator), then pending
+      await reconciler.pollOnce();
+
+      const { rows: a1 } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(
+        a1[0]?.status,
+        "stopping",
+        "(rw4b-iv) attempt stopping after poll 1 (auto-stop)",
+      );
+
+      // Verify a transition row was inserted with actor=coordinator
+      const { rows: tr } = await client.query<{ actor: string; to_state: string }>(
+        "SELECT actor, to_state FROM transitions WHERE aggregate = 'attempt' AND aggregate_id = $1",
+        [attemptId],
+      );
+      assert.ok(
+        tr.some((r) => r.actor === "coordinator" && r.to_state === "stopping"),
+        "(rw4b-iv) transition row with actor=coordinator, to_state=stopping",
+      );
+
+      const { rows: i1 } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(i1[0]?.status, "triggered", "(rw4b-iv) intent still triggered after poll 1");
+
+      const { rows: o1 } = await client.query<{ generation: number }>(
+        "SELECT generation FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      assert.equal(o1.length, 1, "(rw4b-iv) one run_observations row after poll 1");
+
+      const { rows: allA1 } = await client.query("SELECT id FROM attempts");
+      assert.equal(allA1.length, 1, "(rw4b-iv) no replacement attempt after poll 1");
+
+      // Advance clock past deadline
+      nowMs += uncertainAfterMs + 200;
+
+      // Poll 2: past deadline → uncertain
+      await reconciler.pollOnce();
+
+      const { rows: a2 } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(a2[0]?.status, "uncertain", "(rw4b-iv) attempt uncertain after poll 2");
+
+      const { rows: wi } = await client.query<{ condition: string }>(
+        "SELECT condition FROM work_items WHERE id = $1",
+        [workItemId],
+      );
+      assert.equal(wi[0]?.condition, "uncertain", "(rw4b-iv) work_item condition uncertain");
+
+      const { rows: i2 } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(i2[0]?.status, "observed", "(rw4b-iv) intent closed after poll 2");
+
+      const { rows: o2 } = await client.query<{ generation: number }>(
+        "SELECT generation FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      assert.equal(o2.length, 1, "(rw4b-iv) still one run_observations row (R-010)");
+
+      const { rows: allA2 } = await client.query("SELECT id FROM attempts");
+      assert.equal(allA2.length, 1, "(rw4b-iv) no replacement attempt after poll 2");
     } finally {
       await pool.end();
     }
