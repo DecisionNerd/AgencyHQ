@@ -3,7 +3,7 @@
 // out so they can be unit-tested without importing `@trigger.dev/sdk`.
 // No Trigger SDK usage; no direct `child_process`/`fs` calls except through
 // injected dependencies.
-import type { EventDenial, WorkerAttemptOutput } from "../types.ts";
+import type { EventDenial, WorkerAttemptOutput, WorkerReportLite } from "../types.ts";
 
 /** Where an attempt's worktree lives: `<worktreeBase>/attempts/<attemptId>`. */
 export function resolveWorktreePath(args: { worktreeBase: string; attemptId: string }): string {
@@ -25,6 +25,8 @@ export function outcomeFromViolations(violations: string[]): "completed" | "path
 
 export function buildOutput(args: {
   attemptId: string;
+  sessionId?: string;
+  report?: WorkerReportLite;
   outcome: WorkerAttemptOutput["outcome"];
   worktreePath: string;
   runDir: string;
@@ -41,8 +43,19 @@ export function buildOutput(args: {
     errors: string[];
   };
 }): WorkerAttemptOutput {
+  const sessionId = args.sessionId ?? args.opencode.sessionID ?? "unknown";
+  const report: WorkerReportLite = args.report ?? {
+    attempted: "",
+    outputs: args.changedPaths,
+    checksRun: [],
+    unmetCriteria: [],
+    limitations: [],
+    findings: [],
+  };
   return {
     attemptId: args.attemptId,
+    sessionId,
+    report,
     outcome: args.outcome,
     worktreePath: args.worktreePath,
     runDir: args.runDir,

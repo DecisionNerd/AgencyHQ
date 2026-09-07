@@ -77,8 +77,22 @@ export type WorkerAttemptPayload = {
 /** Result of one `worker.attempt` run. `survivors` is only ever non-empty
  * for `outcome: "cancelled"`; the other outcomes finish with the OpenCode
  * process already reaped. */
+/** Worker's own account of what it did: context for the Lead, never evidence
+ * (TESTING.md:67-73). Mirrors @agencyhq/contracts WorkerReportSchema. */
+export type WorkerReportLite = {
+  attempted: string;
+  outputs: string[];
+  checksRun: { command: string; claimedResult: "pass" | "fail" | "unknown" }[];
+  unmetCriteria: string[];
+  limitations: string[];
+  findings: { subject: string; cause: string; description: string }[];
+};
+
 export type WorkerAttemptOutput = {
   attemptId: string;
+  /** OpenCode session id, or "unknown" when the session never reported one. */
+  sessionId: string;
+  report: WorkerReportLite;
   outcome: "completed" | "path_violation" | "opencode_error" | "cancelled" | "timed_out";
   worktreePath: string;
   runDir: string;

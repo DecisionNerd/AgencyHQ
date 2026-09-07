@@ -37,7 +37,7 @@ test("outcomeFromViolations maps any violation to path_violation", () => {
   assert.equal(outcomeFromViolations(["secrets/leak.txt"]), "path_violation");
 });
 
-test("buildOutput returns exactly the fields it was given", () => {
+test("buildOutput returns the fields it was given plus sessionId and a default report", () => {
   const output = buildOutput({
     attemptId: "a-1",
     outcome: "completed",
@@ -54,6 +54,15 @@ test("buildOutput returns exactly the fields it was given", () => {
 
   assert.deepEqual(output, {
     attemptId: "a-1",
+    sessionId: "s-1",
+    report: {
+      attempted: "",
+      outputs: ["src/hello.ts"],
+      checksRun: [],
+      unmetCriteria: [],
+      limitations: [],
+      findings: [],
+    },
     outcome: "completed",
     worktreePath: "/srv/agencyhq/attempts/a-1",
     runDir: "/srv/agencyhq/runs/a-1",

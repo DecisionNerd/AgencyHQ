@@ -306,6 +306,7 @@ export const workerAttempt = task({
     let sessionID: string | null = null;
     let denials: WorkerAttemptOutput["opencode"]["denials"] = [];
     let errors: string[] = [];
+    let textTail = "";
     try {
       const eventsText = await readFile(`${runDir}/events.ndjson`, "utf8").catch(() => "");
       const events = parseEvents(eventsText);
@@ -313,6 +314,7 @@ export const workerAttempt = task({
       sessionID = summary.sessionID ?? null;
       denials = summary.denials;
       errors = summary.errors;
+      textTail = summary.textTail;
     } catch (error: unknown) {
       metadata.set("phase", "opencode_error");
       const message = error instanceof Error ? error.message : String(error);
@@ -365,6 +367,17 @@ export const workerAttempt = task({
 
     return buildOutput({
       attemptId: payload.attemptId,
+      sessionId: sessionID ?? "unknown",
+      // The worker's own account (its final message and the paths it touched)
+      // travels as context for the Lead; acceptance never reads it.
+      report: {
+        attempted: textTail.slice(0, 4000),
+        outputs: changed,
+        checksRun: [],
+        unmetCriteria: [],
+        limitations: violations.length > 0 ? [`quarantined: ${violations.join(", ")}`] : [],
+        findings: [],
+      },
       outcome,
       worktreePath,
       runDir,
