@@ -22,7 +22,7 @@ import {
   verificationMatches,
   verificationResultRef,
 } from "./match.ts";
-import type { ApprovalLike, ArtifactLike, AttemptLike, ReviewLike } from "./types.ts";
+import type { ApprovalLike, ArtifactLike, AttemptLike, FindingLike, ReviewLike } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // AcceptanceReason
@@ -40,7 +40,8 @@ export type AcceptanceReason =
   | "APPROVAL_REQUIRED"
   | "APPROVAL_VERSION_MISMATCH"
   | "PROPOSAL_REJECTS"
-  | "CRITERION_UNSATISFIED";
+  | "CRITERION_UNSATISFIED"
+  | "VERIFIER_TAMPERED";
 
 export interface AcceptanceFailureReason {
   code: AcceptanceReason;
@@ -65,6 +66,12 @@ export interface EvaluateAcceptanceInput {
   reviewerMustDiffer: boolean;
   /** Model identifier used by the worker. */
   workerModel: string;
+  /**
+   * Verifier-integrity findings (kind "verifier_tampered") produced by
+   * detectVerifierTampering in the verify step.  Any blocking finding here
+   * causes VERIFIER_TAMPERED rejection independently of the review.
+   */
+  integrityFindings?: FindingLike[] | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +90,7 @@ export function evaluateAcceptance(
     approval,
     reviewerMustDiffer,
     workerModel,
+    integrityFindings,
   } = input;
 
   const reasons: AcceptanceFailureReason[] = [];
@@ -90,6 +98,18 @@ export function evaluateAcceptance(
   // 1. Proposal-level: accept must be true.
   if (!proposal.accept) {
     reasons.push({ code: "PROPOSAL_REJECTS", detail: "Proposal.accept is false." });
+  }
+
+  // 1a. Verifier-integrity gate (R-017): any blocking integrity finding is
+  // a hard rejection independent of review disposition.
+  const blockingIntegrityFindings = (integrityFindings ?? []).filter(
+    (f) => f.severity === "blocking",
+  );
+  if (blockingIntegrityFindings.length > 0) {
+    reasons.push({
+      code: "VERIFIER_TAMPERED",
+      detail: `Verifier integrity check found ${blockingIntegrityFindings.length} blocking finding(s): ${blockingIntegrityFindings.map((f) => f.id).join(", ")}.`,
+    });
   }
 
   // Build a lookup map from ref → VerificationResult for O(1) access.

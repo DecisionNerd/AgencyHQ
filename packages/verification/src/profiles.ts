@@ -37,19 +37,19 @@ export type VerificationProfile = {
 export const PROFILE_CATALOG: Record<string, VerificationProfile> = {
   "node-pnpm-v1": {
     id: "node-pnpm-v1",
-    version: "1",
+    version: "2",
     checks: ["pnpm-typecheck@1", "pnpm-test@1"],
     protectedPaths: DEFAULT_PROTECTED_PATHS,
   },
   "docs-check-v1": {
     id: "docs-check-v1",
-    version: "1",
+    version: "2",
     checks: ["pnpm-check@1"],
     protectedPaths: DEFAULT_PROTECTED_PATHS,
   },
   "minimal-v1": {
     id: "minimal-v1",
-    version: "1",
+    version: "2",
     checks: ["git-diff-clean@1"],
     protectedPaths: DEFAULT_PROTECTED_PATHS,
   },

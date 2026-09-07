@@ -4,6 +4,13 @@
  * Any change to an approved verifier or its configuration inside the diff
  * is a Review-blocking finding until the profile is re-versioned.
  * See: docs/engineering/TESTING.md §67-73.
+ *
+ * Protected paths cover verifier infrastructure only (package managers, CI
+ * pipelines, TypeScript config, linter config, and test-runner configs).
+ * Test source files (test/**, tests/**, *.test.*, *.spec.*) are NOT protected
+ * here: weakened or removed tests are the adversarial reviewer's job and are
+ * governed by the contract's paths.allow; they do not trigger tampering
+ * findings.
  */
 
 import { matchesPath, parsePathPattern } from "@agencyhq/contracts";
@@ -12,6 +19,7 @@ import type { FindingLike } from "./types.ts";
 // ---------------------------------------------------------------------------
 // DEFAULT_PROTECTED_PATHS
 // Paths that, if changed by the worker, indicate potential verifier tampering.
+// Test source files are intentionally absent — see module comment above.
 // ---------------------------------------------------------------------------
 export const DEFAULT_PROTECTED_PATHS: string[] = [
   "package.json",
@@ -20,10 +28,6 @@ export const DEFAULT_PROTECTED_PATHS: string[] = [
   "tsconfig*.json",
   "biome.json",
   ".github/**",
-  "tests/**",
-  "test/**",
-  "**/*.test.*",
-  "**/*.spec.*",
   "**/vitest.config.*",
   "**/jest.config.*",
 ];

@@ -451,3 +451,52 @@ test("acceptance: ok with humanRequired and matching approval", () => {
   const r = evaluateAcceptance(input);
   assert.ok(r.ok, `Expected ok but got: ${JSON.stringify(!r.ok && r)}`);
 });
+
+// ---------------------------------------------------------------------------
+// VERIFIER_TAMPERED
+// ---------------------------------------------------------------------------
+test("acceptance: VERIFIER_TAMPERED when integrityFindings contains a blocking finding", () => {
+  const input = baseInput();
+  input.integrityFindings = [
+    {
+      id: "verifier-tamper-1",
+      severity: "blocking",
+      kind: "verifier_tampered",
+      description: 'Changed path "package.json" matches protected pattern "package.json".',
+      evidence: "path:package.json pattern:package.json",
+    },
+  ];
+  const r = evaluateAcceptance(input);
+  assert.ok(!r.ok);
+  const codes = r.reasons.map((x) => x.code);
+  assert.ok(codes.includes("VERIFIER_TAMPERED"), `codes: ${codes}`);
+});
+
+test("acceptance: no VERIFIER_TAMPERED when integrityFindings is empty", () => {
+  const input = baseInput();
+  input.integrityFindings = [];
+  const r = evaluateAcceptance(input);
+  assert.ok(r.ok, `Expected ok but got: ${JSON.stringify(!r.ok && r)}`);
+});
+
+test("acceptance: no VERIFIER_TAMPERED when integrityFindings has only non_blocking", () => {
+  const input = baseInput();
+  input.integrityFindings = [
+    {
+      id: "verifier-tamper-1",
+      severity: "non_blocking",
+      kind: "verifier_tampered",
+      description: "non-blocking integrity note",
+      evidence: "path:some/path",
+    },
+  ];
+  const r = evaluateAcceptance(input);
+  assert.ok(r.ok, `Expected ok but got: ${JSON.stringify(!r.ok && r)}`);
+});
+
+test("acceptance: no VERIFIER_TAMPERED when integrityFindings is absent", () => {
+  const input = baseInput();
+  // integrityFindings omitted (undefined)
+  const r = evaluateAcceptance(input);
+  assert.ok(r.ok, `Expected ok but got: ${JSON.stringify(!r.ok && r)}`);
+});

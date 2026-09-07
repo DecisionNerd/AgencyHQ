@@ -11,17 +11,9 @@ import { DEFAULT_PROTECTED_PATHS, detectVerifierTampering } from "../src/evidenc
 // No tamper: no protected paths changed
 // ---------------------------------------------------------------------------
 test("integrity: no findings when no protected paths changed", () => {
+  // src/parser.ts and test source files are not verifier-config paths.
   const findings = detectVerifierTampering(["src/parser.ts", "src/tests/parser.test.ts"]);
-  // "tests/**" is in defaults but "src/tests/**" is not a match for bare "tests/**"
-  // Actually "tests/**" would match "tests/foo" not "src/tests/foo". Let's verify.
-  const _tampered = findings.filter((f) => f.kind === "verifier_tampered");
-  // src/parser.ts → not protected
-  // src/tests/parser.test.ts → "tests/**" only matches "tests/…", not "src/tests/…"
-  assert.equal(
-    findings.filter((f) => f.evidence.includes("src/parser.ts")).length,
-    0,
-    "src/parser.ts should not be flagged",
-  );
+  assert.equal(findings.length, 0, "neither src/parser.ts nor test source files should be flagged");
 });
 
 // ---------------------------------------------------------------------------
@@ -68,12 +60,27 @@ test("integrity: .github/workflows/ci.yml triggers blocking finding", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tamper: tests/** glob
+// Non-tamper: test source files (governed by contract paths.allow, not verifier
+// config) must NOT produce findings — only the adversarial reviewer flags them.
 // ---------------------------------------------------------------------------
-test("integrity: tests/architecture-baseline.test.mjs triggers blocking finding", () => {
+test("integrity: tests/architecture-baseline.test.mjs does NOT trigger (test files not protected)", () => {
   const findings = detectVerifierTampering(["tests/architecture-baseline.test.mjs"]);
-  assert.ok(findings.length > 0, "tests/** should match tests/…");
-  assert.ok(findings.every((f) => f.severity === "blocking"));
+  assert.equal(findings.length, 0, "tests/** is not a protected verifier-config path");
+});
+
+test("integrity: test/parser/x.test.ts does NOT trigger (test files not protected)", () => {
+  const findings = detectVerifierTampering(["test/parser/x.test.ts"]);
+  assert.equal(findings.length, 0, "test/** is not a protected verifier-config path");
+});
+
+test("integrity: tests/y.spec.ts does NOT trigger (spec files not protected)", () => {
+  const findings = detectVerifierTampering(["tests/y.spec.ts"]);
+  assert.equal(findings.length, 0, "*.spec.ts is not a protected verifier-config path");
+});
+
+test("integrity: src/foo.test.ts does NOT trigger (test files not protected)", () => {
+  const findings = detectVerifierTampering(["src/foo.test.ts"]);
+  assert.equal(findings.length, 0, "*.test.* is not a protected verifier-config path");
 });
 
 // ---------------------------------------------------------------------------

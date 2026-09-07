@@ -1366,6 +1366,28 @@ export class BoundedRepairFlow {
       const verificationResults = await loadVerificationResults(pool, attemptRow.id);
       const _resolvedProfile = await profileResolver(contractRow.profile_id);
 
+      // Load blocking verifier_tampered findings for this attempt (R-017).
+      const { rows: integrityFindingRows } = await pool.query(
+        `SELECT id, severity, kind, description, evidence FROM findings
+         WHERE attempt_id = $1 AND kind = 'verifier_tampered' AND severity = 'blocking'`,
+        [attemptRow.id],
+      );
+      const integrityFindings = integrityFindingRows.map(
+        (r: {
+          id: string;
+          severity: string;
+          kind: string;
+          description: string;
+          evidence: string;
+        }) => ({
+          id: r.id,
+          severity: r.severity as "blocking" | "non_blocking",
+          kind: r.kind,
+          description: r.description,
+          evidence: r.evidence ?? "",
+        }),
+      );
+
       const proposalResult = AcceptanceProposalSchema.safeParse(obs.output);
       if (!proposalResult.success) {
         throw new Error(`Invalid acceptance proposal: ${proposalResult.error.message}`);
@@ -1424,6 +1446,7 @@ export class BoundedRepairFlow {
         reviewerMustDiffer:
           contractRow.bounds?.models?.reviewer !== contractRow.bounds?.models?.worker,
         workerModel: config.workerModel,
+        integrityFindings,
       });
 
       const at = new Date();
