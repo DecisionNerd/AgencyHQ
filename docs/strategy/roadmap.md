@@ -1,68 +1,71 @@
 # Incremental roadmap
 
-Each slice must leave the repository runnable, tested, and more capable than the
-previous slice. Later slices must not be pulled forward merely to anticipate
-scale.
+Each slice leaves the repository runnable, tested, and more capable. The
+riskiest assumption — that self-hosted Trigger.dev plus OpenCode can meet the
+isolation and recovery contract — is tested first, before domain code depends
+on it.
 
 ## Slice 0 — architecture baseline (current)
 
-- Repository/package boundaries and authority decisions are documented.
-- Domain vocabulary, failure taxonomy, scope rule, and completion rule exist.
-- A deterministic check protects the baseline and internal links.
+- Authority boundaries, runtime choice, Lead role, worker effect model, and
+  delegated-authority schema are recorded (ADR-0001 to ADR-0007).
+- A deterministic check protects the records and links.
 
-## Slice 1 — bounded process and domain kernel
+## Slice 1 — execution spike (throwaway)
 
-- Walk through the bounded repair contract, supervisor criteria, an honest
-  partial result, and a return-after-interruption view using in-memory data.
-- Implement only the identifiers/transitions needed for that path, including
-  version repair, acceptance, Finding disposition, and recovery gate decisions.
-- Add unit/property tests for invalid transitions, version binding, scope,
-  idempotency, evidence invalidation, and the three failure classes.
-- No real worker dispatch or generalized process graph editor yet.
+- Stand up the self-hosted Trigger webapp stack with pinned versions; run
+  `trigger dev` on the OpenCode host with the existing OpenCode config.
+- Implement `worker.attempt` minimally: `git worktree add`, scrubbed child
+  environment, `opencode run --format json` with a permission-rule file,
+  diff, commit an attempt branch; `onCancel` checkpoint commit and
+  process-group kill. No domain model, no UI.
+- Run trial items 1–4 of the [execution trial](../engineering/TESTING.md#required-execution-trial):
+  idempotent re-dispatch, stop with checkpoint and confirmed process death,
+  `maxDuration`, and denied push/paths/`task`. Confirm dev-mode cancel and
+  `maxDuration` behave as documented.
+- Record results. If the contract cannot be met, supersede ADR-0005 with the
+  evidence before any further slice.
 
-## Slice 2 — Postgres truth
+## Slice 2 — domain kernel and ledger
 
-- Add migrations and repositories for the domain ledger and transactional
-  dispatch/outbox.
-- Prove concurrent transition, idempotency, audit, and recovery behavior with
-  integration tests against a pinned Postgres version.
-- Include attempt generations, capacity reservations, external-operation
-  identities, and supervisor-approved verification profiles before real effects.
+- Implement the slice-2 aggregates in `packages/domain` with the authority
+  subset check, transition validation, failure classification over Trigger
+  statuses, and evidence matching; unit and property tests.
+- Add Postgres migrations and repositories for the ledger, DispatchIntent, and
+  generation fencing; integration tests for transactional decision-then-dispatch,
+  duplicate observation, and stale-generation refusal.
+- Add the Trigger client wrapper with a deterministic fake and the worktree
+  retention policy.
 
-## Slice 3 — one complete executable repair
+## Slice 3 — one complete bounded repair
 
-- Use one repository, one bounded repair process, one worker, and pinned
-  Trigger/OpenCode versions. Prove runtime isolation before admitting contracts.
-- Include exact artifact capture, supervisor-approved verification, proportional
-  review, acceptance, and an unrelated Finding with a backlog disposition.
-- Include leases, revocation, cancellation, reconciliation, and safe replacement
-  now. Demonstrate interruption and delayed stale results using the real runtime.
-- Add a minimal operator view for changes, evidence, decisions, and confirmed
-  versus requested stop state. It need not implement the complete control plane.
-- Use deterministic fakes for routine tests and require the recorded real
-  [execution trial](../engineering/TESTING.md#required-first-execution-trial)
-  to qualify this slice. Workflow success alone cannot qualify it.
+- Implement `lead.plan`, `verify.run`, `lead.review`, `lead.accept`, and the
+  coordinator flow through acceptance at the `artifact` boundary.
+- Adversarial fixtures for repository-content injection and false success.
+- Minimal operator view: return-after-interruption journey with Trigger
+  Realtime for execution state and links to Trigger runs for logs.
+- Run the full execution trial on the real stack and record it. CI runs the
+  baseline check and all slice tests.
 
-## Slice 4 — integration and multiple repositories
+## Slice 4 — integration boundaries and multiple repositories
 
-- Extend the proven path with merge/deployment boundaries only where required.
-- Define shared-interface ownership, compatible revision manifests, dependency
-  order, and combined acceptance before enabling multi-repository Goals.
-- Prove that individually passing changes cannot bypass failed integration and
-  that relevant regressions reopen completion without erasing acceptance history.
+- `integrate.merge` with compare-and-set and per-repository serialization;
+  `merge` boundary completion.
+- Multi-repository WorkItems with revision manifests, dependency order, and
+  combined verification; `deploy` boundary only where a project needs it.
+- Extract a ProcessDefinition type only if a second process is now required.
 
-## Slice 5 — expanded operator control plane
+## Slice 5 — control plane
 
-- Extend the minimal view with campaigns, ranked work, process/step state, failures,
-  allocations, evidence, and approval actions.
-- Exercise primary flows with browser-level acceptance tests.
+- Campaigns, cross-project rank, work overview, decisions view, evidence view,
+  and authority-schema editing; browser tests for primary flows.
 
-## Slice 6 — broader capacity allocation
+## Slice 6 — capacity
 
-- Extend the single-worker limit with ProviderCapacity observations, explicit
-  cross-campaign rank, main-effort allocation, and conservative stale-data rules.
-- Retain the existing recovery gate and repository serialization. Add concurrent
-  workers or nested delegation only after shared-scope, aggregate budget, and
-  descendant cancellation checks pass.
-- Load-test only enough to expose actual bottlenecks before considering new
-  infrastructure or deployment boundaries.
+- Multiple worker machines and concurrent attempts using Trigger queues and
+  environment limits; ProviderCapacity observations with conservative stale
+  handling; Lead quality metrics dashboard.
+- Container runtime profile: deployed supervisor/worker stack, task image
+  with pinned Git and OpenCode, API-key providers, generation-bound push
+  tokens; then a model gateway with per-attempt keys, upgrading isolation,
+  egress, and spend from advisory to enforced.

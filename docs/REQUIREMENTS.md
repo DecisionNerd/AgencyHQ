@@ -1,30 +1,29 @@
 # Baseline requirements
 
-These requirements define the first architecture contract. IDs remain stable as
-implementation and test evidence are added.
+IDs are stable. R-005 was restated and R-020 added on 2026-09-07 (ADR-0006).
 
-| ID | Requirement | Initial acceptance evidence |
+| ID | Requirement | Acceptance evidence |
 | --- | --- | --- |
-| R-001 | The coordinator shall be the only component that commits authorized scope, allocation, approval, and acceptance transitions; the supervisor makes engineering decisions within delegated policy. | Domain policy tests and adapter-boundary tests. |
-| R-002 | Postgres shall persist policy-relevant state, causation, actor, version, and idempotency identity before external effects are dispatched. | Transaction/outbox integration tests. |
-| R-003 | Every worker attempt shall bind to one immutable StepContract version, base Git revision, isolated worktree, and allowed repository scope. | Contract validation and Git-adapter tests. |
-| R-004 | Trigger.dev shall provide durable execution while its run state remains observational rather than authoritative domain state. | Retry/replay/reconciliation integration tests. |
-| R-005 | OpenCode shall be used through its supported runtime/provider abstraction; AgencyHQ shall not implement an agent loop or model-provider adapters. | OpenCode adapter contract test and dependency review. |
-| R-006 | Completion shall require the supervisor-approved criteria, required checks and proportional review against exact outputs, a recorded supervisor acceptance decision, and any policy-required exact-version human Approval. | Acceptance-state tests including false-success cases. |
-| R-007 | The system shall classify execution, contract, and process failures separately and apply category-appropriate recovery. | State-machine table tests for all three classes. |
-| R-008 | Capacity allocation shall preserve declared main effort, allocate feasible capacity in global Campaign/Initiative order, serialize conflicting repository work, and record exceptions and stale-capacity handling. | Deterministic allocation-policy tests. |
-| R-009 | Scope expansion shall create a new StepContract version and shall not be self-authorized by a worker. | Authorization and contract-version tests. |
-| R-010 | Commands and callbacks shall be idempotent and retries shall preserve prior attempt evidence. | Duplicate-delivery and recovery tests. |
-| R-011 | The web app shall expose distinct contract, execution, process, and acceptance states with source identities and timestamps. | Browser acceptance tests. |
-| R-012 | The initial deployment shall remain a modular monolith unless a measured requirement and ADR justify another service or infrastructure component. | Architecture dependency check and ADR review. |
-| R-013 | Replacement shall require fenced prior authority, confirmed termination or effective isolation, reconciled external effects, and remaining budget; lease expiry alone shall not permit replacement. | Interruption, in-flight effect, descendant cancellation, and stale-result tests. |
-| R-014 | The supervisor shall approve and version the definition of done from context; workers shall report actual results and unmet criteria without authorizing changes or acceptance. | Supervisor/worker authorization and verification-profile provenance tests. |
-| R-015 | Initiative/Goal completion shall cover the declared artifact, merge, or deployment boundary and exact combined revisions; relevant invalidation shall reopen affected claims without rewriting history. | Combined-result, boundary, and invalidation tests. |
-| R-016 | Dispatch shall require declared enforcement capabilities; unsupported hard limits and unaccounted nested delegation shall be rejected. | Runtime isolation, capability, budget, and descendant tests. |
-| R-017 | Process selection shall distinguish missing inputs from unsupported work; Findings shall receive an owned disposition without silently expanding scope. | Catalog mapping and Finding-disposition tests. |
-| R-018 | Contract/process repair shall supersede rather than rebind immutable instances, retain provenance, and invalidate mismatched evidence and approvals. | Version-repair and late-result transition tests. |
-| R-019 | The operator shall see changes since their last visit, pending decisions, continuing work, observation freshness, and requested versus confirmed stop status without reading raw logs. | Return-after-interruption browser journey. |
+| R-001 | The coordinator shall be the only component that commits scope, dispatch, and acceptance transitions; the Lead proposes within delegated authority and the coordinator validates and records. | Domain policy and authority tests. |
+| R-002 | Postgres shall persist the decision, actor, causation, generation, and DispatchIntent before any task is triggered. | Transaction and replay tests. |
+| R-003 | Every worker attempt shall run as its own Trigger run in its own Git worktree at the contract's base revision, under the contract's permission rules, in a process environment with no usable push credential. | Adapter tests; execution trial. |
+| R-004 | Trigger.dev shall be the execution runtime, trusted for run lifecycle, duration limits, status, and cancellation, and never for acceptance; each runtime profile shall declare which boundaries it enforces. | Classification tests; execution trial. |
+| R-005 | AgencyHQ shall implement no coding-agent loop and no model-provider adapters; all model calls, including the Lead's, go through OpenCode. | Dependency review. |
+| R-006 | Acceptance shall require approved criteria met by exact outputs, passing `verify.run` results, the required Review, a recorded acceptance Decision, and any `humanRequired` Approval bound to the same versions. | Acceptance tests including false-success cases. |
+| R-007 | The system shall classify execution, contract, and process failures separately; only execution failures create automatic new Attempts, within budget. | Table tests over Trigger final statuses. |
+| R-008 | Dispatch shall follow explicit rank, preserve the main effort's identity when blocked, serialize attempts per repository, and record every exception. | Allocation tests. |
+| R-009 | Any widening of scope, capability, boundary, budget, or review depth shall be a new StepContract version validated against delegated authority; workers cannot request it. | Authority subset tests. |
+| R-010 | Dispatch, observation, token issuance, integration, and operator commands shall be idempotent by the identities in EXECUTION_MODEL.md. | Duplicate-delivery tests. |
+| R-011 | The web app shall show contract, execution, verification, and acceptance states distinctly with source and timestamp, using Trigger Realtime for execution state. | Browser tests. |
+| R-012 | The deployment shall be one AgencyHQ process, one AgencyHQ Postgres, the self-hosted Trigger webapp stack, and `trigger dev` on the OpenCode host; any other service needs a measured requirement and an ADR. | Architecture review. |
+| R-013 | Stopping an attempt shall revoke its generation before cancellation, commit a checkpoint, confirm the worker process group is gone, and display *stopping* until Trigger reports a final status. | Execution trial; persistence tests. |
+| R-014 | The Lead shall approve criteria and profile before dispatch; workers report results and cannot alter criteria, checks, or acceptance. | Adapter and domain tests. |
+| R-015 | WorkItem completion shall cover the declared boundary with exact revisions; integration shall be compare-and-set and serialized per repository. | Integration adapter tests. |
+| R-016 | Dispatch shall reject a contract requiring a boundary the active runtime profile declares advisory; nested agents are denied until descendant accounting exists. | Domain tests. |
+| R-017 | Findings shall receive an owned disposition without widening the contract. | Disposition tests. |
+| R-018 | Contract repair shall supersede, never rebind; evidence and Reviews do not transfer across versions. | Version tests. |
+| R-019 | A returning operator shall see changes, pending decisions, continuing runs, observation freshness, and requested-vs-confirmed stop status without logs. | Browser journey. |
+| R-020 | Repository content and Lead proposals shall be untrusted input; a proposal can only narrow delegated authority, never widen it. | Adversarial-fixture authority tests. |
 
-All runtime evidence above is planned. Only the documentation baseline checks
-currently exist. Detailed Given/When/Then scenarios and completion policy live
-in [engineering/TESTING.md](engineering/TESTING.md).
+Only the documentation baseline check exists today. Scenarios live in
+[engineering/TESTING.md](engineering/TESTING.md).

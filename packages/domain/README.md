@@ -1,6 +1,6 @@
 # Domain package
 
-Framework-free TypeScript domain types, invariants, transitions, and policies.
-This package must not import React, Trigger.dev, OpenCode, Git clients, or a
+Framework-free TypeScript: aggregates, transitions, authority subset checks,
+failure classification over Trigger run statuses, evidence matching, and
+dispatch ordering. Imports nothing from Trigger.dev, OpenCode, React, or a
 Postgres client.
-

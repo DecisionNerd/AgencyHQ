@@ -1,113 +1,120 @@
 # Durable execution model
 
-## Lifecycle
+Trigger.dev supplies durability, isolation, limits, retries, cancellation, and
+observation (ADR-0005). This document defines what the coordinator adds and how
+the two compose. Anything Trigger already does is referenced, not reimplemented.
 
-1. The supervisor approves a versioned definition of done; the coordinator
-   validates scope, approvals, dependencies, enforcement support, and capacity.
-2. It creates a StepInstance attempt, WorkerAllocation, and authority generation
-   in Postgres, with a transactional dispatch record.
-3. A transactional dispatch record causes Trigger.dev to start or resume work.
-4. Trigger.dev invokes the OpenCode adapter with the immutable StepContract,
-   worktree identity, and attempt identity.
-5. OpenCode performs bounded work and reports outputs, checks, limitations,
-   unmet criteria, and Findings honestly, including partial or failed results.
-6. The coordinator records observations, obtains required verification and review,
-   and applies the supervisor's acceptance decision only if the gates pass.
-7. Human approval is requested only where the contract or policy requires it.
+## Lifecycle of one step
 
-Every callback and command carries an idempotency key. Replaying a delivery may
-reconcile state but must not create a second logical attempt or approval.
-Bind keys to the caller, logical operation, and payload digest; reject reuse
-with different intent. Retain identities through the supported replay window;
-older or unknown callbacks cannot authorize effects. A new attempt has a new
-identity, but retrying the same external operation retains its operation key.
+1. **Plan.** The coordinator dispatches `lead.plan` for the WorkItem. The Lead
+   proposal is checked against delegated authority; the result is a Decision
+   and a frozen StepContract (or a pending human decision).
+2. **Admit.** The coordinator confirms rank, budget, and that every bound the
+   contract requires is enforceable by the runtime. It records an Attempt with
+   a new authority generation and a DispatchIntent, in one transaction.
+3. **Dispatch.** It triggers `worker.attempt` with `idempotencyKey` = intent id
+   (global scope, TTL covering the retry window), `concurrencyKey` =
+   repository id, `machine` and `maxDuration` from the contract, and tags for
+   Project, WorkItem, contract version, and attempt. The run id is stored on
+   the intent. A lost response is retried with the same key and returns the
+   same run.
+4. **Execute.** The adapter process creates the attempt worktree at the base
+   revision, spawns OpenCode as a child process group with a scrubbed
+   environment and the contract's permission rules, publishes progress to run
+   metadata, and on exit diffs, path-checks, commits
+   `agencyhq/attempts/<attempt-id>` locally, and returns the report as run
+   output. (Container profile: fresh clone, then push with a generation-bound
+   token.)
+5. **Observe.** The coordinator subscribes to runs by tag. On a final status it
+   retrieves the run, stores the report and Artifact, and classifies the
+   outcome (below). Duplicate deliveries are no-ops keyed by run id.
+6. **Verify.** `verify.run` is dispatched against the attempt revision with the
+   approved profile; results are stored as VerificationResults.
+7. **Review.** `lead.review` is dispatched with the diff, criteria, and results;
+   the output is a Review record.
+8. **Accept.** `lead.accept` proposes acceptance; the coordinator checks the
+   proposal names every criterion, cites passing results, and has no blocking
+   Review finding, then records the acceptance Decision. If the authority
+   schema requires it, a human Approval is requested first.
+9. **Integrate** (merge or deploy boundaries only). `integrate.merge` runs with
+   an operation-scoped credential, serialized per repository, idempotent by
+   attempt and target revision.
 
-Persist the OpenCode session, runtime host/process or container identity, Trigger
-run, worktree, base revision, contract, and authority generation for each attempt.
-Treat a lost dispatch response as uncertain delivery: look up the existing run
-by its dispatch identity or use a proven idempotent dispatch API before retrying.
-Trigger retries reconcile the assigned attempt; they cannot independently create
-a new OpenCode session or retry a mutating step.
+Lead and human decisions happen between runs. No run waits on a human; a
+waiting self-hosted run holds its process or container and a concurrency slot.
+
+## Idempotency
+
+| Operation | Identity | Mechanism |
+| --- | --- | --- |
+| Dispatch | DispatchIntent id | Trigger `idempotencyKey`, global scope. Keys clear on run failure, so a retried failed run needs a new intent, which needs a Decision. |
+| Run observation | Trigger run id + attempt generation | Coordinator upsert; stale generation stored as history only. |
+| Attempt commit | `agencyhq/attempts/<attempt-id>` | Adapter commits to the attempt's own branch; a retried adapter step finds the branch and re-reads it. |
+| Token issuance (container profile) | Attempt id + generation + purpose | Coordinator rejects stale generation; tokens expire in minutes. |
+| Integration | Attempt id + target ref + expected base revision | Compare-and-set on the target ref; a replay finds the ref already advanced and records completion. |
+| Operator command | Command id from the UI | Coordinator idempotency table. |
 
 ## Failure taxonomy
 
-| Class | Definition | Typical response |
+| Class | Trigger observation | Coordinator response |
 | --- | --- | --- |
-| Execution failure | The mechanism could not run or finish an otherwise valid contract: unavailable worker, timeout, lost lease, provider outage. | Reconcile first; retry/resume only after authority and effect checks, within the retry budget. |
-| Contract failure | Inputs, outputs, scope, or acceptance obligations were invalid or unmet. | Supervisor chooses bounded output remediation under the same contract or an explicit replacement contract; no blind retry. |
-| Process failure | The process definition or policy cannot reach a valid next state: impossible dependency, missing gate, contradictory policy. | Halt affected process and repair/version the definition or policy. |
+| Execution failure | Run `crashed`, `timed_out`, `system_failure`, `expired`, OOM, or `canceled` by policy; provider outage reported by the adapter. | Trigger's retry policy handles transient attempts within the task's `maxAttempts`; once the run is final, the coordinator may create a new Attempt within the step budget. No Decision needed unless budget is exhausted. |
+| Contract failure | Run `completed` with unmet criteria, failed VerificationResult, path violation, or `failed` via `AbortTaskRunError`. | Lead disposition: bounded remediation under the same contract or a replacement contract. Never automatic retry. |
+| Process failure | Coordinator cannot compute a valid next state: contradictory authority, missing gate, impossible dependency. | Halt the WorkItem; repair the authority schema or process code; human decision. |
 
-Failures are explicit domain records with category, phase, attempt, cause, and
-evidence. Trigger.dev run status is supporting telemetry, not the classification.
+Failures are domain records with class, phase, attempt, run id, cause, and
+evidence. Trigger status is the observation that supports the class.
 
-## Replacement-worker gate
+## Stop, cancel, and replacement
 
-A timeout is evidence of lost contact, not evidence that the worker stopped.
-Use at-least-once delivery with idempotent effects and fenced authority; do not
-promise exactly-once execution of an arbitrary worker or shell command.
+Because workers cannot cause external effects (ADR-0007), replacement is short:
 
-1. **Freeze and reconcile.** Mark the attempt contact-lost, prevent acceptance
-   and new dispatch for the affected step, and query the runtime, Trigger, Git,
-   and recorded external operations. If the original session is recoverable and
-   has not been superseded, reconnect to it rather than create a second worker.
-2. **Revoke old authority.** For replacement, atomically supersede the attempt
-   and advance its authority generation in Postgres. Coordinator commands and
-   effect adapters reject stale generations. The trusted runtime must confirm
-   termination of the worker and descendants, or confirm isolation that prevents
-   them reaching replacement work, shared mutable resources, and credentials.
-   An abort request, expired lease, or worker self-report is insufficient.
-3. **Resolve effects already in flight.** Record each operation as completed
-   with its external identity, confirmed not performed, or unknown. Reuse a
-   completed result. Retry only a confirmed absent effect or one protected by a
-   still-valid provider idempotency guarantee. An unknown non-idempotent effect
-   blocks conflicting replacement work until authoritative reconciliation.
-4. **Authorize replacement.** Record the revocation/termination or isolation
-   evidence, operation reconciliation, selected immutable starting artifact,
-   current contract, and remaining budget. Persist the fresh attempt, allocation,
-   and provisioning intents atomically with the outbox. Adapters then provision
-   a fresh session and worktree idempotently, recording their identities before
-   worker execution. External resources are not part of the Postgres transaction;
-   an uncertain provisioning result uses the same reconciliation rule.
+1. **Revoke.** Advance the attempt's authority generation in Postgres. From
+   this instant observations for the old generation are history-only.
+2. **Cancel.** Call `runs.cancel`. The adapter's `onCancel` gets a bounded
+   grace period: it commits the worktree to `agencyhq/checkpoints/<attempt-id>`,
+   sends SIGTERM then SIGKILL to the OpenCode process group, and records
+   whether any process survived. `runs.cancel` also cancels child runs.
+3. **Confirm.** Subscribe until the run status is final and the adapter's
+   last metadata reports no survivors. The UI shows *stopping* until then and
+   *stopped* after. If the adapter could not confirm (for example the host
+   itself is unreachable), the state is *uncertain* and no replacement runs on
+   that repository.
+4. **Replace.** Record the final status and any checkpoint revision, then
+   admit a new Attempt under the remaining step budget in a new worktree,
+   starting from the base revision or a Lead-selected checkpoint. The old
+   worktree is retained for inspection, never reused.
 
-All applicable conditions above must hold before replacement runs. The
-coordinator may perform this automatically within policy; require a decision
-only when uncertainty, exceeded limits, or a scope change prevents continuation.
-Replacement inherits the remaining step budget, not a fresh budget allowance.
+Integration tasks are the one place an effect can be in flight. They are
+serialized per repository and compare-and-set on the target ref; an unknown
+outcome is resolved by reading the ref, never by retrying blindly.
 
-Generation checks must protect the resource where an effect occurs, not merely
-the callback that reports it. Workers have no direct publish/merge/deploy
-credentials. Coordinator-owned adapters serialize shared-resource operations
-and validate current authority when dispatching them. Where an external API
-cannot enforce a generation, a request already sent may still finish after
-revocation: keep the resource blocked until that request is reconciled.
+## Contact loss
 
-Late observations from superseded attempts remain in history but cannot advance
-state. Salvaging their work requires a stable snapshot after termination or
-isolation, supervisor selection, and verification under the current contract.
-Never let replacement work share an old attempt's writable worktree.
+If the coordinator cannot reach the Trigger API, or Trigger cannot reach the
+`trigger dev` process on the host, observations are marked stale, dispatch
+stops, and no decisions are made. `maxDuration` still bounds running work, so
+the worst case is a bounded run finishing without an observer; its output is
+retrieved when contact returns. Lost contact is displayed as *uncertain*,
+never *stopped* or *idle*. If the host process dies, Trigger reports the run
+as crashed or system failure and the worktree remains on disk for inspection.
 
-## Pause, cancellation, and bounded recovery
+## Pause
 
-- Pause stops new dispatch and lets the current bounded step finish. It does not
-  silently abort the worker; the UI states which work may still finish.
-- Stop/cancel records a durable request, revokes authority, and requests runtime
-  termination including descendants. Show stopping until trusted termination is
-  confirmed. Isolation may permit recovery but must not be displayed as stopped.
-- Preserve already-created artifacts and external effects; cancellation is not
-  rollback. Reconcile in-flight effects even after a worker has stopped.
-- Retry transient execution failures with bounded backoff within the contract's
-  attempts/time budget. Block on exhaustion; do not retry contract/process
-  failures without a supervisor decision.
-- Resumption means reconstructing from durable domain state and verified
-  artifacts, or reconnecting a known surviving session. It does not assume a
-  saved worker memory image or a replayable conversation.
+Pause stops new dispatch. Running attempts continue to their bounded end. The
+UI names which run may still finish and links to it. Pause does not cancel.
 
-## Basis and implementation proof
+## Budgets
 
-The recovery policy applies the distinction between lease expiry and effective
-write exclusion described in [Kleppmann's fencing analysis](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html),
-and the explicit request identities and ambiguous-effect handling described in
-[Amazon's idempotent API guidance](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/).
-The AgencyHQ-specific gate above is a design decision, not a claim that either
-execution adapter already implements it. The required failure trials are in
-[TESTING.md](TESTING.md); see [ADR-0004](adrs/0004-supervised-completion-and-safe-recovery.md).
+A StepContract's budget is: attempts, `maxDuration` per attempt, and an
+estimated-spend ceiling (machine preset on the container profile). Trigger
+enforces attempts and duration per run. Spend is an estimate from token usage reported by OpenCode; it is never
+represented as a hard limit until a model gateway exists.
+
+## Basis
+
+Fencing by generation follows [Kleppmann's analysis of distributed locks](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html);
+idempotent operation identities follow [Amazon's guidance on idempotent APIs](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/).
+Trigger behaviors cited here come from its documentation as read on 2026-09-07
+and must be re-verified when the pinned version changes. The
+[execution trial](TESTING.md#required-execution-trial) is the proof.

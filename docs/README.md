@@ -12,10 +12,10 @@ tests, delivery, and eventually production learning.
 | [`DESIGN.md`](DESIGN.md) | What should remain consistent in the operator experience? |
 | [`experience/`](experience/) | What evidence and desired behaviors inform the product? |
 | [`REQUIREMENTS.md`](REQUIREMENTS.md) | What must the delivered system demonstrably do? |
-| [`engineering/ARCHITECTURE.md`](engineering/ARCHITECTURE.md) | How do the domain and component boundaries satisfy those requirements? |
-| [`engineering/TESTING.md`](engineering/TESTING.md) | Which checks, review, and integration evidence qualify completion? |
+| [`engineering/ARCHITECTURE.md`](engineering/ARCHITECTURE.md) | How do the components and the Trigger.dev runtime satisfy those requirements? |
+| [`engineering/TESTING.md`](engineering/TESTING.md) | Which checks, review, trial, and integration evidence qualify completion? |
 | Publishing | Deferred until AgencyHQ has a chosen deployment and promotion path. |
-| Observability | Deferred until executable journeys and real telemetry sources exist. |
+| Observability | Trigger's dashboard and Realtime cover execution; AgencyHQ-level telemetry is deferred until the first slice runs. |
 
 ## Supporting detail
 
@@ -33,10 +33,12 @@ tests, delivery, and eventually production learning.
 - Keep requirements stable, testable, and traceable to evidence.
 - Record significant decisions as ADRs.
 - Do not represent planned implementation, delivery, or telemetry as current.
+- Cite Trigger.dev and OpenCode behavior with the date it was read; re-verify
+  when pinned versions change.
 
-The current baseline includes [supervisor authority and version repair](engineering/DOMAIN_MODEL.md),
-one [worked process](engineering/PROCESS_CATALOG.md), a
-[replacement-worker gate](engineering/EXECUTION_MODEL.md), and
-[proportional completion rules](engineering/TESTING.md).
-[ADR-0004](engineering/adrs/0004-supervised-completion-and-safe-recovery.md) records
-the acceptance revision; the original accepted ADR files remain historical.
+The 2026-09-07 revision adopts self-hosted Trigger.dev as the execution
+runtime ([ADR-0005](engineering/adrs/0005-trigger-as-execution-runtime.md)),
+defines the Lead role and delegated authority
+([ADR-0006](engineering/adrs/0006-lead-role-and-delegated-authority.md)), and
+removes worker-side external effects
+([ADR-0007](engineering/adrs/0007-worker-effect-model.md)).

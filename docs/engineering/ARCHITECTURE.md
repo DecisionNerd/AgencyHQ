@@ -2,128 +2,157 @@
 
 ## Context
 
-AgencyHQ is a modular monolith with external execution adapters. The web app is
-an operator interface. The coordinator is the only component allowed to decide
-what work may run, what scope it receives, how capacity is allocated, and when
-evidence satisfies acceptance.
+AgencyHQ is a modular monolith (web control plane plus coordinator) that
+records intent, authority, evidence, and acceptance in Postgres and delegates
+all execution to self-hosted Trigger.dev. Every unit of work — a Lead decision,
+a worker attempt, a verification run, an integration — is a Trigger run. The
+coordinator decides *whether* and *within what bounds* work runs and *whether
+its evidence satisfies acceptance*; Trigger decides *how* it runs and *whether
+it is still running*.
+
+Slices 1–3 use the **host runtime profile** (ADR-0005): `trigger dev` on the
+machine where OpenCode is configured, real Git worktrees per attempt. The
+**container profile** is the later hardening path.
 
 ```mermaid
 flowchart LR
     Operator --> Web[React web control plane]
     Web --> Coordinator
-    Coordinator --> Postgres
-    Coordinator --> Git[Git and worktree adapter]
-    Git --> Repositories[Linked repositories]
-    Coordinator --> Trigger[Self-hosted Trigger.dev]
-    Trigger --> OpenCode
-    OpenCode --> Git
-    OpenCode --> Results[Artifacts and execution results]
-    Results --> Coordinator
+    Web -. Realtime run state .-> TriggerAPI
+    Coordinator --> Postgres[(AgencyHQ Postgres)]
+    Coordinator -- trigger / cancel / retrieve --> TriggerAPI[Trigger.dev webapp]
+    TriggerAPI --> Dev[trigger dev on the OpenCode host]
+    subgraph Host machine
+      Dev --> Adapter[Task adapter process]
+      Adapter --> OpenCode[OpenCode child process]
+      OpenCode --> Worktree[(attempt worktree)]
+      Adapter --> Worktree
+    end
+    Adapter -- output, metadata, status --> TriggerAPI
+    Integrate[integrate.merge task] -- push after acceptance --> Repos[Linked repositories]
 ```
 
-Arrows show commands or observations, not transfers of authority.
+Arrows are commands and observations. Authority lives where the table in the
+[README](../../README.md) says it does.
 
 ## Components
 
 ### Web control plane
 
-Presents campaigns, project links, ranked work, allocations, approvals,
-failures, and evidence. It calls coordinator application APIs and contains no
-independent scheduling or acceptance logic.
+React/TypeScript. Renders coordinator state and submits typed commands. For
+live execution state it subscribes to Trigger runs by tag with Trigger's React
+hooks using scoped public access tokens. Contains no scheduling or acceptance
+logic. Runs in the same Node process as the coordinator.
 
 ### Coordinator
 
-Owns application policy, domain transitions, scope enforcement, allocation,
-approval gates, and acceptance evaluation. It persists decisions before asking
-external mechanisms to act and consumes their results idempotently.
-The supervisor is the engineering decision role within this boundary: it uses
-context to approve the definition of done and assess results. Domain rules
-validate its authority and evidence requirements. Worker agents may propose
-decisions but cannot commit policy or acceptance transitions.
+Owns the ledger and the policy:
 
-### Postgres
+- validates every transition against domain invariants and the project's
+  [delegated-authority schema](adrs/0006-lead-role-and-delegated-authority.md);
+- records a DispatchIntent before triggering any task and uses the intent id
+  as the Trigger idempotency key;
+- consumes run outputs and final statuses idempotently into attempt reports,
+  Artifacts, VerificationResults, Reviews, and failure records;
+- commits Lead proposals as Decisions only when they pass the authority check;
+- holds the Trigger secret key and AgencyHQ's own secrets.
 
-Stores the engineering/domain ledger: identities, relationships, state changes,
-contracts, attempts, allocations, approvals, artifact metadata, and verification
-results. Large artifact bodies may live elsewhere later, but their identity,
-digest, provenance, and relationship remain in Postgres.
+### Lead
 
-### Trigger.dev
+The engineering decision role (ADR-0006): OpenCode sessions in a read-only
+agent configuration returning structured JSON, run as Trigger tasks in a
+read-only worktree at the relevant revision. Proposes definitions of done,
+verification profiles, review depth, boundaries, Finding dispositions, failure
+classifications, review findings, and acceptance. Proposals become Decisions
+only through the coordinator.
 
-Provides durable invocation, retry, scheduling, waits, and resumption. Trigger
-task/run state is observed by the coordinator but never substitutes for domain
-state. Trigger tasks call versioned coordinator commands and worker adapters.
-Trigger remains the selected backend, subject to the first execution trial in
-[TESTING.md](TESTING.md). Pin platform, SDK/CLI, and OpenCode versions together
-with their compatibility evidence. As checked on 2026-09-06, [Trigger's self-hosting
-overview](https://trigger.dev/docs/self-hosting/overview) lists checkpoints as
-unavailable. Domain recovery must work without checkpointed process memory.
-If the trial fails the recovery contract, record an ADR comparing remediation
-with a Postgres-backed worker before changing backend; neither fallback nor
-successful qualification is implied by these docs.
+### Trigger.dev (execution runtime)
+
+Self-hosted v4 webapp stack (ADR-0005) plus, on the host profile, `trigger dev`
+running on the OpenCode host. Provides queues and per-repository
+serialization, attempts and retries, `maxDuration`, cancellation with bounded
+grace, idempotent dispatch, tags, metadata, run output, Realtime, and the
+raw-log dashboard. Run status is trusted for execution mechanics and never for
+acceptance. The container profile adds the supervisor/worker stack.
+
+### Task adapters (`trigger/`)
+
+Thin, versioned task definitions with no policy:
+
+| Task | Does | Returns as run output |
+| --- | --- | --- |
+| `lead.plan` | Read-only OpenCode session in a worktree at the base revision; proposes StepContract, criteria, profile, review depth, boundary. | Structured proposal with source citations. |
+| `worker.attempt` | `git worktree add` at the base revision; spawn OpenCode with scrubbed env and the contract's permission rules; on exit diff, path-check, commit `agencyhq/attempts/<id>`; on cancel commit a checkpoint and kill the process group. | Worker report, commit id, diff digest, path violations. |
+| `verify.run` | Separate worktree at the attempt revision; run the approved profile's checks; capture bounded logs. | VerificationResult records. |
+| `lead.review` | Read-only session over the diff and evidence; adversarial review. | Review findings against exact versions. |
+| `lead.accept` | Judges criteria against evidence and review. | Acceptance proposal with rationale. |
+| `integrate.merge` | After a recorded acceptance: merge to the target ref, compare-and-set on expected base, push with host credentials. | Resulting revision or conflict evidence. |
+
+Adapters raise `AbortTaskRunError` for contract failures so Trigger does not
+retry work that a decision must follow.
 
 ### OpenCode
 
-Executes a StepContract in the assigned worktree using its supported provider
-abstraction. AgencyHQ supplies bounded context and receives structured results;
-it does not implement its own agent loop or provider adapters.
+The coding-agent runtime and provider abstraction, configured and
+authenticated on the host. AgencyHQ invokes it non-interactively
+(`opencode run --format json --dir <worktree>` with an agent and permission
+rules per contract) and reads its JSON event stream and structured outputs.
+AgencyHQ implements no agent loop and no provider adapters.
 
-### Git and worktrees
+### Git and repositories
 
-Git is authoritative for source changes. Each mutable worker attempt receives an
-isolated worktree, base revision, branch/ref policy, and allowed repository set.
-Database records point to Git identities; they do not copy source truth.
-The trusted Git adapter owns branch creation, snapshots, commits, shared-ref
-updates, and integration. Workers edit assigned files and propose outputs.
+Git is source truth. Each Project has a coordinator-owned clone; each attempt
+gets its own worktree folder, never reused. Adapters, not workers, commit
+attempt and checkpoint branches locally. Only `integrate.merge` pushes.
+Postgres stores commit ids and digests, never source.
 
 ## Enforcement boundaries
 
-These are required adapter capabilities, not implemented guarantees. A worktree
-alone is not a security or resource-isolation boundary. Dispatch must reject a
-contract whose required controls cannot be provided by the configured runtime.
+Host profile as declared. A contract that requires a boundary the profile
+marks advisory is rejected at dispatch.
 
-| Boundary | Enforcement owner and contract |
-| --- | --- |
-| Filesystem and repository access | Runtime isolates each attempt's writable files and prevents access to other worktrees, shared Git metadata writes, and host credentials. The Git adapter owns shared metadata mutations. |
-| Fine-grained output paths | Git adapter rejects/quarantines disallowed diffs before acceptance. Path exclusions are output checks unless the runtime provides narrower write controls; contracts needing prevention must require those controls. |
-| Shell, tools, network, and external effects | Runtime applies capability and egress controls before execution. Workers receive no publish/merge/deploy credentials; trusted effect adapters apply coordinator authority and reconciliation rules. A prompt instruction is not enforcement. |
-| Time, concurrency, and budget | Coordinator reserves capacity; runtime enforces hard duration/process limits. Provider spend observations may lag: distinguish estimates from hard limits and reject an unsupported hard spending guarantee. Retries share the original budget. |
-| Nested agents | Disabled initially. Enable only when child authority is a subset of the parent, aggregate usage is charged to its allocation, and stop/recovery controls cover all descendants. |
-| Verification and acceptance | Approved criteria/profile records are outside worker write access. Verification runs without publish credentials; only the coordinator commits the supervisor's acceptance decision. |
-
-For effects already dispatched, revocation does not imply rollback or completion.
-The [replacement-worker gate](EXECUTION_MODEL.md#replacement-worker-gate) defines
-what must be reconciled before another attempt can act.
+| Boundary | Host profile | Kind | Container profile |
+| --- | --- | --- | --- |
+| Worktree per attempt | Separate `git worktree` folder; never shared with a replacement. | Before action | Fresh clone per container. |
+| Filesystem isolation from the host | None; the worker can read host files. | Advisory | Container filesystem. |
+| CPU, memory | None. | Advisory | Machine preset. |
+| Duration | Trigger `maxDuration` from the contract. | Before action | Same. |
+| Tool and command capability | OpenCode permission rules generated from the contract; `deny` survives `--auto`. | Before action | Same. |
+| Output paths | Adapter diff check against `paths.allow/deny`; violations quarantine the attempt. | On output | Same. |
+| Git pushes from the worker | Scrubbed child environment (no SSH agent, no tokens, empty credential helper) plus `deny` on `git push`/`git remote`. | Before action | No credential exists. |
+| Merge, deploy, publish | Only `integrate.merge`, after acceptance, serialized, compare-and-set. | Before action | Same, with operation-scoped token. |
+| Termination | Generation revoked → `runs.cancel` → `onCancel` checkpoint commit and process-group kill → adapter confirms no survivors → Trigger final status. | Trusted observation | Supervisor removes the container. |
+| Egress and provider spend | None; spend is an estimate. | Advisory | Gateway with per-attempt keys (later). |
+| Nested agents | OpenCode `task` tool denied for worker agents. | Before action | Same. |
 
 ## Dependency rule
 
-Dependencies point inward: adapters depend on application/domain contracts;
-domain code does not import Trigger.dev, OpenCode, React, or database clients.
-Cross-component communication uses typed commands/events and stable identifiers,
-not direct edits to another component's state.
+`packages/domain` imports nothing from Trigger, OpenCode, React, or Postgres
+clients. `trigger/` and `packages/db` depend on `packages/contracts` and
+`packages/domain`. The coordinator composes them.
 
 ## Deployment shape
 
-Begin with one web deployment, one coordinator deployment, Postgres, and the
-self-hosted Trigger.dev services it requires. Package boundaries are for clarity
-and testability, not an instruction to deploy microservices.
-If AgencyHQ and Trigger share a Postgres service, use separate databases and
-credentials. AgencyHQ owns its migrations and uses supported Trigger APIs, never
-Trigger's internal tables as an integration contract.
+Host profile: one AgencyHQ process (web + coordinator), one AgencyHQ Postgres,
+the Trigger webapp stack (webapp, Postgres, Redis, Electric, registry, object
+storage, socket proxy; ClickHouse optional), and `trigger dev` kept running on
+the OpenCode host. No supervisor or worker machine. AgencyHQ and Trigger never
+share a database or credentials; AgencyHQ uses only Trigger's SDK and
+management API.
 
 ## Security baseline
 
-- Keep provider and repository credentials outside prompts and artifacts.
-- Grant workers repository- and operation-scoped credentials.
-- Bind commands to actor, Campaign, Project, StepContract version, and attempt.
-- Store immutable audit records for approvals and policy-relevant transitions.
-- Treat worker output, repository content, and external callbacks as untrusted.
-- Authenticate operator commands and adapter callbacks; bind them to the
-  authorized actor and current attempt generation before effects or acceptance.
+- The coordinator holds AgencyHQ secrets and the Trigger secret key. Worker
+  processes inherit the host's OpenCode credentials by design of the host
+  profile; that exposure is recorded, not hidden.
+- Every command is bound to actor, Project, contract version, attempt, and
+  generation; Decisions and Approvals are immutable audit records.
+- Worker reports, repository content, Lead proposals, and run outputs are
+  untrusted input; deterministic checks and the authority schema bound them.
+- Operator sessions are authenticated even for one operator; Trigger public
+  access tokens for the UI are scoped to specific runs or tags.
 
-The domain vocabulary and relationships are detailed in
-[DOMAIN_MODEL.md](DOMAIN_MODEL.md). Durable dispatch, recovery, and failure
-semantics are detailed in [EXECUTION_MODEL.md](EXECUTION_MODEL.md).
-
-See [ADR-0001](adrs/0001-authority-boundaries.md) and
-[ADR-0002](adrs/0002-modular-monolith.md).
+See [DOMAIN_MODEL.md](DOMAIN_MODEL.md), [EXECUTION_MODEL.md](EXECUTION_MODEL.md),
+and ADRs [0001](adrs/0001-authority-boundaries.md), [0002](adrs/0002-modular-monolith.md),
+[0005](adrs/0005-trigger-as-execution-runtime.md), [0006](adrs/0006-lead-role-and-delegated-authority.md),
+[0007](adrs/0007-worker-effect-model.md).

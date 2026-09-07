@@ -1,6 +1,6 @@
 # Web control plane
 
-Planned React/TypeScript operator interface. It renders coordinator state and
-submits typed commands; it does not own scheduling, allocation, or acceptance
-policy. A minimal return-after-interruption view ships with the complete repair
-path in roadmap slice 3; slice 5 expands it into the full control plane.
+React/TypeScript operator interface. Renders coordinator state, submits typed
+commands, and subscribes to Trigger.dev Realtime (scoped public access tokens)
+for live execution state. Links to Trigger runs for raw logs. Owns no policy.
+The minimal return-after-interruption view ships in slice 3.

@@ -1,0 +1,65 @@
+# ADR-0007: Workers produce proposals, not effects
+
+- Status: Accepted
+- Date: 2026-09-07
+- Extends: ADR-0004 (simplifies the replacement gate by removing worker-side
+  external effects) and ADR-0005.
+- Implementation status: Planned; qualified by the Slice 1 execution trial.
+
+## Context
+
+The baseline replacement gate had to reconcile "effects already in flight"
+from a lost worker: pushes, merges, deployments, unknown external calls. That
+is necessary only if workers can cause external effects. The baseline also
+said both "grant workers repository- and operation-scoped credentials" and
+"workers receive no publish/merge/deploy credentials", and never said where
+worktrees live.
+
+## Decision
+
+1. **A worker's only output is the state of its attempt worktree and its
+   report.** Workers get no publish, merge, or deploy capability. OpenCode's
+   permission rules for worker agents deny `git push`, `git remote`, network
+   tools, the `task` tool, and access outside the worktree.
+2. **Worktrees are real Git worktrees on the host.** Each Project has a
+   coordinator-owned base folder with one clone; each attempt gets
+   `git worktree add <base>/attempts/<attempt-id> <base-revision>`. The folder
+   is the operator-visible artifact of the attempt and is never reused by
+   another attempt.
+3. **The worker child process runs with a scrubbed environment.** The adapter
+   spawns OpenCode with `SSH_AUTH_SOCK`, `GH_TOKEN`, `GITHUB_TOKEN`, and
+   similar variables removed, `credential.helper` overridden to empty through
+   `GIT_CONFIG_*` variables, and `HOME` retained so OpenCode finds its own
+   config. This is a before-action control against pushes from the worker
+   process; it is not filesystem isolation.
+4. **Outputs are committed by the adapter after the worker exits.** The
+   adapter diffs the worktree, quarantines paths outside the contract, and
+   commits on `agencyhq/attempts/<attempt-id>` in the local repository. The
+   commit id and diff digest are the attempt Artifact. No push occurs.
+5. **Verification runs as its own Trigger task** in a separate worktree at the
+   attempt revision, with the approved checks, and returns results.
+6. **Integration is a coordinator-dispatched task** that merges the attempt
+   revision to the target ref and pushes with the host's credentials, only
+   after a recorded acceptance Decision, serialized per repository, and
+   compare-and-set on the target ref's expected base.
+7. **Cancellation salvage.** On `onCancel` the adapter commits whatever is in
+   the worktree to `agencyhq/checkpoints/<attempt-id>` before terminating the
+   process group, so a stopped attempt's work is inspectable and a Lead may
+   select it as a starting revision for a replacement.
+8. **Provider credentials** are the host's. A worker with shell access can
+   read them; this is a declared risk of the host profile, mitigated by the
+   permission rules and by moving to the container profile with per-attempt
+   keys when hardening is needed.
+
+## Consequences
+
+- Replacement reduces to: revoke the generation, cancel the run, confirm the
+  process group is gone and the run is final, start a new attempt in a new
+  worktree. Nothing the old worker did reached a shared ref, because the
+  adapter, not the worker, commits, and only integration pushes.
+- Unknown-effect reconciliation applies only to the integration task, which
+  is serialized and compare-and-set.
+- Attempt worktrees accumulate on disk; a retention policy removes worktrees
+  whose attempt is final and whose commits are retained in the repository.
+- The coordinator needs no inbound endpoint for task adapters on the host
+  profile; the container profile adds token issuance.

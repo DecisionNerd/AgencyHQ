@@ -6,4 +6,4 @@ evidence exist.
 
 | Document | Description |
 | --- | --- |
-| [`roadmap.md`](roadmap.md) | A complete repair path with recovery and acceptance, then broader integration and capacity. |
+| [`roadmap.md`](roadmap.md) | Execution spike first, then ledger, then one complete repair, then integration, control plane, and capacity. |

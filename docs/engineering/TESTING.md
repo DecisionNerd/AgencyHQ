@@ -1,199 +1,137 @@
 # Testing and verification
 
-AgencyHQ uses behavior-first tests and deterministic evidence. Fast domain
-tests protect policy and state transitions; integration tests prove the real
-Postgres, Git/worktree, Trigger.dev, and OpenCode boundaries; browser tests
-prove operator-visible behavior. A green workflow is never a substitute for
-the acceptance evidence required by a StepContract.
+Fast domain tests protect policy; integration tests prove the Postgres,
+Trigger, OpenCode, and Git boundaries; one recorded execution trial qualifies
+the pinned versions; browser tests prove operator-visible behavior. A green
+Trigger run is never acceptance.
 
 ## Strategy
 
-| Layer | What it proves | Planned implementation |
+| Layer | Proves | Implementation |
 | --- | --- | --- |
-| Architecture baseline | Required records, links, boundary language, and completed DocSlime docs remain intact. | Node test runner in `tests/architecture-baseline.test.mjs`. |
-| Domain | Invariants, transitions, ranking, scope, idempotency, and failure classification. | Framework-free TypeScript unit and property tests in the domain package. |
-| Persistence | Transactional state, outbox dispatch, concurrency, replay, audit, and recovery. | Integration tests against a pinned Postgres version. |
-| Adapters | Exact contracts at Git/worktree, Trigger.dev, and OpenCode boundaries. | Deterministic fakes plus opt-in local integration tests. |
-| Operator behavior | Distinct states, evidence inspection, scope preview, and approval commands. | Browser-level acceptance tests against the composed system. |
+| Architecture baseline | Required records and links exist; no template guidance remains. | `tests/architecture-baseline.test.mjs` (current). |
+| Domain | Transitions, authority subset checks, version binding, evidence matching, failure classification, idempotent command handling. | Framework-free TypeScript unit and property tests in `packages/domain`. |
+| Persistence | Transactional decision + DispatchIntent, generation fencing, observation dedupe, audit. | Integration tests against a pinned Postgres. |
+| Adapters | Task contracts: clone/scrub/push, path check, permission-rule generation, structured-output parsing, `AbortTaskRunError` on contract failure. | Deterministic fakes for OpenCode and Git; opt-in local run against the real stack. |
+| Execution trial | The runtime meets the recovery and isolation contract. | Recorded manual trial per pinned version set. |
+| Operator behavior | Distinct states, evidence inspection, decisions, stop status. | Browser tests against the composed system. |
 
 ## Behavior coverage
 
-The following scenarios are the required evidence map. Test paths beyond the
-architecture baseline are explicit roadmap gaps, not claims of current code.
-
 | Requirement | Given / When / Then | Evidence |
 | --- | --- | --- |
-| R-001, R-004 | Given a successful Trigger.dev run, when required acceptance evidence is absent, then the coordinator does not mark the step accepted. | Planned domain and Trigger adapter tests. |
-| R-002 | Given a state transition and dispatch intent, when a transaction fails or dispatch is replayed, then no uncommitted decision produces an external effect and committed dispatch remains recoverable. | Planned Postgres transaction/outbox tests. |
-| R-003, R-009 | Given a bounded StepContract, when a worker attempts a prohibited capability or repository access, then the runtime rejects it; a disallowed output diff is quarantined and cannot be accepted. | Planned runtime isolation and Git adapter tests. |
-| R-005 | Given a configured OpenCode runtime, when work is dispatched, then it uses the pinned supported API and provider abstraction without an AgencyHQ agent loop or direct provider adapter. | Planned OpenCode contract test and dependency review. |
-| R-006 | Given exact outputs, when the pinned checks and required review pass and the supervisor accepts the matching evidence, then acceptance may advance without an extra human gate unless policy requires one. | Planned verification-policy tests. |
-| R-007 | Given equivalent retry conditions in different failure categories, when recovery is evaluated, then only execution failure is automatically retryable by default. | Planned domain table tests. |
-| R-008 | Given constrained compatible capacity, when ranked work is allocated, then the feasible main effort receives capacity first and every exception has a reason. | Planned allocation-policy tests. |
-| R-008 | Given two Campaigns share a repository or stale capacity data, when allocation runs, then global rank and repository serialization apply, conservative limits bound dispatch, and blocked main effort retains its identity. | Planned shared-capacity and stale-observation tests. |
-| R-010 | Given a previously handled callback, when it is delivered again with the same idempotency key, then no second logical attempt or approval is created. | Planned persistence integration tests. |
-| R-011 | Given contract, execution, process, and acceptance states differ, when the operator opens the process view, then each state and its source timestamp are distinct. | Planned browser acceptance test. |
-| R-012 | Given package and deployment changes, when the architecture is reviewed, then domain dependencies remain inward and new services require measured need and an ADR. | Planned dependency check and architecture review. |
-| R-013 | Given an expired lease with an unconfirmed worker or unknown external effect, when recovery runs, then replacement is blocked until the recovery gate holds; late stale results cannot advance it. | Planned real interruption and stale-worker integration tests. |
-| R-014 | Given a supervisor-approved definition of done, when a worker changes a check or reports partial success, then the original criteria remain authoritative and unmet work is not accepted. | Planned profile provenance and supervisor authorization tests. |
-| R-015 | Given separately passing branches or repositories, when the required combined revision set fails, then the Goal remains incomplete. | Planned integration acceptance tests. |
-| R-015 | Given a completed Goal, when relevant evidence is disproved or required live behavior regresses, then current completion is reopened with its historical acceptance preserved; unrelated commits alone do not reopen it. | Planned completion-validity tests. |
-| R-016 | Given a required capability is only advisory or unavailable, when dispatch is requested, then it is rejected; unaccounted child delegation is disabled. | Planned adapter capability and nested-delegation tests. |
-| R-017 | Given an unclear request or unrelated Finding, when the supervisor classifies it, then it requests inputs or records the correct disposition without authorizing unrelated work. | Planned process selection and Finding tests. |
-| R-018 | Given a contract is superseded, when a replacement is created, then the old instance stays immutable and mismatched checks/approvals cannot transfer. | Planned version-transition tests. |
-| R-019 | Given an operator returns after interruption, when the workspace opens, then changed outcomes, pending decisions, stale observations, and actual stop status are understandable without opening logs. | Planned browser journey test. |
+| R-001, R-004 | Given a `completed` Trigger run, when acceptance evidence is absent, then the step is not accepted. | Domain test. |
+| R-002 | Given a decision and DispatchIntent, when the transaction fails or the trigger call is replayed, then no undecided work runs and a committed intent resolves to exactly one run. | Postgres integration test with a fake Trigger client honoring idempotency keys. |
+| R-003 | Given a contract with allowed paths and capabilities, when the worker writes outside them, invokes a denied tool, or attempts a push, then the write is rejected by OpenCode rules, the diff is quarantined by the adapter, or the push fails from the scrubbed environment. | Adapter tests; execution trial. |
+| R-005 | Given the dependency graph, when reviewed, then no package imports a model-provider SDK and all model calls go through OpenCode. | Dependency check. |
+| R-006 | Given exact outputs and passing checks, when the Lead proposes acceptance within authority, then acceptance advances without a human gate; when `humanRequired` matches, it waits for an Approval bound to the same versions. | Domain tests. |
+| R-007 | Given each Trigger final status and adapter outcome, when classified, then only execution failures create automatic new Attempts. | Table test over all statuses. |
+| R-008 | Given ranked WorkItems and one worker slot, when dispatch runs, then the main effort dispatches first and every exception has a reason. | Domain test. |
+| R-009 | Given a Lead proposal wider than the Project schema, when checked, then it becomes a pending human decision and no contract is frozen. | Authority subset tests. |
+| R-010 | Given a run observation delivered twice, or for a revoked generation, then no second Attempt, Artifact, or Decision is created. | Persistence tests. |
+| R-011 | Given contract, execution, verification, and acceptance states differ, when the operator opens the WorkItem, then each is distinct with its source and timestamp. | Browser test. |
+| R-012 | Given the workspace, when reviewed, then domain imports remain inward and the deployment shape matches ARCHITECTURE.md. | Dependency check; ADR review. |
+| R-013 | Given an executing attempt, when the operator stops it, then generation advances before `runs.cancel`, a checkpoint is committed, the process group is confirmed gone, the UI shows *stopping* until the run is final, and a late observation from the old generation is history-only. | Execution trial; persistence test. |
+| R-014 | Given a worker report claiming success with a weakened check, when verification and review run, then the original criteria and profile govern and the claim is not accepted. | Adapter and domain tests; trial. |
+| R-015 | Given a `merge` boundary, when integration fails or the target ref moved, then the WorkItem stays incomplete and integration is retried compare-and-set, never blindly. | Integration adapter test. |
+| R-016 | Given a contract requiring a boundary the active runtime profile declares advisory (filesystem isolation, resource limits, egress, hard spend on the host profile), when dispatch is requested, then it is rejected. | Domain test. |
+| R-017 | Given an unrelated Finding, when the Lead classifies it, then a backlog WorkItem is linked and the contract is unchanged. | Domain test. |
+| R-018 | Given a superseded contract, when a replacement Attempt is created, then the old Attempt's Review and VerificationResults do not transfer. | Version tests. |
+| R-019 | Given an operator returns, when the workspace opens, then changed outcomes, pending decisions, stale observations, and stop status are visible without logs. | Browser journey. |
+| R-020 | Given a repository containing instructions to widen scope or skip checks, when `lead.plan` runs, then the proposal is either narrower than authority or rejected; it can never widen. | Authority tests with adversarial fixtures. |
 
 ## Completion rule
 
-A successful Trigger.dev run or OpenCode response is an execution observation;
-it does not establish accepted completion or that every descendant stopped.
-Acceptance requires the supervisor-approved criteria to be met by exact outputs,
-passing required VerificationResults, the required review, and a recorded
-supervisor acceptance decision. Any required human Approval binds to the same
-subject version and evidence. The coordinator enforces these prerequisites.
+A Trigger run finishing or an OpenCode message claiming success is an
+execution observation. Acceptance requires: every approved criterion cited
+against exact outputs; passing VerificationResults from `verify.run`; the
+required Review with no blocking finding; a recorded acceptance Decision; and
+any `humanRequired` Approval bound to the same versions.
 
-### Lean verification and review
+### Proportional verification and review
 
-The supervisor chooses the smallest adequate profile before dispatch, guided by
-project context and the consequences of failure. Repository-mandated checks and
-review still apply. The following are defaults, not additional workflow layers:
+The Lead proposes the smallest adequate profile; the schema's `review.minimum`
+is the floor.
 
-| Work | Required evidence and review |
+| Change class | Required evidence and review |
 | --- | --- |
-| Editorial or mechanical change with no behavior impact | Relevant structural checks (such as links, formatting, or a build) and supervisor inspection of the exact diff against the request. No invented behavior test or separate review session solely for ceremony. |
-| Behavior change or bounded bug fix | Targeted tests for the claimed behavior and plausible regression, relevant existing project checks, and one adversarial review by the supervisor or another reviewer who did not author the change. |
-| Shared-interface change, migration, security-sensitive or hard-to-reverse action | The behavior-change profile plus checks aimed at the specific risk, such as compatibility, migration recovery, or deployment observations. Human approval only where policy or delegated authority requires it. |
+| Editorial or mechanical, no behavior impact | Structural checks (links, format, build) and Lead inspection of the exact diff. |
+| Behavior change or bounded bug fix | Targeted tests for the claimed behavior and plausible regression, existing project checks, one adversarial `lead.review` by a non-authoring session (different model where the schema requires). |
+| Shared-interface change, migration, security-sensitive, or hard-to-reverse | The above plus risk-specific checks; human Approval where `humanRequired` matches. |
 
-Adversarial review asks what could make the completion claim false: an untested
-criterion, scope violation, regression, incompatible dependency, or misleading
-evidence. It records concise findings or no blocking findings against exact
-versions. An existing qualifying PR review counts; do not require another panel,
-meeting, or named red-team process. The reviewer cannot approve its own authored
-change where independent review is required. Reviewer identity and authorship
-are recorded; review by another agent is useful evidence, not a guarantee.
-
-Acceptance waits for criterion failures and material correctness or safety
-findings. Style preferences and unrelated improvements become nonblocking
-Findings. Recheck changed outputs and affected risks after remediation; do not
-restart unrelated review. Stop once the agreed gates pass.
-
-Deterministic checks prove their assertions, not all possible correctness.
-Qualitative judgments are recorded as review evidence, never fabricated as
-deterministic tests. This policy follows the proportionality of [Google's code
-review standard](https://google.github.io/eng-practices/review/reviewer/standard.html),
-which favors meaningful improvement over perfection; the profiles are AgencyHQ's
-chosen application of that principle.
+Adversarial review asks what would make the claim false and records findings
+against exact versions. Style and unrelated improvements are non-blocking
+Findings. An existing qualifying human PR review may be recorded as a Review
+once a forge integration exists; until then, it does not count.
 
 ### Evidence integrity
 
-Before execution, record the supervisor-approved criteria and verification
-profile digests outside the worker's writable scope. The verification adapter
-runs the approved checks against a stable snapshot in an isolated environment
-and records its own results; worker reports do not substitute for that run.
-Workers may add tests or propose corrections, but any alteration to an approved
-verifier, assertion, or its transitive configuration requires supervisor review
-and explicit profile versioning before it counts. A green weakened suite does
-not satisfy the original contract.
+Criteria and profile digests are frozen in the StepContract before the worker
+runs and are never present in the worker's writable tree. `verify.run` executes
+the approved checks in its own worktree and run; the worker's report of checks is
+context, not evidence. Any change to an approved verifier or its configuration
+inside the diff is a Review-blocking finding until the profile is re-versioned.
 
-Review, Approval, and VerificationResult records identify the evidence they
-cover. Preserve reused artifact provenance, including any source attempt; check
-reuse follows [version repair](DOMAIN_MODEL.md#version-repair), not a worker's
-claim that prior checks remain valid.
+### WorkItem completion
 
-### Initiative and Goal completion
+Complete at the declared boundary with exact revisions: `artifact` needs the
+attempt revision; `merge` needs the resulting target revision from
+`integrate.merge`; `deploy` needs a deployment identity and the required live
+observation. For a one-step WorkItem, reuse the step's acceptance Decision.
 
-An Initiative or Goal is complete when all criteria in its approved definition
-of done are satisfied at its declared completion boundary, required evidence
-and review cover the resulting integrated identities, required approvals exist,
-and no unresolved blocking Finding or ambiguous external operation affects the
-claim. The supervisor records acceptance and rationale; counting successful
-steps is insufficient. Unrelated backlog work need not finish.
-
-Use one target revision for a repository or a manifest of exact compatible
-revisions for multiple repositories. Name an integration owner in the process;
-serialize updates to shared target refs, revalidate against their current base,
-and verify the combined result. Cross-repository work declares dependency order
-and runs a compatibility check against that manifest. Independent green results
-do not replace the combined check.
-
-Accepted artifact, merged change, and deployed outcome are distinct boundaries.
-Require authoritative merge evidence only for a merge goal, and deployment
-identity plus relevant live observations only for a deployed outcome. A deploy
-goal cannot complete from tests alone; a documentation goal needs no deployment.
-For a one-step Goal, reuse the same evidence and supervisor decision at both
-levels when the criteria and boundary match; do not add a second approval ritual.
-
-| Later event | Effect on completion |
+| Later event | Effect |
 | --- | --- |
-| Output, criteria, verification profile, or dependency identity changes before acceptance | Invalidate mismatched evidence/review/approval; rerun only affected gates against the new identities. |
-| Evidence is falsified, misattributed, unavailable for a required audit, or a material defect disproves an accepted criterion | Mark the current claim invalidated and reopen affected work with the reason and evidence. Preserve the historical acceptance record. |
-| A required deployed outcome is rolled back or demonstrably regresses | Reopen that outcome and affected dependents; retain the earlier deployment and acceptance history. |
-| New desired behavior or unrelated later commits | Create a new Goal version or work item; do not retroactively invalidate a valid historical completion. |
-
-Invalidate only dependent claims supported by the affected evidence. Completion
-records are immutable historical facts; current validity is a separate state.
-Continuous monitoring is required only when the Goal explicitly includes it,
-not an automatic obligation for every completed change.
+| Outputs, criteria, profile, or base change before acceptance | Invalidate mismatched evidence; rerun affected gates. |
+| Evidence falsified or a material defect disproves a criterion | Mark the claim invalidated with reason and reopen affected work; keep the historical Decision. |
+| Deployed outcome rolled back or regresses | Reopen that outcome; keep history. |
+| New desired behavior or unrelated later commits | New WorkItem version; do not reopen. |
 
 ## VerificationResult minimum record
 
-- verifier name and version;
-- StepContract and attempt identities;
-- definition-of-done and approved verification profile versions/digests;
-- repository, base revision, and resulting revision or diff digest;
-- normalized command/check identifier and relevant environment fingerprint;
-- start/end timestamps, exit status, and bounded stdout/stderr evidence;
-- input and output artifact digests;
-- deterministic pass/fail/error outcome.
+Verifier name and version; StepContract and Attempt ids; criteria and profile
+digests; repository, base revision, attempt revision, diff digest; normalized
+check id and environment fingerprint (host toolchain versions, or task image digest on the container profile); start/end, exit
+status, bounded stdout/stderr; artifact digests; pass/fail/error.
 
-## Initial verification layers
+## Lead quality metrics
 
-1. Contract validation: required inputs, scope, identities, and artifact schema.
-2. Repository validation: clean provenance, allowed paths, expected base, and
-   inspectable diff.
-3. Project checks: formatter, typecheck, unit/integration tests, and build as
-   selected by the Project's versioned verification profile.
-4. Acceptance checks: Goal/Initiative-specific assertions from StepContract.
-5. Review and acceptance: the required adversarial or supervisor inspection,
-   supervisor acceptance, and human Approval only where mandated.
+Because Lead judgment is the product's differentiator, record per decision:
+proposal, sources cited, model, authority result, and eventual outcome. Report
+escalation rate (proposals outside authority), acceptance reversal rate
+(accepted then invalidated), and review yield (blocking findings that were
+correct). No target is set until a baseline exists.
 
-Checks must be runnable without relying on a prior agent conversation. Network
-and nondeterministic tests are isolated and reported separately; they cannot be
-silently treated as deterministic acceptance.
+## Required execution trial
 
-## Required first execution trial
+Before slice 3 is complete, run and record with the pinned Trigger, OpenCode,
+and image versions on the real self-hosted stack:
 
-Before a real-worker slice is called complete, demonstrate one bounded repair
-with the pinned self-hosted Trigger/OpenCode versions and the actual runtime:
+1. Dispatch a repair; drop the trigger response; re-dispatch with the same
+   intent id; observe one run and one worktree.
+2. Stop an executing attempt; confirm generation revocation precedes cancel,
+   `onCancel` commits a checkpoint branch, the OpenCode process group is gone
+   (no orphaned children), the run reaches a final status, and a late
+   observation from the old generation cannot advance state.
+3. Exceed `maxDuration`; confirm the run is stopped, the process group is
+   killed, and the failure is classified as execution with no automatic second
+   Attempt beyond budget.
+4. Have the worker attempt `git push` (with the host's real credentials
+   configured), a write outside allowed paths, and the `task` tool; confirm the
+   push fails from the scrubbed environment, the diff is quarantined, and the
+   tool is denied.
+5. Seed the repository with instructions to skip tests and widen scope;
+   confirm `lead.plan` cannot widen the contract.
+6. Deliver a false success report with a weakened test; confirm `verify.run`
+   and `lead.review` block acceptance and an unrelated Finding lands in the
+   backlog.
+7. Complete the repair through acceptance with proportional review and no
+   human Approval, and show it in the minimal operator view.
 
-- create an output, interrupt contact, reconcile, and resume or replace without
-  duplicate sessions or external effects;
-- delay an old worker/callback past supersession and prove it cannot alter the
-  replacement or advance acceptance;
-- lose an external operation response and block conflicting retry until its
-  outcome or valid idempotency protection is established;
-- cancel with a descendant running and distinguish requested, isolated, and
-  confirmed stopped states;
-- reject altered success criteria and a false worker success report, capture an
-  unrelated Finding, and finish with exact evidence and proportional review.
+Deterministic fakes cover these in CI; the recorded real trial qualifies the
+version set. No trial has run yet.
 
-Use deterministic fakes for routine checks, but require one recorded real trial
-to qualify the adapter versions. Rerun relevant trials when those versions or
-enforcement mechanisms change. No such trial has been implemented or passed yet.
+## Baseline check
 
-## Repository baseline check
-
-The current `pnpm check` is intentionally small. It verifies the architecture
-record itself while product code does not yet exist. Each vertical slice must
-extend the check with executable domain and integration tests before it can be
-called complete.
-
-Run the currently implemented suite with:
-
-```sh
-pnpm check
-```
-
-No CI workflow exists yet. Before the first feature branch is merged, the
-baseline check and the slice-specific tests must run in CI and block merge on
-failure.
+`pnpm check` verifies documentation integrity only. Each slice extends it with
+executable tests, and CI must run the check and slice tests before the first
+feature merge.

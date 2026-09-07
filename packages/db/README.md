@@ -1,6 +1,6 @@
 # Database package
 
-Postgres migrations and repositories for the domain ledger. This package maps
-domain persistence ports to Postgres; it does not contain allocation or
-acceptance policy.
-
+Postgres migrations and repositories for the ledger: Projects, WorkItems,
+StepContracts, Attempts with authority generations, DispatchIntents, evidence,
+Decisions, Approvals, Findings, and idempotency tables. Separate database and
+credentials from Trigger.dev's. No policy here.

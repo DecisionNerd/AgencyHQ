@@ -1,58 +1,54 @@
 # Initial process catalog
 
-This is a planned contract example, not an executable workflow. Start with one
-process and derive reusable structures from its use; do not build a general
-workflow designer first. Every process names its inputs, authority, outputs,
-gates, remediation budget, and escalation conditions.
+One process exists and it is code, not data. A ProcessDefinition type is
+introduced when the second process shows what varies.
 
 ## Selection
 
-The supervisor maps intent and project context to a supported process version.
-If necessary facts are missing, request those facts or authorize a separately
-bounded investigation. If no process fits, record a mapping alert with the
-nearest candidates and failed entry conditions. Do not invent an unbounded
-execution process to avoid the alert.
+`lead.plan` maps operator intent and project context to a supported process.
+If necessary facts are missing it asks for them (a pending decision naming the
+gap). If no process fits it records a mapping alert with the nearest candidate
+and the failed entry condition. It never invents an unbounded process.
 
 ## Bounded repair v1
 
 | Contract part | Definition |
 | --- | --- |
-| Input | One Project, exact base revision, observed defect with reproduction or a testable expected behavior, allowed scope, and operator authority. |
-| Entry | Supervisor approves the definition of done, verification profile, completion boundary, review depth, attempt/time budget, and integration owner; coordinator validates runtime controls and capacity. |
-| Allowed work | Implement the repair and relevant regression test inside allowed paths/capabilities. Existing project rules apply. The worker cannot change acceptance criteria or publish independently. |
-| Output | Exact diff/commit and artifact identities, honest worker report, verification results, review evidence, and dispositions for discovered Findings. |
-| Completion | The approved behavior holds, relevant regression checks pass, required review has no unresolved blockers, and the supervisor accepts at the declared boundary. |
-| Failure | Execution uncertainty uses the recovery gate; unmet criteria use bounded remediation; contradictory process requirements require a replacement process decision. |
-| Escalation | Missing authority, unsupported enforcement, changed scope/criteria, exhausted budget, or an external effect that cannot be reconciled. |
+| Input | One Project, exact base revision, an observed defect with reproduction or a testable expected behavior, and operator intent. |
+| Entry | Lead proposal within delegated authority: criteria, verification profile, review depth, completion boundary, allowed paths, capabilities, budget. Coordinator confirms runtime enforcement and admits. |
+| Allowed work | Implement the repair and a relevant regression test inside allowed paths and capabilities. Existing project rules apply. |
+| Output | Attempt ref revision, diff digest, worker report, VerificationResults, Review, Finding dispositions. |
+| Completion | Every criterion holds on the attempt revision, required checks pass, Review has no blocking finding, acceptance Decision recorded at the declared boundary. |
+| Failure | Execution failure → new Attempt within budget. Contract failure → Lead disposition. Process failure → halt and human decision. |
+| Escalation | Out-of-authority proposal, unsupported enforcement, exhausted budget, blocking Finding, integration conflict. |
 
 ### Worked example
 
-An operator requests a repair for a parser that accepts a known-invalid input.
-The supervisor records that the exact bad input must be rejected, representative
-valid inputs must remain accepted, and unrelated parsing behavior is out of
-scope. It pins the relevant Project checks and chooses an accepted-artifact
-boundary unless the request requires merge or deployment. As a behavior change,
-the work needs targeted tests and one independent adversarial review.
+An operator asks for a repair: the parser accepts a known-invalid input.
 
-1. Coordinator reserves the single worker slot and dispatches the approved
-   StepContract in an isolated attempt worktree.
-2. Worker changes the parser and adds a regression test. An unrelated diagnostic
-   improvement is reported as a Finding; the supervisor records it in the
-   backlog without expanding the repair.
-3. On interruption, the coordinator reconnects the known session or satisfies
-   the replacement gate before dispatching a fresh attempt. It retains the
-   original budget and any explicitly selected, stable prior output.
-4. Verification runs the approved checks on exact outputs. The non-authoring
-   supervisor or a separate reviewer challenges the completion claim. A failing
-   criterion returns for bounded remediation under the same contract; it is
-   not resolved by weakening the criterion.
-5. Supervisor accepts the evidence once the gates pass. For this one-step Goal,
-   reuse that acceptance at the Goal level. If the approved boundary is merge
-   or deployment, obtain the corresponding integration/live evidence first.
+1. `lead.plan` proposes: the exact input must be rejected; representative valid
+   inputs stay accepted; unrelated parsing is out of scope; paths limited to
+   the parser module and its tests; `pnpm test` and typecheck as checks;
+   behavior-change review profile; `artifact` boundary; 2 attempts,
+   `maxDuration` 20 minutes. The coordinator verifies each bound
+   is inside the Project's authority and freezes the StepContract.
+2. `worker.attempt` runs. The worker fixes the parser and adds a regression
+   test. It notices an unrelated diagnostic improvement and reports it as a
+   Finding. The adapter commits `agencyhq/attempts/<id>` in the attempt
+   worktree and returns the report.
+3. The Lead classifies the Finding as unrelated; the coordinator creates a
+   backlog WorkItem and does not widen the contract.
+4. `verify.run` executes the pinned checks on the attempt revision.
+   `lead.review`, with a different model where the schema requires it,
+   challenges the claim against the diff and results. A failing criterion goes
+   back as a new Attempt under the same contract; the criterion is not weakened.
+5. `lead.accept` proposes acceptance; the coordinator confirms every criterion
+   cites passing evidence and records the Decision. For a one-step WorkItem
+   the same Decision completes the WorkItem. No human Approval is requested
+   because the authority schema did not require one for this change class.
 
-No separate human sign-off is added unless required by policy. An editorial
-repair can use the lighter profile in [TESTING.md](TESTING.md); a migration needs
-a suitable process and compatibility checks rather than stretching this example.
+If the operator had asked for a merge, step 5 is followed by `integrate.merge`
+and completion waits for the resulting target revision.
 
-See [scope, Findings, and version repair](DOMAIN_MODEL.md),
-[execution and recovery](EXECUTION_MODEL.md), and [completion](TESTING.md).
+See [DOMAIN_MODEL.md](DOMAIN_MODEL.md), [EXECUTION_MODEL.md](EXECUTION_MODEL.md),
+and [TESTING.md](TESTING.md).
