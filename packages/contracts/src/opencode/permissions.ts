@@ -178,16 +178,10 @@ export function leadAgentPermissions(): PermissionRuleset {
     "git show*": "allow",
     "git ls-files*": "allow",
     "ls*": "allow",
-    "cat *": "allow",
-    "head *": "allow",
-    "tail *": "allow",
     "wc *": "allow",
     "rg *": "allow",
     "grep *": "allow",
     "find *": "allow",
-    "pnpm test*": "allow",
-    "pnpm typecheck*": "allow",
-    "node --test*": "allow",
   };
   // Always-deny bash patterns override the allows above (last-match-wins).
   for (const pattern of WORKER_ALWAYS_DENY_BASH) {

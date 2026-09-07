@@ -135,7 +135,7 @@ host profile and does not cause R-016 rejection; only contracts that enable
 `packages/domain` imports nothing from Trigger, OpenCode, React, or Postgres
 clients. `trigger/` and `packages/db` depend on `packages/contracts` and
 `packages/domain`. The coordinator composes them. This is verified by
-`tests/dependency-rules.test.mjs` (11 cases), which runs as part of `pnpm check`.
+`tests/dependency-rules.test.mjs` (6 cases), which runs as part of `pnpm check`.
 
 ## Deployment shape
 

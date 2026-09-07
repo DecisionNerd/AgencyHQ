@@ -141,4 +141,4 @@ live — covered by deterministic tests), item 7 PASS. Full record:
 
 ## Baseline check
 
-`pnpm check` runs the architecture baseline check and the dependency rules (11 cases: `tests/dependency-rules.test.mjs`). Each slice extends it with executable tests, and CI must run the check and slice tests before the first feature merge.
+`pnpm check` runs the architecture baseline check and the dependency rules (6 cases: `tests/dependency-rules.test.mjs`). Each slice extends it with executable tests, and CI must run the check and slice tests before the first feature merge.

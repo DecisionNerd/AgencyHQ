@@ -21,6 +21,9 @@ export const DEFAULT_PROTECTED_PATHS: string[] = [
   "biome.json",
   ".github/**",
   "tests/**",
+  "test/**",
+  "**/*.test.*",
+  "**/*.spec.*",
   "**/vitest.config.*",
   "**/jest.config.*",
 ];

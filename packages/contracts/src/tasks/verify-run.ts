@@ -15,6 +15,11 @@ export const VerifyRunPayloadSchema = z.object({
   baseRevision: z.string().min(1),
   attemptRevision: z.string().min(1),
   diffDigest: DigestStringSchema,
+  /** Frozen profile protected paths (verifier-tampering detection); the
+   * single source of truth for verify.run, copied from the profile by the
+   * coordinator. Optional for older payloads: the task then uses the domain
+   * default list. */
+  protectedPaths: z.array(z.string().min(1)).optional(),
   checks: z.array(
     z.object({
       id: z.string().min(1),
