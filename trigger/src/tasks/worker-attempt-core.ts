@@ -1,9 +1,76 @@
 // Pure/injectable pieces of the `worker.attempt` task (ADR-0007,
 // docs/engineering/adrs/0007-worker-effect-model.md lines 18-63), factored
-// out so they can be unit-tested without importing `@trigger.dev/sdk`.
+// out so they can be unit-tested without importing the Trigger SDK.
 // No Trigger SDK usage; no direct `child_process`/`fs` calls except through
 // injected dependencies.
-import type { EventDenial, WorkerAttemptOutput, WorkerReportLite } from "../types.ts";
+import type {
+  PermissionRuleset as ContractsPermissionRuleset,
+  PermissionAction,
+  PermissionPatternMap,
+} from "@agencyhq/contracts";
+import { WORKER_ALWAYS_DENY_BASH, WORKER_ALWAYS_DENY_PATHS } from "@agencyhq/contracts";
+import type {
+  EventDenial,
+  WorkerAttemptOutput,
+  WorkerAttemptPayload,
+  WorkerReportLite,
+} from "../types.ts";
+
+// ---------------------------------------------------------------------------
+// Permission ruleset resolution — no Trigger SDK usage
+// ---------------------------------------------------------------------------
+
+/**
+ * Defense-in-depth: merge always-deny entries on top of a contract ruleset.
+ * Ensures that task and external_directory are always denied, and that bash
+ * patterns from WORKER_ALWAYS_DENY_BASH and file patterns from
+ * WORKER_ALWAYS_DENY_PATHS are denied after any allows, even if the payload
+ * ruleset explicitly allowed them. Last-match-wins is OpenCode's rule.
+ */
+export function enforceAlwaysDeny(ruleset: ContractsPermissionRuleset): ContractsPermissionRuleset {
+  const bash: PermissionPatternMap = { ...ruleset.bash };
+  for (const pattern of WORKER_ALWAYS_DENY_BASH) {
+    bash[pattern] = "deny";
+  }
+
+  const edit: PermissionPatternMap = { ...ruleset.edit };
+  for (const glob of WORKER_ALWAYS_DENY_PATHS) {
+    edit[glob] = "deny";
+  }
+
+  return {
+    ...ruleset,
+    bash,
+    edit,
+    task: "deny" as PermissionAction,
+    external_directory: "deny" as PermissionAction,
+  };
+}
+
+/**
+ * Select the worker's permission ruleset from the payload, applying
+ * always-deny entries for defense-in-depth. Throws a plain `Error` if
+ * `permissionRules` is absent at runtime (the TypeScript type requires it, but
+ * a malformed Trigger payload could bypass the type check); the task converts
+ * this into an `AbortTaskRunError` before any spawn.
+ *
+ * @returns `{ ruleset, source: "contract" }` — the source is always
+ *   "contract" because the spike fallback path has been removed.
+ */
+export function resolveWorkerRuleset(payload: Pick<WorkerAttemptPayload, "permissionRules">): {
+  ruleset: ContractsPermissionRuleset;
+  source: "contract";
+} {
+  // Runtime guard: the TypeScript type requires permissionRules, but a
+  // malformed or JS-bypassed payload could omit it.
+  if (payload.permissionRules === undefined || payload.permissionRules === null) {
+    throw new Error(
+      "worker.attempt setup error: permissionRules is required but was absent from the payload",
+    );
+  }
+  const ruleset = enforceAlwaysDeny(payload.permissionRules);
+  return { ruleset, source: "contract" };
+}
 
 /** Where an attempt's worktree lives: `<worktreeBase>/attempts/<attemptId>`. */
 export function resolveWorktreePath(args: { worktreeBase: string; attemptId: string }): string {
