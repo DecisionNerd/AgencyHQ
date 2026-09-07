@@ -99,6 +99,7 @@ export interface ExecutionRuntime {
   createPublicToken(input: { tags: string[]; expiresIn: string }): Promise<string>;
 }
 
+export * from "./fake.ts";
 // Re-export the real runtime and its error type.
 export type { SdkSurface } from "./real.ts";
 export { RealExecutionRuntime, RuntimeError } from "./real.ts";

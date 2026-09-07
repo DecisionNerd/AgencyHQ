@@ -241,7 +241,7 @@ test("runConfigFor: produces correct config shape for worker agent", () => {
     disableMcp: ["jean", "t3-coordinator"],
   });
 
-  assert.equal(config["$schema"], "https://opencode.ai/config.json");
+  assert.equal(config.$schema, "https://opencode.ai/config.json");
   assert.equal(config.share, "disabled");
   assert.equal(config.autoupdate, false);
   assert.deepEqual(config.permission, ruleset);

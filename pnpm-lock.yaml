@@ -41,6 +41,13 @@ importers:
       hono:
         specifier: ^4
         version: 4.13.7
+      pg:
+        specifier: ^8
+        version: 8.23.0
+    devDependencies:
+      '@types/pg':
+        specifier: ^8
+        version: 8.23.1
 
   apps/web:
     dependencies:
@@ -63,9 +70,6 @@ importers:
       '@types/react-dom':
         specifier: ^19
         version: 19.2.7(@types/react@19.2.18)
-      '@vitejs/plugin-react':
-        specifier: ^6
-        version: 6.1.1(vite@7.3.6(@types/node@24.13.3)(jiti@2.7.0))
       vite:
         specifier: ^7
         version: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)
@@ -116,6 +120,15 @@ importers:
 
   trigger:
     dependencies:
+      '@agencyhq/contracts':
+        specifier: workspace:*
+        version: link:../packages/contracts
+      '@agencyhq/domain':
+        specifier: workspace:*
+        version: link:../packages/domain
+      '@agencyhq/verification':
+        specifier: workspace:*
+        version: link:../packages/verification
       '@opencode-ai/sdk':
         specifier: 1.18.29
         version: 1.18.29
@@ -726,9 +739,6 @@ packages:
   '@protobuf-ts/runtime@2.11.1':
     resolution: {integrity: sha512-KuDaT1IfHkugM2pyz+FwiY80ejWrkH1pAtOBOZFuR6SXEFTsnb/jiQWQ1rCIrcKx2BtyxnxW6BWwsVSA/Ie+WQ==}
 
-  '@rolldown/pluginutils@1.0.1':
-    resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
-
   '@rollup/rollup-android-arm-eabi@4.63.1':
     resolution: {integrity: sha512-UZ8sUxPTiHWYX9QNdJedb1kDZSpS1t/VPWBWGSgqHNi9w3Cu6IXvu2mzbhiTiPvtrqgTQJ+zqiAq2iPIPilpaQ==}
     cpu: [arm]
@@ -961,22 +971,6 @@ packages:
 
   '@types/retry@0.12.2':
     resolution: {integrity: sha512-XISRgDJ2Tc5q4TRqvgJtzsRkFYNJzZrhTdtMoGVBttwzzQJkPnS3WWTFc7kuDRoPtPakl+T+OfdEUjYJj7Jbow==}
-
-  '@vitejs/plugin-react@6.1.1':
-    resolution: {integrity: sha512-yxLaQV9gkhS8ezJqCM6+ndU7mDY6gqAg75NQ+0IjwEI8IYOmQCgkRwHKVSfWXW076DsqMo0Dk+0FK1U+M5RgFw==}
-    engines: {node: ^20.19.0 || >=22.12.0}
-    peerDependencies:
-      '@rolldown/plugin-babel': ^0.1.7 || ^0.2.0
-      babel-plugin-react-compiler: ^1.0.0
-      oxc-transform-react: ^0.145.0
-      vite: ^8.0.0
-    peerDependenciesMeta:
-      '@rolldown/plugin-babel':
-        optional: true
-      babel-plugin-react-compiler:
-        optional: true
-      oxc-transform-react:
-        optional: true
 
   accepts@2.0.0:
     resolution: {integrity: sha512-5cvg6CtKwfgdmVqY1WIiXKc3Q1bkRqGLi+2W/6ao+6Y7gu/RCwRuAhGEzh5B4KlszSuTLgZYuqFqo5bImjNKng==}
@@ -2560,8 +2554,6 @@ snapshots:
 
   '@protobuf-ts/runtime@2.11.1': {}
 
-  '@rolldown/pluginutils@1.0.1': {}
-
   '@rollup/rollup-android-arm-eabi@4.63.1':
     optional: true
 
@@ -2769,11 +2761,6 @@ snapshots:
       csstype: 3.2.3
 
   '@types/retry@0.12.2': {}
-
-  '@vitejs/plugin-react@6.1.1(vite@7.3.6(@types/node@24.13.3)(jiti@2.7.0))':
-    dependencies:
-      '@rolldown/pluginutils': 1.0.1
-      vite: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)
 
   accepts@2.0.0:
     dependencies:

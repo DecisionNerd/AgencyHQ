@@ -24,7 +24,7 @@ export async function withTestSchema(
   t: TestContext,
   fn: (ctx: TestDbContext) => Promise<void>,
 ): Promise<void> {
-  const url = process.env["DATABASE_URL"];
+  const url = process.env.DATABASE_URL;
   if (!url) {
     console.warn("[db] DATABASE_URL unset; skipping integration test");
     t.skip("DATABASE_URL is not set");

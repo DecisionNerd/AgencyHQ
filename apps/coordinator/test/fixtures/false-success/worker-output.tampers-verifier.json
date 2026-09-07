@@ -1,0 +1,28 @@
+{
+  "_comment": "Worker changes package.json which is a protected path. detectVerifierTampering should produce a blocking finding.",
+  "attemptId": "__RUNTIME_ATTEMPT_ID__",
+  "sessionId": "session-tamper-001",
+  "outcome": "completed",
+  "worktreePath": "/worktrees/__RUNTIME_ATTEMPT_ID__",
+  "runDir": "/worktrees/__RUNTIME_ATTEMPT_ID__/.run",
+  "commitId": "cafebabe1234567890cafebabe1234567890cafe",
+  "diffDigest": "sha256:e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+  "changedPaths": ["src/parser/parse.ts", "package.json"],
+  "pathViolations": [],
+  "checkpointCommit": null,
+  "survivors": [],
+  "opencode": {
+    "sessionID": "ocsess-tamper-001",
+    "exitCode": 0,
+    "denials": [],
+    "errors": []
+  },
+  "report": {
+    "attempted": "Fixed parser and updated package.json",
+    "outputs": ["src/parser/parse.ts", "package.json"],
+    "checksRun": [{ "command": "pnpm test", "claimedResult": "pass" }],
+    "unmetCriteria": [],
+    "limitations": [],
+    "findings": []
+  }
+}

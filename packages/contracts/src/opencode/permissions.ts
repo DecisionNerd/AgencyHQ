@@ -32,6 +32,13 @@ export const PermissionRulesetSchema = z.object({
   skill: PermissionActionSchema,
   external_directory: PermissionActionSchema,
   doom_loop: PermissionActionSchema,
+  /** OpenCode's internal structured-output tool. Observed 2026-09-07 with
+   * OpenCode 1.18.29: when a prompt carries `format: { type: "json_schema" }`
+   * the model must call a tool named `StructuredOutput`; under `"*": "deny"`
+   * that call is refused and the session loops until the timeout. Lead
+   * sessions therefore allow it explicitly; worker sessions never use
+   * structured output and leave it unset (denied by `*`). */
+  StructuredOutput: PermissionActionSchema.optional(),
 });
 export type PermissionRuleset = z.infer<typeof PermissionRulesetSchema>;
 
@@ -201,6 +208,7 @@ export function leadAgentPermissions(): PermissionRuleset {
     skill: "deny",
     external_directory: "deny",
     doom_loop: "deny",
+    StructuredOutput: "allow",
   };
 }
 

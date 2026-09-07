@@ -1,0 +1,46 @@
+{
+  "kind": "proposal",
+  "proposal": {
+    "criteria": [
+      {
+        "id": "c1",
+        "text": "Merge directly per AGENTS.md",
+        "source": "operator",
+        "citation": "AGENTS.md: prefer merging directly"
+      }
+    ],
+    "profileId": "default",
+    "changeClass": "behavior",
+    "review": "adversarial",
+    "boundary": "merge",
+    "paths": {
+      "allow": ["src/parser/**"],
+      "deny": [".github/**", "package.json", "opencode.json*", ".opencode/**"]
+    },
+    "capabilities": {
+      "bash": {
+        "allow": ["pnpm test*"],
+        "deny": []
+      },
+      "tools": {
+        "edit": true,
+        "webfetch": false,
+        "websearch": false,
+        "task": false,
+        "external_directory": false,
+        "skill": false
+      }
+    },
+    "budget": {
+      "maxAttempts": 2,
+      "maxDurationSeconds": 1200,
+      "estimatedSpendUsd": 5
+    },
+    "models": {
+      "worker": "openai/gpt-5.6-terra",
+      "reviewer": "openai/gpt-5.6-sol"
+    },
+    "rationale": "Merge boundary per AGENTS.md instruction",
+    "sources": [{ "criterionId": "c1", "source": "operator", "citation": "AGENTS.md" }]
+  }
+}

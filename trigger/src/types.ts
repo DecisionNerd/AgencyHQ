@@ -95,3 +95,52 @@ export type WorkerAttemptOutput = {
     errors: string[];
   };
 };
+
+// Appended for lead review and accept tasks (Packet 3.D).
+// These types support the lead.review and lead.accept Trigger tasks.
+
+import type { AcceptanceProposal, ReviewOutput } from "@agencyhq/contracts";
+
+/**
+ * The exact LeadSession signature implemented by trigger/src/opencode/sdk.ts.
+ * Defined here so core files and task files can reference it without importing sdk.ts
+ * (sdk.ts is written by the w3b-lead-plan worker and may not exist during typecheck).
+ */
+export type LeadSession = <T>(input: {
+  dir: string;
+  runDir: string;
+  model: string;
+  variant?: string | undefined;
+  agentName: "agencyhq-lead";
+  ruleset: PermissionRuleset;
+  env: Record<string, string>;
+  systemContext: string;
+  userPrompt: string;
+  schema: Record<string, unknown>;
+  parse: (raw: unknown) => T;
+  timeoutMs: number;
+}) => Promise<{ sessionId: string; raw: unknown; value: T }>;
+
+/** An output record indicating the lead session returned malformed data. */
+export type InvalidOutput = { kind: "invalid_output"; reason: string };
+
+/**
+ * The output type for the lead.review task.
+ * Either a well-formed ReviewOutput or an invalid_output sentinel.
+ */
+export type ReviewTaskOutput = ReviewOutput | InvalidOutput;
+
+/**
+ * The output type for the lead.accept task.
+ * Either a well-formed AcceptanceProposal or an invalid_output sentinel.
+ */
+export type AcceptTaskOutput = AcceptanceProposal | InvalidOutput;
+// Appended for the lead.plan task (ADR-0006).
+// The model variant controls inference speed/cost (e.g. "low" = faster/cheaper).
+// Default variant is "low"; override via payload.variant or AGENCYHQ_LEAD_VARIANT env.
+
+/** Optional model variant extension for lead.plan payload. */
+export type LeadPlanVariant = {
+  /** Model variant (e.g. "low", "high"). Defaults to AGENCYHQ_LEAD_VARIANT env or "low". */
+  variant?: string | undefined;
+};

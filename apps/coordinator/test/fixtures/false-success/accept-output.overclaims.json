@@ -1,0 +1,18 @@
+{
+  "_comment": "Lead.accept proposal overclaims: cites a nonexistent verification result ref, and omits criterion c1 entirely. Should yield CITED_RESULT_MISSING and CRITERION_UNCITED.",
+  "accept": true,
+  "criteria": [
+    {
+      "criterionId": "c-nonexistent",
+      "satisfied": true,
+      "evidence": [
+        {
+          "kind": "verification_result",
+          "ref": "agencyhq-verifier:pnpm-test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  ],
+  "findingDispositions": [],
+  "rationale": "Overclaiming: cites nonexistent ref and omits real criterion"
+}

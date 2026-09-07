@@ -73,3 +73,15 @@ See [ADR-0005](docs/engineering/adrs/0005-trigger-as-execution-runtime.md),
 [ADR-0006](docs/engineering/adrs/0006-lead-role-and-delegated-authority.md), and
 [ADR-0007](docs/engineering/adrs/0007-worker-effect-model.md) for the 2026-09-07
 revision.
+
+## Development
+
+Requires Node.js 24+ and pnpm 11+.
+
+```sh
+pnpm install
+pnpm check
+pnpm test
+pnpm db:up && DATABASE_URL=postgres://agencyhq:agencyhq@localhost:5432/agencyhq_test pnpm test:integration
+pnpm trigger:dev
+```

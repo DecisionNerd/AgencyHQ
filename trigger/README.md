@@ -214,3 +214,177 @@ Candidates with an unreachable commit are skipped (kept for inspection).
 Returns `{ removed, skipped }`.  The `deps` parameter accepts injectable
 `worktreeRemove` and `refExists` implementations so the function is
 unit-testable without a real git repository.
+
+## `verify.run` task (`src/tasks/verify-run.ts`)
+
+Implements ADR-0007 item 5: verification runs as its own Trigger task in a separate worktree at the attempt revision, with the approved checks.
+
+- Task id: `verify.run`, `maxDuration: 1200`, single-concurrency `verify` queue, `retry: { maxAttempts: 1 }`.
+- Validates the payload with `VerifyRunPayloadSchema` and throws `AbortTaskRunError` on contract failure (no retry).
+- Publishes phases `worktree_ready` → `integrity_checked` → `checks_running` → `done` to run metadata.
+- Wires real git deps (`worktreeAdd`, `worktreeRemove`, `diffDigest`, `changedPaths`), prefixing the raw hex from `git.ts diffDigest` with `sha256:` to satisfy `DigestStringSchema`.
+- Loads `@agencyhq/verification` via a dynamic import guarded by a local structural type (`VerificationPackage`) so typecheck passes before that package is published. When the package is absent, a stub runner returns `result: "error"` with `stderrTail: "verification_package_unavailable"` for every check.
+- Registers a signal abort listener that calls the runner's optional `abort()` so in-flight checks are killed when the task is cancelled or reaches `maxDuration`.
+
+### `verify-run-core.ts` — pure/injectable logic
+
+`src/tasks/verify-run-core.ts` factors out every piece that does not need the Trigger SDK:
+
+- `VerificationRunner` interface: `runProfile(input) => Promise<VerificationResult[]>` plus optional `abort()`.
+- `VerifyRunDeps`: injected git ops, runner, optional fingerprint, and `now()`.
+- `resolveVerifyWorktreePath`: `<worktreeBase>/verify/<attemptId>-<generation>`.
+- `runVerification(payload, deps)`: creates the verify worktree at `attemptRevision`; reproduces `diffDigest` against `baseRevision` before any check runs; on mismatch returns one `result: "error"` per check with `stderrTail: "integrity_mismatch: expected <a> got <b>"` and does NOT call the runner; on match runs `detectVerifierTampering` on the changed paths (reporting `tamperedPaths` in output but not changing results), then calls `runner.runProfile`; always removes the verify worktree in `finally`; re-stamps `profileDigest`/`criteriaDigest` from the payload on every result (frozen digests, never recomputed from the worktree); parses every result with `VerificationResultSchema`.
+
+Evidence integrity invariants enforced (TESTING.md §67-73): the worktree is at `attemptRevision`; the digests are frozen before the worker runs and copied from the payload unchanged; the worker's report of checks run is context, not evidence (the file never references `report` or `checksRun`); the verify worktree is disposed after the run.
+
+Tests are in `test/verify-run-core.test.ts` (10 tests covering the happy path, integrity mismatch, tamper detection, worktree cleanup on failure, schema validation, source-grep assertions, and the generation-in-path invariant).
+## `lead.review` and `lead.accept` tasks (Packet 3.D)
+
+### Overview
+
+Two Trigger tasks implement the adversarial review and acceptance proposal steps
+described in ADR-0006 (Lead role and delegated authority). Both tasks produce
+proposals for the coordinator; neither task decides or evaluates criteria itself.
+
+### `lead.review` (id: `lead.review`, maxDuration: 600s, queue: lead)
+
+Runs an adversarial Lead session seeded with the diff, approved criteria, and
+verification results — never the worker's session or conversation (ADR-0006
+independence invariant). The reviewer is asked: _what would make the claim
+false?_
+
+Inputs (`LeadReviewPayload`): attemptId, generation, contractId, criteria with
+digests, verification results from `verify.run`, model, repoPath, worktreeBase,
+and baseRevision. The payload schema deliberately omits any worker session id or
+transcript field; the runtime asserts this at every invocation.
+
+The task:
+1. Validates the payload with `LeadReviewPayloadSchema`.
+2. Creates a read-only git worktree at the attempt revision
+   (`<worktreeBase>/review/<attemptId>-<generation>`).
+3. Runs `git diff <base> <attempt>` and writes the patch to
+   `<runDir>/attempt.patch` (outside the worktree).
+4. Builds an adversarial system + user prompt via `buildReviewPrompt`.
+5. Calls the Lead session with `leadAgentPermissions()` and
+   `LEAD_OUTPUT_JSON_SCHEMAS.reviewOutput`.
+6. Post-validates that the reviewer's `subject` exactly matches the payload
+   digests and revision (a mismatch → `{ kind: "invalid_output" }`).
+7. Removes the review worktree in a `finally` block.
+
+Output: `ReviewOutput & { reviewerModel: string }` on success, or
+`{ kind: "invalid_output"; reason: string; reviewerModel: string }` on failure.
+
+### `lead.accept` (id: `lead.accept`, maxDuration: 300s, queue: lead)
+
+Runs a Lead session to produce an acceptance proposal after all verification
+results and a review are available. No worktree is created.
+
+The acceptance proposer cites each criterion against evidence refs
+(`verificationResultRef` strings from the payload's `verificationResults`). The
+`accept` field may be true only when every criterion is satisfied and no
+blocking finding is present. Non-blocking findings receive an explicit
+disposition.
+
+Inputs (`LeadAcceptPayload`): attemptId, generation, contractId, criteria,
+verification results, the review output, and model. After the session, the task
+post-validates that every cited `verification_result` ref exists in
+`payload.verificationResults` (unknown refs → `{ kind: "invalid_output" }`).
+
+Output: `AcceptanceProposal` on success, or `{ kind: "invalid_output"; reason }` on failure.
+
+### Source layout
+
+| File | Purpose |
+|---|---|
+| `src/opencode/review-prompt.ts` | `buildReviewPrompt(payload, patch)` — deterministic adversarial prompt builder |
+| `src/opencode/accept-prompt.ts` | `buildAcceptPrompt(payload)` — deterministic acceptance proposer prompt builder |
+| `src/tasks/lead-review-core.ts` | `runReview(payload, deps)` — pure/injectable review logic |
+| `src/tasks/lead-accept-core.ts` | `runAccept(payload, deps)` — pure/injectable accept logic |
+| `src/tasks/lead-review.ts` | Trigger task wiring for `lead.review` |
+| `src/tasks/lead-accept.ts` | Trigger task wiring for `lead.accept` |
+| `test/review-prompt.test.ts` | Prompt builder determinism and invariant tests |
+| `test/lead-review-core.test.ts` | Review core unit tests with fake session |
+| `test/lead-accept-core.test.ts` | Accept core unit tests with fake session |
+
+### `LeadSession` type
+
+The `LeadSession` generic function type in `src/types.ts` is the interface
+implemented by `src/opencode/sdk.ts` (written by the w3b-lead-plan worker). Task
+files import it dynamically via a computed URL so typecheck passes before the
+implementation exists.
+
+### Environment variables
+
+| Name | Default | Purpose |
+|---|---|---|
+| `AGENCYHQ_LEAD_VARIANT` | `"low"` | Passed as the `variant` hint to the Lead session |
+| `AGENCYHQ_WORKTREE_BASE` | (required in production) | Base path for worktrees and run dirs |
+## Lead plan task (`src/tasks/lead-plan.ts`)
+
+Implements the `lead.plan` Trigger task (ADR-0006, R-005, R-020). The Lead is
+a read-only planning role: it inspects the repository at `baseRevision` and
+produces a structured PROPOSAL. The coordinator validates each proposal
+deterministically against delegated authority before recording a Decision. The
+Lead never calls the authority subset check and never writes a Decision.
+
+### What the task does
+
+1. Validates the payload with `LeadPlanPayloadSchema` (→ `AbortTaskRunError`
+   on failure — not retried).
+2. Creates a git worktree at `baseRevision` (`worktreeBase/lead/<id>-<runId>`).
+3. Reads `AGENTS.md`, README head, and `git ls-files` (≤ 500 entries) from
+   the worktree.
+4. Builds a system context and user prompt via `buildLeadPlanPrompt` in
+   `src/opencode/lead-prompt.ts`.
+5. Calls `leadPrompt` (`src/opencode/sdk.ts`) which spawns `opencode serve`
+   and sends ONE prompt with `format: { type: "json_schema" }`.
+6. Parses the response with `LeadPlanOutputSchema`.
+7. On parse failure → returns `{ kind: "invalid_output", reason }` (retriable).
+8. Removes the Lead worktree in `finally` (read-only, disposable; run dir kept).
+
+### OpenCode SDK integration (`src/opencode/`)
+
+- `sdk.ts` — `leadPrompt<T>()`: spawns `opencode serve --port 0` with
+  `OPENCODE_CONFIG`, `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_PURE=1`,
+  `OPENCODE_PERMISSION` env vars; connects the v2 SDK client; creates a
+  session; sends a single prompt; extracts `AssistantMessage.structured`.
+  The SDK's `createOpencodeServer` cannot pass custom env vars (it only exposes
+  `hostname`, `port`, `signal`, `timeout`, `config` in `ServerOptions`), so
+  the server is spawned with `child_process.spawn` and the client connects to
+  the reported URL.
+- `structured.ts` — `extractStructured()`: isolates the `structured` field
+  name (SDK drift risk). `parseWithSchema()`: uniform Zod-compatible parse
+  result shape.
+- `lead-prompt.ts` — `buildLeadPlanPrompt()`: deterministic prompt builder
+  that labels operator intent as TRUSTED and repository text as UNTRUSTED.
+
+### Probe script
+
+`scripts/lead-probe.ts` runs the core against a real OpenCode server (once;
+model `openai/gpt-5.6-sol`, variant `low`). Run with:
+
+```
+node --env-file=.env scripts/lead-probe.ts
+```
+
+## Running
+
+### Task development (local)
+
+```sh
+pnpm --filter @agencyhq/trigger dev
+```
+
+This starts `trigger dev` connected to the Trigger.dev cloud (requires `.env` with `TRIGGER_API_URL` and `TRIGGER_SECRET_KEY`).
+
+### Unit tests
+
+```sh
+pnpm --filter @agencyhq/trigger test
+```
+
+### Tasks connected to the coordinator
+
+Each task is imported by the coordinator and wired through static imports. The `verify.run` task uses `@agencyhq/verification` directly. The `lead.plan`, `lead.review`, and `lead.accept` tasks use `leadPrompt` from `trigger/src/opencode/sdk.ts`.
+
+To run the full integration loop locally, start the coordinator with `RUNTIME=fake` and use the seed script to create a project and work item.

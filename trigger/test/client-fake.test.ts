@@ -219,7 +219,7 @@ test("setMetadata survivors observable after final status", async () => {
   fake.setMetadata(runId, { survivors: [1234, 5678] });
 
   const obs = await fake.retrieve(runId);
-  assert.deepEqual(obs.metadata?.["survivors"], [1234, 5678]);
+  assert.deepEqual(obs.metadata?.survivors, [1234, 5678]);
 });
 
 // ---------------------------------------------------------------------------

@@ -218,11 +218,11 @@ test("full skipped-reasons table: each reason appears correctly", () => {
   });
 
   const reasons = Object.fromEntries(result.skipped.map((s) => [s.workItemId, s.reason]));
-  assert.equal(reasons["proposed"], "not_admitted");
-  assert.equal(reasons["blocked"], "blocked");
-  assert.equal(reasons["uncertain"], "uncertain");
+  assert.equal(reasons.proposed, "not_admitted");
+  assert.equal(reasons.blocked, "blocked");
+  assert.equal(reasons.uncertain, "uncertain");
   assert.equal(reasons["active-dupe"], "repository_busy");
-  assert.equal(reasons["already"], "already_active");
+  assert.equal(reasons.already, "already_active");
   assert.equal(reasons["repo-unc"], "repository_uncertain");
   assert.equal(reasons["no-slot"], "no_slot");
 

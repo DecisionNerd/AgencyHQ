@@ -108,11 +108,10 @@ export class RealExecutionRuntime implements ExecutionRuntime {
         idempotencyKey,
         idempotencyKeyTTL: options.idempotencyKeyTtl ?? "24h",
       };
-      if (options.concurrencyKey !== undefined)
-        triggerOpts["concurrencyKey"] = options.concurrencyKey;
-      if (options.tags !== undefined) triggerOpts["tags"] = options.tags;
+      if (options.concurrencyKey !== undefined) triggerOpts.concurrencyKey = options.concurrencyKey;
+      if (options.tags !== undefined) triggerOpts.tags = options.tags;
       if (options.maxDurationSeconds !== undefined)
-        triggerOpts["maxDuration"] = options.maxDurationSeconds;
+        triggerOpts.maxDuration = options.maxDurationSeconds;
 
       const handle = await this._sdk.tasks.trigger(taskId, payload as never, triggerOpts as never);
 

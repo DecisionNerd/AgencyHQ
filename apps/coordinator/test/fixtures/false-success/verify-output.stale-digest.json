@@ -1,0 +1,25 @@
+{
+  "_comment": "verify.run claims pass but profileDigest is from a previous profile version. Should yield RESULT_VERSION_MISMATCH.",
+  "results": [
+    {
+      "verifier": { "name": "agencyhq-verifier", "version": "1.0.0" },
+      "stepContractId": "__RUNTIME_CONTRACT_ID__",
+      "attemptId": "__RUNTIME_ATTEMPT_ID__",
+      "criteriaDigest": "__RUNTIME_CRITERIA_DIGEST__",
+      "profileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+      "repository": "/repo",
+      "baseRevision": "0000000000000000000000000000000000000000",
+      "attemptRevision": "deadbeef1234567890deadbeef1234567890dead",
+      "diffDigest": "__RUNTIME_DIFF_DIGEST__",
+      "checkId": "pnpm-test",
+      "environmentFingerprint": { "node": "20.0.0" },
+      "startedAt": "2026-09-07T10:00:00.000Z",
+      "endedAt": "2026-09-07T10:00:10.000Z",
+      "exitStatus": 0,
+      "stdoutTail": "All tests passed",
+      "stderrTail": "",
+      "artifactDigests": [],
+      "result": "pass"
+    }
+  ]
+}

@@ -3,6 +3,14 @@ name: check
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   check:
@@ -23,10 +31,11 @@ jobs:
       - run: pnpm check
       - run: pnpm lint
       - run: pnpm typecheck
-      - run: pnpm build
+      - run: pnpm -r --if-present build
       - run: pnpm test:unit
 
   integration:
+    # Trials are not run in CI; only deterministic integration tests run here.
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -35,15 +44,15 @@ jobs:
           POSTGRES_USER: agencyhq
           POSTGRES_PASSWORD: agencyhq
           POSTGRES_DB: agencyhq_test
+        ports:
+          - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U agencyhq"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-        ports:
-          - 5434:5432
     env:
-      DATABASE_URL: postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test
+      DATABASE_URL: postgres://agencyhq:agencyhq@localhost:5432/agencyhq_test
     steps:
       - uses: actions/checkout@v4
 

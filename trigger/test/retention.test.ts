@@ -68,7 +68,7 @@ function makeInput(attempts: ReturnType<typeof makeAttempt>[]): RetentionInput {
 test("removes completed attempt with reachable commit and old finalAt", () => {
   const result = retentionCandidates(makeInput([makeAttempt()]));
   assert.equal(result.remove.length, 1);
-  assert.equal(result.remove[0]!.attemptId, "attempt-1");
+  assert.equal(result.remove[0]?.attemptId, "attempt-1");
   assert.equal(result.keep.length, 0);
 });
 
@@ -76,19 +76,19 @@ test("keeps attempt with non-removable status (executing)", () => {
   const result = retentionCandidates(makeInput([makeAttempt({ status: "executing" })]));
   assert.equal(result.remove.length, 0);
   assert.equal(result.keep.length, 1);
-  assert.ok(result.keep[0]!.reason.includes("executing"));
+  assert.ok(result.keep[0]?.reason.includes("executing"));
 });
 
 test("keeps attempt with status 'uncertain'", () => {
   const result = retentionCandidates(makeInput([makeAttempt({ status: "uncertain" })]));
   assert.equal(result.remove.length, 0);
-  assert.equal(result.keep[0]!.reason.includes("uncertain"), true);
+  assert.equal(result.keep[0]?.reason.includes("uncertain"), true);
 });
 
 test("keeps attempt with status 'stopping'", () => {
   const result = retentionCandidates(makeInput([makeAttempt({ status: "stopping" })]));
   assert.equal(result.remove.length, 0);
-  assert.equal(result.keep[0]!.reason.includes("stopping"), true);
+  assert.equal(result.keep[0]?.reason.includes("stopping"), true);
 });
 
 test("keeps attempt in protectedAttemptIds even if otherwise removable", () => {
@@ -98,13 +98,13 @@ test("keeps attempt in protectedAttemptIds even if otherwise removable", () => {
   };
   const result = retentionCandidates(input);
   assert.equal(result.remove.length, 0);
-  assert.equal(result.keep[0]!.reason, "protected");
+  assert.equal(result.keep[0]?.reason, "protected");
 });
 
 test("keeps attempt whose finalAt is null", () => {
   const result = retentionCandidates(makeInput([makeAttempt({ finalAt: null })]));
   assert.equal(result.remove.length, 0);
-  assert.equal(result.keep[0]!.reason, "finalAt is null");
+  assert.equal(result.keep[0]?.reason, "finalAt is null");
 });
 
 test("keeps attempt whose finalAt is within keepFinalForMs", () => {
@@ -113,7 +113,7 @@ test("keeps attempt whose finalAt is within keepFinalForMs", () => {
     makeInput([makeAttempt({ finalAt: "2026-01-01T11:59:30.000Z" })]),
   );
   assert.equal(result.remove.length, 0);
-  assert.ok(result.keep[0]!.reason.includes("too recent"));
+  assert.ok(result.keep[0]?.reason.includes("too recent"));
 });
 
 test("removes attempt exactly at keepFinalForMs boundary (60s ago)", () => {
@@ -129,7 +129,7 @@ test("keeps attempt with no commit (attemptCommit and checkpointCommit both null
     makeInput([makeAttempt({ attemptCommit: null, checkpointCommit: null })]),
   );
   assert.equal(result.remove.length, 0);
-  assert.equal(result.keep[0]!.reason, "no commit retained in repository");
+  assert.equal(result.keep[0]?.reason, "no commit retained in repository");
 });
 
 test("removes attempt using checkpointCommit when attemptCommit is null", () => {
@@ -137,7 +137,7 @@ test("removes attempt using checkpointCommit when attemptCommit is null", () => 
     makeInput([makeAttempt({ attemptCommit: null, checkpointCommit: "chk5678" })]),
   );
   assert.equal(result.remove.length, 1);
-  assert.equal(result.remove[0]!.commit, "chk5678");
+  assert.equal(result.remove[0]?.commit, "chk5678");
 });
 
 test("removes 'quarantined' status attempt", () => {
@@ -169,7 +169,7 @@ test("handles mixed batch: one remove, two keep", () => {
     ]),
   );
   assert.equal(result.remove.length, 1);
-  assert.equal(result.remove[0]!.attemptId, "a1");
+  assert.equal(result.remove[0]?.attemptId, "a1");
   assert.equal(result.keep.length, 2);
   const keepIds = result.keep.map((k) => k.attemptId);
   assert.ok(keepIds.includes("a2"));
@@ -230,11 +230,11 @@ test("removeRetained: removes committed worktree, skips uncommitted one", async 
     const { removed, skipped } = await removeRetained(repoPath, [c1, c2]);
 
     assert.equal(removed.length, 1, "one worktree should be removed");
-    assert.equal(removed[0]!.attemptId, "a1");
+    assert.equal(removed[0]?.attemptId, "a1");
 
     assert.equal(skipped.length, 1, "one worktree should be skipped");
-    assert.equal(skipped[0]!.attemptId, "a2");
-    assert.ok(skipped[0]!.reason.includes("not reachable"));
+    assert.equal(skipped[0]?.attemptId, "a2");
+    assert.ok(skipped[0]?.reason.includes("not reachable"));
   } finally {
     // Clean up wt2 (wt1 was removed by removeRetained)
     await git(["worktree", "remove", "--force", wt2], repoPath).catch(() => undefined);
@@ -265,5 +265,5 @@ test("removeRetained: skips when worktreeRemove throws", async () => {
   const { removed, skipped } = await removeRetained("/fake/repo", candidates, fakeDeps);
   assert.equal(removed.length, 0);
   assert.equal(skipped.length, 1);
-  assert.ok(skipped[0]!.reason.includes("worktree remove failed"));
+  assert.ok(skipped[0]?.reason.includes("worktree remove failed"));
 });

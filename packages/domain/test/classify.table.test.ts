@@ -594,10 +594,10 @@ test("classifyObservation never throws for any status × outcome × stopRequeste
               `should not throw for status=${status} outcome=${String(outcomeVal)} stopRequested=${String(stopRequested)} budget=${budgetRemaining} stale=${String(stale)}`,
             );
             assert.ok(result !== undefined, "result should be defined");
-            assert.equal(result!.stale, stale, "stale flag must match");
+            assert.equal(result?.stale, stale, "stale flag must match");
             if (stale) {
-              assert.equal(result!.class, "none", "stale must be class none");
-              assert.equal(result!.attemptStatus, "uncertain");
+              assert.equal(result?.class, "none", "stale must be class none");
+              assert.equal(result?.attemptStatus, "uncertain");
             }
             count++;
           }

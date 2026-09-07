@@ -105,7 +105,7 @@ test("constructor calls configure with baseURL and secretKey", () => {
   const { sdk } = makeRuntime();
   const configureCall = sdk.calls.find((c) => c.method === "configure");
   assert.ok(configureCall, "configure should be called");
-  const opts = configureCall!.args[0] as { baseURL: string; secretKey: string };
+  const opts = configureCall?.args[0] as { baseURL: string; secretKey: string };
   assert.equal(opts.baseURL, "https://api.trigger.dev");
   assert.equal(opts.secretKey, "tr_test_secret");
 });
@@ -125,8 +125,8 @@ test("trigger() creates idempotency key with global scope", async () => {
 
   const createCall = sdk.calls.find((c) => c.method === "idempotencyKeys.create");
   assert.ok(createCall, "idempotencyKeys.create should be called");
-  assert.equal(createCall!.args[0], "idem-key-1");
-  const opts = createCall!.args[1] as { scope: string };
+  assert.equal(createCall?.args[0], "idem-key-1");
+  const opts = createCall?.args[1] as { scope: string };
   assert.equal(opts.scope, "global");
 });
 
@@ -141,7 +141,7 @@ test("trigger() passes idempotencyKeyTTL default '24h'", async () => {
 
   const triggerCall = sdk.calls.find((c) => c.method === "tasks.trigger");
   assert.ok(triggerCall);
-  const opts = triggerCall!.args[2] as { idempotencyKeyTTL: string };
+  const opts = triggerCall?.args[2] as { idempotencyKeyTTL: string };
   assert.equal(opts.idempotencyKeyTTL, "24h");
 });
 
@@ -155,7 +155,7 @@ test("trigger() uses caller-specified idempotencyKeyTtl when given", async () =>
   });
 
   const triggerCall = sdk.calls.find((c) => c.method === "tasks.trigger");
-  const opts = triggerCall!.args[2] as { idempotencyKeyTTL: string };
+  const opts = triggerCall?.args[2] as { idempotencyKeyTTL: string };
   assert.equal(opts.idempotencyKeyTTL, "48h");
 });
 
@@ -173,7 +173,7 @@ test("trigger() passes concurrencyKey and tags", async () => {
   });
 
   const triggerCall = sdk.calls.find((c) => c.method === "tasks.trigger");
-  const opts = triggerCall!.args[2] as { concurrencyKey: string; tags: string[] };
+  const opts = triggerCall?.args[2] as { concurrencyKey: string; tags: string[] };
   assert.equal(opts.concurrencyKey, "repo:abc");
   assert.deepEqual(opts.tags, ["attempt:x", "repo:abc"]);
 });
@@ -188,7 +188,7 @@ test("trigger() passes maxDurationSeconds as maxDuration", async () => {
   });
 
   const triggerCall = sdk.calls.find((c) => c.method === "tasks.trigger");
-  const opts = triggerCall!.args[2] as { maxDuration: number };
+  const opts = triggerCall?.args[2] as { maxDuration: number };
   assert.equal(opts.maxDuration, 300);
 });
 
@@ -309,7 +309,7 @@ test("cancel() calls runs.cancel with runId", async () => {
   await rt.cancel("run_to_cancel");
   const cancelCall = sdk.calls.find((c) => c.method === "runs.cancel");
   assert.ok(cancelCall);
-  assert.equal(cancelCall!.args[0], "run_to_cancel");
+  assert.equal(cancelCall?.args[0], "run_to_cancel");
 });
 
 test("cancel() wraps SDK error into RuntimeError", async () => {
@@ -334,7 +334,7 @@ test("createPublicToken() passes tags as scopes.read.tags", async () => {
 
   const call = sdk.calls.find((c) => c.method === "auth.createPublicToken");
   assert.ok(call);
-  const opts = call!.args[0] as {
+  const opts = call?.args[0] as {
     scopes: { read: { tags: string[] } };
     expirationTime: string;
   };
@@ -346,15 +346,15 @@ test("createPublicToken() passes tags as scopes.read.tags", async () => {
 // Live test (skipped unless TRIGGER_LIVE=1)
 // ---------------------------------------------------------------------------
 
-test("live trigger roundtrip", { skip: !process.env["TRIGGER_LIVE"] }, async () => {
+test("live trigger roundtrip", { skip: !process.env.TRIGGER_LIVE }, async () => {
   // This test requires TRIGGER_LIVE=1 plus TRIGGER_API_URL and
   // TRIGGER_SECRET_KEY set in the environment.  It triggers the
   // `spike.echo` task (registered in trigger/src/tasks/) and waits for
   // a non-QUEUED status.  Do not run it in CI.
   const { RealExecutionRuntime: RT } = await import("../src/client/real.ts");
 
-  const apiUrl = process.env["TRIGGER_API_URL"] ?? "https://api.trigger.dev";
-  const secretKey = process.env["TRIGGER_SECRET_KEY"] ?? "";
+  const apiUrl = process.env.TRIGGER_API_URL ?? "https://api.trigger.dev";
+  const secretKey = process.env.TRIGGER_SECRET_KEY ?? "";
   if (!secretKey) throw new Error("TRIGGER_SECRET_KEY must be set for live test");
 
   const rt = new RT({ apiUrl, secretKey });

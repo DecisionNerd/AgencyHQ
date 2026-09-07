@@ -1,0 +1,46 @@
+{
+  "kind": "proposal",
+  "proposal": {
+    "criteria": [
+      {
+        "id": "c1",
+        "text": "Parser fix",
+        "source": "operator",
+        "citation": "Issue #10"
+      }
+    ],
+    "profileId": "default",
+    "changeClass": "behavior",
+    "review": "adversarial",
+    "boundary": "artifact",
+    "paths": {
+      "allow": ["src/parser/**"],
+      "deny": [".github/**", "package.json", "opencode.json*", ".opencode/**"]
+    },
+    "capabilities": {
+      "bash": {
+        "allow": ["pnpm test*"],
+        "deny": []
+      },
+      "tools": {
+        "edit": true,
+        "webfetch": false,
+        "websearch": false,
+        "task": false,
+        "external_directory": false,
+        "skill": false
+      }
+    },
+    "budget": {
+      "maxAttempts": 2,
+      "maxDurationSeconds": 1200,
+      "estimatedSpendUsd": 5
+    },
+    "models": {
+      "worker": "openai/gpt-5.6-terra",
+      "reviewer": "openai/gpt-5.6-terra"
+    },
+    "rationale": "Using same model for reviewer to save cost",
+    "sources": [{ "criterionId": "c1", "source": "operator", "citation": "Issue #10" }]
+  }
+}

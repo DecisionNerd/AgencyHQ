@@ -143,7 +143,8 @@ export async function diffDigest(args: { worktreePath: string; baseRev: string }
     hash.update(`\0untracked:${path}\0`);
     hash.update(content);
   }
-  return hash.digest("hex");
+  // Canonical wire format shared with @agencyhq/contracts DigestStringSchema.
+  return `sha256:${hash.digest("hex")}`;
 }
 
 export async function revertPaths(args: {
