@@ -28,13 +28,15 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    `agencyhq/attempts/<attempt-id>` locally, and returns the report as run
    output. (Container profile: fresh clone, then push with a generation-bound
    token.)
-5. **Observe.** The coordinator subscribes to runs by tag. On a final status it
-   retrieves the run, stores the report, and classifies the outcome (below).
+5. **Observe.** The coordinator polls open DispatchIntents and retrieves each
+   run by id; tags are used by the operator view's realtime subscription. On a
+   final status it stores the report and classifies the outcome (below).
    A worker output with a null commit id (nothing changed) is classified as a
-   failure; no Artifact is created. A completed run with a valid commit id has
-   its Artifact stored. Duplicate deliveries are no-ops keyed by run id and
-   attempt generation; a delivery for a revoked generation is stored as
-   history-only (stale) and does not advance state.
+   failure; no Artifact is created (untested: no test covers this path yet).
+   A completed run with a valid commit id has its Artifact stored. Duplicate
+   deliveries are no-ops keyed by run id and attempt generation; a delivery
+   for a revoked generation is stored as history-only (stale) and does not
+   advance state.
 6. **Verify.** `verify.run` is dispatched against the attempt revision with the
    approved profile; results are stored as VerificationResults.
 7. **Review.** `lead.review` is dispatched with the diff, criteria, and results;
@@ -43,8 +45,9 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    proposal names every criterion, cites passing results, and has no blocking
    Review finding, then records the acceptance Decision. If the authority
    schema requires it (`humanRequired` is true), the work item is parked as
-   `pending_human` until a matching Approval exists. No Approval write path
-   (command or API) exists yet; this is Slice 4 scope.
+   `pending_human` until a matching Approval exists (untested: no test covers
+   this parking path yet). No Approval write path (command or API) exists yet;
+   this is Slice 4 scope.
 9. **Integrate** (merge or deploy boundaries only). `integrate.merge` runs with
    an operation-scoped credential, serialized per repository, idempotent by
    attempt and target revision.
@@ -84,22 +87,28 @@ Because workers cannot cause external effects (ADR-0007), replacement is short:
    grace period: it commits the worktree to `agencyhq/checkpoints/<attempt-id>`,
    sends SIGTERM then SIGKILL to the OpenCode process group, and records
    whether any process survived. `runs.cancel` also cancels child runs.
-3. **Confirm.** The reconciler calls `confirmStop` with the run's final
-   metadata (`checkpointCommit`, `survivors`) as evidence and records the
-   checkpoint commit on the attempt row. Subscribe until the run status is
-   final and the adapter's last metadata reports no survivors. On the host
-   profile, the Trigger API reports a final status before adapter cleanup
-   completes (observed 22–38 ms after `runs.cancel` in the Slice 1 trial);
-   the adapter's on-disk stop record (`<runDir>/stop.ndjson`) is the
-   confirmation source because run metadata is frozen once the run is final.
+3. **Confirm.** The reconciler always routes CANCELED/TIMED_OUT worker
+   observations to stop confirmation; no such observation is skipped. If the
+   attempt is `dispatched` or `running` at that point (externally cancelled or
+   hard-timed-out by Trigger), the coordinator first calls `stopAttempt` with
+   actor `"coordinator"` to transition it to `stopping`, then calls
+   `confirmStop`. Evidence is read in priority order: (1) run metadata
+   (`survivors`, `checkpointCommit`) from the observation, (2) the run
+   directory's `stop.ndjson` file when metadata has no survivors field, (3)
+   pending — no evidence yet. The checkpoint commit is recorded on the attempt
+   row. On the host profile, the Trigger API reports a final status before
+   adapter cleanup completes (observed 22–38 ms after `runs.cancel` in the
+   Slice 1 trial); `stop.ndjson` is the fallback evidence source for that gap.
    The adapter also applies a soft deadline (`maxDuration` minus 15 s,
    minimum 5 s) to stop the worker before the CLI delivers SIGTERM on
    `maxDuration`, returning outcome `timed_out` with the run COMPLETED; the
    hard `maxDuration` remains the backstop. See the
    [Slice 1 execution trial](../engineering/trials/2026-09-slice1.md). The UI
    shows *stopping* until confirmation and *stopped* after. If the adapter could
-   not confirm (for example the host itself is unreachable), the state is
-   *uncertain* and no replacement runs on that repository. The cancelled
+   not confirm, the pending state remains open until `AGENCYHQ_UNCERTAIN_AFTER_MS`
+   (default 120 000 ms) from the first final observation, at which point the
+   attempt becomes `uncertain` and the work item condition `uncertain`; no
+   replacement runs on that repository while uncertain. The cancelled
    observation is recorded as history-only (stale) so it does not advance state
    on a later delivery. Stop command replay returns `replayed: true`.
 4. **Operator-stop: no replacement.** On an operator-initiated stop the
