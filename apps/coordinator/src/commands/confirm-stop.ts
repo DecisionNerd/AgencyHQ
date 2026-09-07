@@ -131,6 +131,8 @@ export async function confirmStop(
 
   if (stopEvidence?.checkpointCommit != null) {
     checkpointCommit = stopEvidence.checkpointCommit;
+  } else if (typeof observation.metadata?.checkpointCommit === "string") {
+    checkpointCommit = observation.metadata.checkpointCommit;
   }
 
   const isFinal = FINAL_RUN_STATUSES.has(observation.status);

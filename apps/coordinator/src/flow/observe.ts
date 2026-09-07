@@ -14,7 +14,7 @@
 
 import type { LeadPlanOutput } from "@agencyhq/contracts";
 import { LeadPlanOutputSchema, TASK_IDS } from "@agencyhq/contracts";
-import { listOpenDispatchIntents } from "@agencyhq/db";
+import { applyObservation, listOpenDispatchIntents } from "@agencyhq/db";
 import type { CommandId, RunObservation } from "@agencyhq/domain";
 import { FINAL_RUN_STATUSES } from "@agencyhq/domain";
 
@@ -196,6 +196,20 @@ export class Reconciler {
       );
       const generation = rows[0]?.generation;
       if (generation === undefined) return;
+
+      // R-010: Record the observation before calling confirmStop.
+      // Use the dispatched generation from the intent's idempotency key (may be
+      // behind the current generation after revokeGeneration bumped it — that is
+      // expected and will be marked stale).  Duplicate calls are no-ops.
+      const dispatchedGen = getIntentGen(intent);
+      await applyObservation(client, {
+        runId: obs.runId,
+        generation: dispatchedGen,
+        attemptId: intent.attempt_id,
+        status: obs.status,
+        payload: obs,
+        observedAt: new Date(obs.observedAt),
+      });
 
       const commandDeps = { pool, runtime: this.deps.runtime, clock };
       const csResult = await confirmStop(commandDeps, client, {

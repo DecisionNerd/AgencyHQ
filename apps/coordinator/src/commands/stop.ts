@@ -45,8 +45,8 @@ export type StopAttemptInput = {
 };
 
 export type StopAttemptResult =
-  | { ok: true; generation: number; runId: string | null }
-  | { ok: false; reason: "state_mismatch" | "stale_generation" };
+  | { ok: true; generation: number; runId: string | null; replayed?: boolean }
+  | { ok: false; reason: "state_mismatch" | "stale_generation"; replayed?: boolean };
 
 // ---------------------------------------------------------------------------
 // stopAttempt
@@ -63,7 +63,8 @@ export async function stopAttempt(
     // 1. Claim command slot (idempotency table)
     const claim = await claimCommand(client, commandId, "stop");
     if (!claim.claimed) {
-      return claim.result as StopAttemptResult;
+      const stored = claim.result as StopAttemptResult;
+      return { ...stored, replayed: true };
     }
 
     // 2. Load attempt — must be dispatched|running
