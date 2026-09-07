@@ -92,10 +92,7 @@ test("0002 migration SQL is safe to re-execute (idempotent DO blocks)", async (t
     const pgMod = await import("pg");
     const escapedSchema = pgMod.default.escapeIdentifier(schema);
 
-    const migrationsDir = resolve(
-      fileURLToPath(import.meta.url),
-      "../../../migrations",
-    );
+    const migrationsDir = resolve(fileURLToPath(import.meta.url), "../../../migrations");
     const sql = await readFile(resolve(migrationsDir, "0002_ledger_not_null.sql"), "utf8");
 
     // Should not throw — DO blocks check is_nullable before altering.
@@ -108,10 +105,11 @@ test("insert into findings without kind is rejected (not-null violation)", async
   await withTestSchema(t, async ({ client }) => {
     try {
       // Omit kind — should violate the NOT NULL constraint added by 0002.
-      await client.query(
-        `INSERT INTO findings (id, severity, description) VALUES ($1, $2, $3)`,
-        ["fnd-no-kind", "blocking", "test finding without kind"],
-      );
+      await client.query(`INSERT INTO findings (id, severity, description) VALUES ($1, $2, $3)`, [
+        "fnd-no-kind",
+        "blocking",
+        "test finding without kind",
+      ]);
       assert.fail("Expected a not-null violation (23502) for findings.kind");
     } catch (err) {
       const pgErr = err as { code?: string };
@@ -128,10 +126,11 @@ test("insert into decisions without actor is rejected (not-null violation)", asy
   await withTestSchema(t, async ({ client }) => {
     try {
       // Omit actor — should violate the NOT NULL constraint added by 0002.
-      await client.query(
-        `INSERT INTO decisions (id, kind, at) VALUES ($1, $2, $3)`,
-        ["dec-no-actor", "plan", new Date()],
-      );
+      await client.query(`INSERT INTO decisions (id, kind, at) VALUES ($1, $2, $3)`, [
+        "dec-no-actor",
+        "plan",
+        new Date(),
+      ]);
       assert.fail("Expected a not-null violation (23502) for decisions.actor");
     } catch (err) {
       const pgErr = err as { code?: string };
