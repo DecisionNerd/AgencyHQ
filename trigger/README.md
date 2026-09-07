@@ -128,3 +128,43 @@ Items 5–7 require the Slice 2 domain kernel and have not run.
 
 The trial script is `scripts/trial.ts`; run one item at a time with
 `pnpm trial <item>` once `trigger dev` and the webapp stack are running.
+
+## Execution-runtime client (`src/client/`)
+
+### `ExecutionRuntime` interface (`src/client/index.ts`)
+
+Defines the four operations every execution-runtime adapter must provide:
+
+- `trigger(input)` — start a task run with a global-scope idempotency key,
+  an optional concurrency key (serialises per repository), and tags.
+- `cancel(runId)` — cancel an in-flight run; resolves even if already final.
+- `retrieve(runId)` — fetch the current `RunObservation` for a run.
+- `createPublicToken(input)` — create a short-lived public access token.
+
+`TriggerRunStatus` is the full 13-status v4 union.  `FINAL_RUN_STATUSES`
+lists the statuses a run never leaves.  `FAILURE_RUN_STATUSES` lists those
+that clear an idempotency key (FAILED, CRASHED, SYSTEM_FAILURE, EXPIRED,
+TIMED_OUT); COMPLETED and CANCELED keep their keys.
+
+### `FakeExecutionRuntime` (`src/client/fake.ts`)
+
+Deterministic in-memory implementation for tests.  Does not import any
+trigger.dev SDK package (asserted by `trigger/test/client-fake.test.ts`).
+
+Key features:
+
+- **Idempotency** — `idempotency` map mirrors the real table: same key
+  returns the same `runId` while the key is live; failure-class finals clear
+  it; COMPLETED and CANCELED keep it.
+- **Lost-response simulation** — `dropNextResponse()` makes the next
+  `trigger()` register the run (so the idempotency key is live) then throw
+  `FakeNetworkError`, enabling retry-collapses-to-same-run tests.
+- **Scripted progressions** — `script(task, handler)` programs the outcome
+  per task; `advance(runId)` / `advanceAll()` step runs through the queue
+  (QUEUED → EXECUTING → scripted steps) so tests observe each intermediate
+  state via `retrieve()`.
+- **Cancel** — sets CANCELED immediately, keeps the idempotency key.
+- **setMetadata** — patches metadata after a run is final (models adapter
+  survivors arriving post-completion).
+- **Deterministic run ids** — `run_fake_<n>` for easy assertions.
+- **`calls` log** — every method call in order for assertion.

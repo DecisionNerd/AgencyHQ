@@ -9,12 +9,14 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/**/*.test.ts'",
-    "test:integration": "node --test 'test/integration/**/*.test.ts'"
+    "test:integration": "node --test 'test/integration/**/*.test.ts'",
+    "migrate": "node --env-file=../../.env src/migrate-cli.ts"
   },
   "dependencies": {
     "@agencyhq/contracts": "workspace:*",
     "@agencyhq/domain": "workspace:*",
-    "pg": "^8"
+    "pg": "^8",
+    "zod": "^4"
   },
   "devDependencies": {
     "@types/pg": "^8"
