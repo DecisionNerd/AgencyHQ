@@ -56,8 +56,8 @@
 //   "APIError","data":{"message":"Invalid API key.", ...}}}` object; `errors`
 //   in `summarize()` is confirmed against this shape (drilling into
 //   `error.data.message`/`error.message`).
-// - Denial shape, observed 2026-09-07 with OpenCode 1.18.29 and model
-//   openai/gpt-5.6-terra (smoke scenarios b and c): a denied tool call is a
+// - Denial shape, observed 2026-09-07 with OpenCode 1.18.29 (smoke scenarios b and c):
+//   a denied tool call is a
 //   `{"type":"tool_use", "part": {"tool": "<name>", "state": {"status":
 //   "error", "error": "The user has specified a rule which prevents you from
 //   using this specific tool call. Here are some of the relevant rules [...]",

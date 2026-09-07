@@ -24,8 +24,7 @@
 //   isolation, we spawn opencode ourselves with child_process.spawn (detached)
 //   and connect the v2 client to it. This is the spawn-yourself path.
 //
-// PROBE RUN (see scripts/lead-probe.ts): openai/gpt-5.6-sol, variant "low",
-// 2026-09-07 — recorded in the probe script header comment.
+// PROBE RUN (see scripts/lead-probe.ts): recorded in the probe script header comment.
 
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -43,7 +42,7 @@ export interface LeadPromptInput<T> {
   dir: string;
   /** Run directory for config/log files (created if absent). */
   runDir: string;
-  /** Provider/model string (e.g. "openai/gpt-5.6-sol"). */
+  /** Provider/model string (e.g. "openai/model-name"). */
   model: string;
   /** Model variant (e.g. "low"). */
   variant?: string | undefined;

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type {
   AcceptanceProposal,
@@ -97,6 +100,10 @@ function makeFakeDeps(proposalOrError: AcceptanceProposal | Error): AcceptDeps {
         raw: proposalOrError,
         value: input.parse(proposalOrError),
       };
+    },
+    mkdtemp: (prefix: string) => mkdtemp(join(tmpdir(), prefix)),
+    rmdir: async (path: string) => {
+      await rm(path, { recursive: true, force: true });
     },
   };
 }
@@ -224,6 +231,10 @@ test("runAccept returns invalid_output when session output fails schema parse", 
         value: input.parse(garbage), // ZodError
       };
     },
+    mkdtemp: (prefix: string) => mkdtemp(join(tmpdir(), prefix)),
+    rmdir: async (path: string) => {
+      await rm(path, { recursive: true, force: true });
+    },
   };
 
   const result = await runAccept(payload, deps);
@@ -316,4 +327,86 @@ test("lead-accept-core.ts does not reference checkProposal or evaluateAcceptance
   const src = readFileSync(new URL("../src/tasks/lead-accept-core.ts", import.meta.url), "utf8");
   assert.ok(!src.includes("checkProposal"), "must not reference checkProposal");
   assert.ok(!src.includes("evaluateAcceptance"), "must not reference evaluateAcceptance");
+});
+
+// ---------------------------------------------------------------------------
+// CR-6: per-run working directory — must exist, be empty, and not be "/tmp"
+// ---------------------------------------------------------------------------
+
+test("runAccept: directory passed to session exists and is empty at call time", async () => {
+  const payload = makePayload();
+  let capturedDir: string | undefined;
+
+  const deps: AcceptDeps = {
+    leadSession: async <T>(input: { dir: string; parse: (raw: unknown) => T }) => {
+      capturedDir = input.dir;
+      const proposal = makeValidProposal();
+      return {
+        sessionId: "session-dir-check",
+        raw: proposal,
+        value: input.parse(proposal),
+      };
+    },
+    mkdtemp: (prefix: string) => mkdtemp(join(tmpdir(), prefix)),
+    rmdir: async (path: string) => {
+      await rm(path, { recursive: true, force: true });
+    },
+  };
+
+  await runAccept(payload, deps);
+
+  assert.ok(capturedDir !== undefined, "leadSession must be called");
+  // The directory must exist at the time the session was called (mkdtemp guarantees this).
+  // We cannot check it after rmdir removes it, so verify the path was not bare "/tmp".
+  assert.notEqual(capturedDir, "/tmp", "session dir must not be the bare /tmp directory");
+  assert.ok(capturedDir.length > "/tmp".length, "session dir must be a unique subdirectory");
+});
+
+test("runAccept: directory passed to session is distinct from /tmp", async () => {
+  const payload = makePayload();
+  const dirsSeen: string[] = [];
+
+  const deps: AcceptDeps = {
+    leadSession: async <T>(input: { dir: string; parse: (raw: unknown) => T }) => {
+      dirsSeen.push(input.dir);
+      const proposal = makeValidProposal();
+      return { sessionId: "s", raw: proposal, value: input.parse(proposal) };
+    },
+    mkdtemp: (prefix: string) => mkdtemp(join(tmpdir(), prefix)),
+    rmdir: async (path: string) => {
+      await rm(path, { recursive: true, force: true });
+    },
+  };
+
+  await runAccept(payload, deps);
+
+  assert.equal(dirsSeen.length, 1, "leadSession called exactly once");
+  assert.notEqual(dirsSeen[0], "/tmp", "dir must not be bare /tmp");
+  // The dir is always inside tmpdir() and has the attempt id in the prefix.
+  assert.ok(dirsSeen[0]?.includes(payload.attemptId), "dir name should include the attempt id");
+});
+
+test("runAccept: directory is empty when passed to session", async () => {
+  const payload = makePayload();
+  let capturedDir: string | undefined;
+  let dirContentsAtCallTime: string[] = ["sentinel-not-empty"];
+
+  const deps: AcceptDeps = {
+    leadSession: async <T>(input: { dir: string; parse: (raw: unknown) => T }) => {
+      capturedDir = input.dir;
+      // Read the directory contents synchronously at call time.
+      dirContentsAtCallTime = await readdir(input.dir);
+      const proposal = makeValidProposal();
+      return { sessionId: "s", raw: proposal, value: input.parse(proposal) };
+    },
+    mkdtemp: (prefix: string) => mkdtemp(join(tmpdir(), prefix)),
+    rmdir: async (path: string) => {
+      await rm(path, { recursive: true, force: true });
+    },
+  };
+
+  await runAccept(payload, deps);
+
+  assert.ok(capturedDir !== undefined, "leadSession must be called");
+  assert.deepEqual(dirContentsAtCallTime, [], "session dir must be empty when the session starts");
 });

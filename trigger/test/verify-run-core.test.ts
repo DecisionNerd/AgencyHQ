@@ -530,3 +530,54 @@ test("protectedPaths default: test/parser/reject.test.ts is not covered by DEFAU
   assert.equal(covered, false, `${testFilePath} must not be a protected verifier path`);
   assert.ok(DEFAULT_PROTECTED_PATHS.some((p) => matchesGlob(p, "package.json")));
 });
+
+// ---------------------------------------------------------------------------
+// H-6: protectedPathsSource metadata in RunVerificationOutput.integrity
+// ---------------------------------------------------------------------------
+
+// T14: when payload.protectedPaths is absent, protectedPathsSource is "default".
+test("protectedPathsSource: absent protectedPaths records source=default", async () => {
+  const fixture = await makeFixture({ includeTamperedFile: false });
+  try {
+    const payload = makePayload(fixture);
+    assert.equal(
+      payload.protectedPaths,
+      undefined,
+      "fixture payload should have no protectedPaths",
+    );
+
+    const { runner } = makeFakeRunner();
+    const deps = makeDeps(runner);
+    const output = await runVerification(payload, deps);
+
+    assert.equal(
+      output.integrity.protectedPathsSource,
+      "default",
+      "absent protectedPaths should record source=default",
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+// T15: when payload.protectedPaths is explicitly set, protectedPathsSource is "payload".
+test("protectedPathsSource: explicit protectedPaths records source=payload", async () => {
+  const fixture = await makeFixture({ includeTamperedFile: false });
+  try {
+    const payload = makePayload(fixture, {
+      protectedPaths: ["src/critical-verifier.ts"],
+    });
+
+    const { runner } = makeFakeRunner();
+    const deps = makeDeps(runner);
+    const output = await runVerification(payload, deps);
+
+    assert.equal(
+      output.integrity.protectedPathsSource,
+      "payload",
+      "explicit protectedPaths should record source=payload",
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
