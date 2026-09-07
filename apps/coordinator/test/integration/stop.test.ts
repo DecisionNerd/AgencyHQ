@@ -510,3 +510,54 @@ test("stop idempotency: same commandId → second call returns stored result, ca
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Test (iv): stop command replay → replayed: true
+// ---------------------------------------------------------------------------
+
+test("stop: command replay returns stored result with replayed: true", async (t) => {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(url, ctx.schema);
+    try {
+      const { attemptId } = await seedAttempt(ctx, { status: "running", generation: 1 });
+
+      const runtime = new FakeRuntime();
+      const deps = makeDeps(pool, runtime);
+      const commandId = `cmd-${randomUUID()}`;
+
+      // First call: fresh execution
+      const first = await stopAttempt(deps, {
+        commandId,
+        attemptId,
+        actor: "human",
+        reason: "test",
+      });
+      assert.ok(first.ok, "first call succeeds");
+      assert.ok(!first.replayed, "first call is NOT replayed");
+
+      // Second call: same commandId → replay
+      const second = await stopAttempt(deps, {
+        commandId,
+        attemptId,
+        actor: "human",
+        reason: "test",
+      });
+      assert.ok(second.ok, "replay result is ok");
+      assert.equal(second.replayed, true, "replay call has replayed: true");
+
+      // Result content matches first call
+      if (first.ok && second.ok) {
+        assert.equal(second.generation, first.generation, "replay: same generation");
+        assert.equal(second.runId, first.runId, "replay: same runId");
+      }
+    } finally {
+      await pool.end();
+    }
+  });
+});

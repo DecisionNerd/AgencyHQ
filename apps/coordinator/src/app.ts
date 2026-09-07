@@ -483,7 +483,11 @@ export function createApp(deps: AppDeps): Hono {
         const actor = body.actor === "human" || body.actor === "coordinator" ? body.actor : "human";
         const reason = typeof body.reason === "string" ? body.reason : "operator requested";
         const result = await commands.stop({ commandId, attemptId, actor, reason });
-        return c.json({ commandId, replayed: false, result }, 200);
+        const stopReplayed =
+          typeof result === "object" &&
+          result !== null &&
+          (result as Record<string, unknown>).replayed === true;
+        return c.json({ commandId, replayed: stopReplayed, result }, 200);
       }
 
       if (kind === "pause") {
