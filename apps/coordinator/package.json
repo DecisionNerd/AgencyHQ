@@ -1,0 +1,23 @@
+{
+  "name": "@agencyhq/coordinator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.ts'",
+    "test:integration": "node --test 'test/integration/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@agencyhq/contracts": "workspace:*",
+    "@agencyhq/domain": "workspace:*",
+    "@agencyhq/db": "workspace:*",
+    "@agencyhq/verification": "workspace:*",
+    "@agencyhq/trigger": "workspace:*",
+    "hono": "^4",
+    "@hono/node-server": "^2"
+  }
+}

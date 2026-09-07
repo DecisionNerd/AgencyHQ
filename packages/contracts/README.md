@@ -5,3 +5,7 @@ delegated-authority schema, task payloads and outputs (`lead.plan`,
 `worker.attempt`, `verify.run`, `lead.review`, `lead.accept`,
 `integrate.merge`), worker report, Lead proposal, and OpenCode permission-rule
 generation. Also the JSON schemas handed to OpenCode structured output.
+
+## Package
+
+Package name: `@agencyhq/contracts`. Scripts: `typecheck` runs `tsc --noEmit`; `test` runs the unit test suite with `node --test`.

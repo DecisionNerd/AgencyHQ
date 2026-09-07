@@ -1,0 +1,22 @@
+{
+  "name": "@agencyhq/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.ts'",
+    "test:integration": "node --test 'test/integration/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@agencyhq/contracts": "workspace:*",
+    "@agencyhq/domain": "workspace:*",
+    "pg": "^8"
+  },
+  "devDependencies": {
+    "@types/pg": "^8"
+  }
+}

@@ -11,7 +11,8 @@
     "echo": "node --env-file=.env scripts/echo.ts"
   },
   "dependencies": {
-    "@trigger.dev/sdk": "4.5.16"
+    "@trigger.dev/sdk": "4.5.16",
+    "@opencode-ai/sdk": "1.18.29"
   },
   "devDependencies": {
     "trigger.dev": "4.5.16",

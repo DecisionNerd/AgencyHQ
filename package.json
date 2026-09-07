@@ -7,13 +7,16 @@
     "node": ">=24"
   },
   "scripts": {
-    "check": "node --test tests/architecture-baseline.test.mjs",
+    "check": "node --test tests/architecture-baseline.test.mjs tests/dependency-rules.test.mjs",
     "test": "pnpm check",
     "typecheck": "pnpm -r --if-present typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "test:unit": "pnpm -r --if-present test",
     "test:integration": "pnpm -r --if-present test:integration",
+    "build": "pnpm -r --if-present build",
+    "db:up": "docker compose -f infra/db/compose.yaml up -d",
+    "db:down": "docker compose -f infra/db/compose.yaml down",
     "trigger:dev": "pnpm --filter @agencyhq/trigger dev",
     "trigger:trial": "pnpm --filter @agencyhq/trigger trial"
   },
