@@ -25,5 +25,6 @@ IDs are stable. R-005 was restated and R-020 added on 2026-09-07 (ADR-0006).
 | R-019 | A returning operator shall see changes, pending decisions, continuing runs, observation freshness, and requested-vs-confirmed stop status without logs. | Browser journey. |
 | R-020 | Repository content and Lead proposals shall be untrusted input; a proposal can only narrow delegated authority, never widen it. | Adversarial-fixture authority tests. |
 
-Only the documentation baseline check exists today. Scenarios live in
-[engineering/TESTING.md](engineering/TESTING.md).
+Unit, Postgres integration, and dependency-rule tests exist; see
+[engineering/TESTING.md](engineering/TESTING.md) for the full test layer
+inventory and coverage.

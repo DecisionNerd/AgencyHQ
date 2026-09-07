@@ -54,12 +54,14 @@ and Findings. An honest partial or failed report is valid execution evidence,
 not acceptance. Missing results remain unknown.
 
 A worker output with a null commit id (nothing changed) is classified as a
-failure; no Artifact is created for that attempt.
+failure; no Artifact is created for that attempt (untested: no test covers
+this path yet).
 
 When the authority schema sets `humanRequired` true, the work item is parked as
 `pending_human` after acceptance is proposed, and stays there until a matching
-Approval bound to the same contract version and attempt exists. No Approval
-write path (command or API) exists yet; this is Slice 4 scope.
+Approval bound to the same contract version and attempt exists (untested: no
+test covers this parking path yet). No Approval write path (command or API)
+exists yet; this is Slice 4 scope.
 
 ## Delegated authority
 
@@ -102,7 +104,7 @@ The Lead classifies each Finding; the coordinator records the disposition.
 
 Match Findings by subject and cause before creating another.
 
-*Implementation: finding dispositions in `packages/domain/src/findings/disposition.ts`; acceptance rule with 13 reason codes in `packages/domain/src/evidence/acceptance.ts`; verifier-tampering detection in `packages/domain/src/evidence/integrity.ts`.*
+*Implementation: finding dispositions in `packages/domain/src/findings/disposition.ts`; acceptance rule with 14 reason codes (`PROPOSAL_REJECTS`, `VERIFIER_TAMPERED`, `CRITERION_UNCITED`, `CRITERION_UNSATISFIED`, `CITED_RESULT_MISSING`, `CITED_RESULT_NOT_PASSING`, `RESULT_VERSION_MISMATCH`, `REVIEW_MISSING`, `REVIEW_VERSION_MISMATCH`, `REVIEW_BLOCKING`, `REVIEW_BELOW_REQUIRED`, `REVIEWER_NOT_DISTINCT`, `APPROVAL_REQUIRED`, `APPROVAL_VERSION_MISMATCH`) in `packages/domain/src/evidence/acceptance.ts`; verifier-tampering detection in `packages/domain/src/evidence/integrity.ts` (protected paths: package manifests, lock files, workspace file, tsconfig*, biome.json, .github/**, vitest/jest configs; test source files are not protected).*
 
 ## Version repair
 

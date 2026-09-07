@@ -5,7 +5,7 @@ riskiest assumption — that self-hosted Trigger.dev plus OpenCode can meet the
 isolation and recovery contract — is tested first, before domain code depends
 on it.
 
-## Slice 0 — architecture baseline (current)
+## Slice 0 — architecture baseline
 
 - Authority boundaries, runtime choice, Lead role, worker effect model, and
   delegated-authority schema are recorded (ADR-0001 to ADR-0007).

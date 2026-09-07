@@ -56,14 +56,15 @@ model (ADR-0007): no Trigger SDK usage, node built-ins only.
   descendant, wait out the grace period, then SIGKILL survivors), and
   `survivorScan` (finds any process still tagged with an attempt's
   `AGENCYHQ_ATTEMPT_ID`) for the stop sequence in EXECUTION_MODEL.md.
-- `opencode.ts`: `buildPermissionRuleset` (spike fallback) and `writeRunConfig`
-  produce the worker's permission ruleset and `opencode.worker.json`.
-  Permission source: when `WorkerAttemptPayload.permissionRules` is present
-  (set by the coordinator from a frozen StepContract), that contract ruleset is
-  written verbatim after `enforceAlwaysDeny` merges `WORKER_ALWAYS_DENY_BASH`
-  and `WORKER_ALWAYS_DENY_PATHS` on top for defense in depth. When absent,
-  `buildPermissionRuleset` is used as a spike fallback. `permissionSource`
-  ("contract" | "fallback") is recorded in run metadata. Deny enforcement
+- `opencode.ts`: `writeRunConfig` writes `opencode.worker.json` from the
+  resolved ruleset. `buildPermissionRuleset` remains in the file as a legacy
+  helper but is no longer called by `worker.attempt` (no fallback path exists).
+  Permission source: `WorkerAttemptPayload.permissionRules` is required;
+  `resolveWorkerRuleset` (in `worker-attempt-core.ts`) applies
+  `enforceAlwaysDeny` to merge `WORKER_ALWAYS_DENY_BASH` and
+  `WORKER_ALWAYS_DENY_PATHS` on top for defense in depth and throws when the
+  field is absent. `permissionSource` is always `"contract"` and is recorded
+  in run metadata. Deny enforcement
   applies at two layers: before-action (the ruleset's edit/bash pattern map,
   last-match-wins) and on-output (`classifyPaths` with `denied` list from
   `payload.bounds?.paths.deny`). `spawnOpenCode` runs `opencode run --format
