@@ -22,7 +22,7 @@ const DEFAULT_LEAD_VARIANT = "low";
 export const leadAccept = task({
   id: "lead.accept",
   maxDuration: 300,
-  queue: { name: "lead" },
+  queue: { name: "lead", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },
 
   run: async (rawPayload: unknown): Promise<AcceptTaskOutput> => {

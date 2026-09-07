@@ -37,7 +37,7 @@ async function gitDiff(repoPath: string, base: string, attempt: string): Promise
 export const leadReview = task({
   id: "lead.review",
   maxDuration: 600,
-  queue: { name: "lead" },
+  queue: { name: "lead", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },
 
   run: async (rawPayload: unknown): Promise<ReviewTaskOutput & { reviewerModel: string }> => {
