@@ -27,15 +27,13 @@
 // Everything past that point is mechanical: diff, classify paths, quarantine
 // violations, commit the remainder. No other policy lives in this file.
 import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-
-import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
-
 import type {
+  PermissionRuleset as ContractsPermissionRuleset,
   PermissionAction,
   PermissionPatternMap,
-  PermissionRuleset as ContractsPermissionRuleset,
 } from "@agencyhq/contracts";
 import { WORKER_ALWAYS_DENY_BASH, WORKER_ALWAYS_DENY_PATHS } from "@agencyhq/contracts";
+import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
 
 import { scrubbedChildEnv } from "../lib/env.ts";
 import {

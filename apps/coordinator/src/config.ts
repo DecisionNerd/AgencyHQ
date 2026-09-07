@@ -100,22 +100,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
   }
 
   // Support both legacy and new env var names
-  const worktreeBase =
-    optional("AGENCYHQ_WORKTREE_BASE") ??
-    optional("WORKTREE_BASE") ??
-    (missing.push("AGENCYHQ_WORKTREE_BASE"), "");
-  const workerModel =
-    optional("AGENCYHQ_WORKER_MODEL") ??
-    optional("WORKER_MODEL") ??
-    (missing.push("AGENCYHQ_WORKER_MODEL"), "");
-  const leadModel =
-    optional("AGENCYHQ_LEAD_MODEL") ??
-    optional("LEAD_MODEL") ??
-    (missing.push("AGENCYHQ_LEAD_MODEL"), "");
-  const reviewerModel =
-    optional("AGENCYHQ_REVIEWER_MODEL") ??
-    optional("REVIEWER_MODEL") ??
-    (missing.push("AGENCYHQ_REVIEWER_MODEL"), "");
+  const requiredWithFallback = (primary: string, fallback: string): string => {
+    const value = optional(primary) ?? optional(fallback);
+    if (value === undefined) {
+      missing.push(primary);
+      return "";
+    }
+    return value;
+  };
+  const worktreeBase = requiredWithFallback("AGENCYHQ_WORKTREE_BASE", "WORKTREE_BASE");
+  const workerModel = requiredWithFallback("AGENCYHQ_WORKER_MODEL", "WORKER_MODEL");
+  const leadModel = requiredWithFallback("AGENCYHQ_LEAD_MODEL", "LEAD_MODEL");
+  const reviewerModel = requiredWithFallback("AGENCYHQ_REVIEWER_MODEL", "REVIEWER_MODEL");
 
   const leadVariant = optional("AGENCYHQ_LEAD_VARIANT");
 
