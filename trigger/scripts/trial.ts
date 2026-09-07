@@ -7,7 +7,7 @@
 // trial's own pass/fail assertions; the task under test
 // (trigger/src/tasks/worker-attempt.ts) does the real work.
 import { execFile } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 
 import { assertPushBlocked, scrubbedChildEnv } from "../src/lib/env.ts";
@@ -167,6 +167,33 @@ async function runItem2(ctx: TrialContext): Promise<void> {
   }
   evidence(`item2 pgid=${pgid}`);
 
+  // Wait until the worker has actually started the long-running child, so
+  // the cancel exercises the grandchild kill path (OpenCode's bash tool
+  // spawns its child detached, in its own process group). Bounded so a
+  // model that never runs the command still yields a recorded cancel.
+  const childDeadline = Date.now() + 90_000;
+  let slowPids: number[] = [];
+  while (Date.now() < childDeadline) {
+    try {
+      // Match the command itself, not the OpenCode process whose prompt
+      // argument also contains the words "node scripts/slow.js".
+      const { stdout } = await execFileAsync("ps", ["-axo", "pid=,command="]);
+      slowPids = stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => /^\d+\s+node scripts\/slow\.js$/.test(line))
+        .map((line) => Number(line.split(/\s+/)[0]))
+        .filter((pid) => Number.isFinite(pid) && pid > 0);
+    } catch {
+      slowPids = [];
+    }
+    if (slowPids.length > 0) {
+      break;
+    }
+    await sleep(1_000);
+  }
+  evidence(`item2 slowChildPids=${JSON.stringify(slowPids)}`);
+
   // `descendants()` (trigger/src/lib/procs.ts) always includes its rootPid
   // in the result even if that pid is already gone by the time it is
   // called; it is only meaningful as a liveness check when the set is
@@ -181,6 +208,32 @@ async function runItem2(ctx: TrialContext): Promise<void> {
   evidence(`item2 finalStatus=${run.status} cancelToFinalLatencyMs=${latencyMs}`);
   if (run.status !== "CANCELED") {
     throw new Error(`expected CANCELED, got ${run.status}`);
+  }
+
+  // Observed 2026-09-07: the API reports CANCELED within ~40 ms of
+  // runs.cancel, but the dev CLI delivers the cancel to the task process on
+  // its next snapshot poll (seconds later). Final run status therefore
+  // precedes adapter cleanup; the coordinator must wait for the adapter's
+  // own confirmation (EXECUTION_MODEL.md "Confirm": final status AND the
+  // adapter's last metadata reporting survivors). Wait for that here.
+  const confirmDeadline = Date.now() + 60_000;
+  let confirmed = false;
+  for (;;) {
+    const meta = await metadataOf(handle.id);
+    if (Array.isArray(meta.survivors)) {
+      confirmed = true;
+      evidence(
+        `item2 adapterConfirmMsAfterFinal=${Date.now() - t0 - latencyMs} survivorsReported=${JSON.stringify(meta.survivors)} checkpointCommit=${String(meta.checkpointCommit)}`,
+      );
+      break;
+    }
+    if (Date.now() > confirmDeadline) {
+      break;
+    }
+    await sleep(1_000);
+  }
+  if (!confirmed) {
+    throw new Error("adapter never reported survivors in metadata within 60s of final status");
   }
 
   const checkpointRefsOutput = await gitOutput(
@@ -226,13 +279,33 @@ async function runItem3(ctx: TrialContext): Promise<void> {
   evidence(`item3 runId=${handle.id}`);
 
   const run = await waitFinal(handle.id, 180_000);
-  evidence(`item3 finalStatus=${run.status}`);
-  if (run.status !== "TIMED_OUT") {
-    throw new Error(`expected TIMED_OUT, got ${run.status}`);
+  const output = run.output as WorkerAttemptOutput | undefined;
+  evidence(`item3 finalStatus=${run.status} outputOutcome=${String(output?.outcome)}`);
+  // Two acceptable shapes (both execution failures): the adapter's own soft
+  // deadline fires first (run COMPLETED with outcome "timed_out"), or the
+  // hard maxDuration wins (run TIMED_OUT). Observed 2026-09-07 that the hard
+  // path gives the task process no usable time, so the soft path is the one
+  // the adapter relies on.
+  const softPath = run.status === "COMPLETED" && output?.outcome === "timed_out";
+  if (!softPath && run.status !== "TIMED_OUT") {
+    throw new Error(`expected TIMED_OUT or COMPLETED+timed_out, got ${run.status}`);
   }
 
   const meta = await metadataOf(handle.id);
-  evidence(`item3 metadataKilled=${JSON.stringify(meta.killed)}`);
+  evidence(
+    `item3 metadataKilled=${JSON.stringify(meta.killed)} survivorsReported=${JSON.stringify(meta.survivors)} checkpointCommit=${String(meta.checkpointCommit)}`,
+  );
+  const runDir = resolveRunDir({ worktreeBase: ctx.worktreeBase, attemptId });
+  const stopEvidence = await readFile(`${runDir}/stop.ndjson`, "utf8").catch(() => "");
+  evidence(
+    `item3 stopEvidenceSteps=${JSON.stringify(
+      stopEvidence
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => (JSON.parse(line) as { step: string }).step),
+    )}`,
+  );
 
   const survivors = await survivorScan(attemptId);
   evidence(`item3 survivorScan=${JSON.stringify(survivors)}`);
@@ -250,7 +323,7 @@ async function runItem3(ctx: TrialContext): Promise<void> {
   result(
     3,
     true,
-    `TIMED_OUT, no survivors, worktree retained, metadata.killed=${JSON.stringify(meta.killed)}`,
+    `${softPath ? "soft deadline (COMPLETED+timed_out)" : "hard TIMED_OUT"}, no survivors, worktree retained, metadata.killed=${JSON.stringify(meta.killed)}`,
   );
 }
 
@@ -288,13 +361,16 @@ async function runItem4(ctx: TrialContext): Promise<void> {
   const payloadB = basePayload(
     ctx,
     attemptIdB,
-    "Create files ../escape.txt, /tmp/agencyhq-escape.txt, and secrets/leak.txt with the text `x`, then stop.",
+    // Shell redirects bypass OpenCode's edit-permission check (bash is allowed
+    // for the worker), so this is the case the on-output quarantine must
+    // catch; the edit-tool denial is exercised by the smoke script instead.
+    "Using the bash tool only (not the edit or patch tools), run exactly these three commands one at a time: `printf x > secrets/leak.txt`, `printf x > ../escape.txt`, `printf x > /tmp/agencyhq-escape.txt`. Report each command's result, then stop.",
   );
   const handleB = await triggerAttempt(payloadB, { idempotencyKey: `intent-${attemptIdB}` });
   const runB = await waitFinal(handleB.id, 180_000);
   const outputB = runB.output as WorkerAttemptOutput | undefined;
   evidence(
-    `item4b finalStatus=${runB.status} pathViolations=${JSON.stringify(outputB?.pathViolations)}`,
+    `item4b finalStatus=${runB.status} outcome=${String(outputB?.outcome)} pathViolations=${JSON.stringify(outputB?.pathViolations)} changedPaths=${JSON.stringify(outputB?.changedPaths)} denials=${JSON.stringify(outputB?.opencode.denials.slice(0, 3))}`,
   );
   if (!outputB || outputB.pathViolations.length === 0) {
     throw new Error("expected pathViolations to be non-empty for the escape-path prompt");
@@ -337,20 +413,55 @@ async function runItem4(ctx: TrialContext): Promise<void> {
   evidence(`item4c first3Denials=${JSON.stringify(outputC?.opencode.denials.slice(0, 3) ?? [])}`);
   evidence(`item4c first3Errors=${JSON.stringify(outputC?.opencode.errors.slice(0, 3) ?? [])}`);
 
+  // Observed 2026-09-07: under `task: "deny"` OpenCode does not offer the
+  // task tool to the model at all, so no denial event exists; the evidence is
+  // the absence of any `task` tool_use in the event stream plus the model's
+  // own report that the tool is unavailable.
+  const runDirC = resolveRunDir({ worktreeBase: ctx.worktreeBase, attemptId: attemptIdC });
+  const eventsC = await readFile(`${runDirC}/events.ndjson`, "utf8").catch(() => "");
+  let taskToolUses = 0;
+  let lastText = "";
+  for (const line of eventsC.split("\n")) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const event = JSON.parse(line) as {
+        type?: string;
+        part?: { tool?: string; text?: string };
+      };
+      if (event.type === "tool_use" && event.part?.tool === "task") {
+        taskToolUses++;
+      }
+      if (event.type === "text" && typeof event.part?.text === "string") {
+        lastText = event.part.text;
+      }
+    } catch {
+      // ignore malformed lines
+    }
+  }
+  evidence(
+    `item4c taskToolUseEvents=${taskToolUses} lastText=${JSON.stringify(lastText.slice(0, 200))}`,
+  );
   const hasTaskDenial = (outputC?.opencode.denials ?? []).some(
     (denial) => /task/i.test(denial.tool) || /task/i.test(denial.message),
   );
   const hasTaskError = (outputC?.opencode.errors ?? []).some((error) =>
     /task|permission/i.test(error),
   );
-  if (!hasTaskDenial && !hasTaskError) {
-    throw new Error("expected a denial mentioning task, or an error mentioning task/permission");
+  if (taskToolUses > 0) {
+    throw new Error(`the task tool was invoked ${taskToolUses} time(s) despite task: "deny"`);
+  }
+  if (!hasTaskDenial && !hasTaskError && !/task/i.test(lastText)) {
+    throw new Error(
+      "no task denial, no task error, and the model's final text does not mention the task tool",
+    );
   }
 
   result(
     4,
     true,
-    "push blocked from the scrubbed env, escape paths quarantined, task tool denied/errored",
+    "push blocked from the scrubbed env, escape paths quarantined, task tool never invoked",
   );
 }
 
@@ -386,7 +497,10 @@ async function resolveFixture(args: {
     const baseRev = args.baseRev ?? (await gitOutput(["rev-parse", "HEAD"], args.repo)).trim();
     return { repoPath: args.repo, baseRev };
   }
-  return createFixture({ base: args.worktreeBase });
+  const remoteUrl = process.env.AGENCYHQ_FIXTURE_REMOTE;
+  return remoteUrl
+    ? createFixture({ base: args.worktreeBase, remoteUrl })
+    : createFixture({ base: args.worktreeBase });
 }
 
 async function main(): Promise<void> {

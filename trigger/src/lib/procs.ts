@@ -135,19 +135,35 @@ export async function killTree(args: {
   return { terminated, killed, survivors };
 }
 
+/**
+ * Every live process that belongs to an attempt: matched by the
+ * `AGENCYHQ_ATTEMPT_ID=<id>` environment marker where `ps -E` exposes it
+ * (macOS prints environments only for some processes), unioned with any
+ * command line that carries the attempt id (the OpenCode child is spawned
+ * with `--title attempt-<id>` and `--dir .../attempts/<id>`). Observed
+ * 2026-09-07 during trial item 2: `ps -E` showed no environment for a live
+ * OpenCode child, so the command-line match is load-bearing, not a fallback.
+ */
 export async function survivorScan(attemptId: string): Promise<number[]> {
   const needle = `AGENCYHQ_ATTEMPT_ID=${attemptId}`;
+  const found = new Set<number>();
   try {
     const { stdout } = await execFileAsync("ps", ["-E", "-axo", "pid=,command="], {
       maxBuffer: 16 * 1024 * 1024,
     });
-    return extractPids(stdout, needle);
+    for (const pid of extractPids(stdout, needle)) {
+      found.add(pid);
+    }
   } catch {
-    const { stdout } = await execFileAsync("ps", ["-axo", "pid=,command="], {
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    return extractPids(stdout, attemptId);
+    // `ps -E` unsupported: the command-line scan below still runs.
   }
+  const { stdout } = await execFileAsync("ps", ["-axo", "pid=,command="], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  for (const pid of extractPids(stdout, attemptId)) {
+    found.add(pid);
+  }
+  return [...found].filter((pid) => isAlive(pid)).sort((a, b) => a - b);
 }
 
 function extractPids(psOutput: string, needle: string): number[] {

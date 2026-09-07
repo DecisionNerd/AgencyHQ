@@ -72,6 +72,15 @@ export type RunState = {
   repoPath: string;
   attemptId: string;
   cancelled: boolean;
+  /** Run directory for local stop evidence (`stop.ndjson`); optional so
+   * unit tests with fakes need not supply it. */
+  runDir?: string;
+  /** The in-flight stop sequence once claimed. A later caller awaits this
+   * instead of returning early: observed 2026-09-07 (trial item 2) that when
+   * `onCancel` returned immediately because the abort listener had already
+   * claimed the run, Trigger terminated the task process before the kill
+   * finished, orphaning OpenCode and its children. */
+  stopPromise?: Promise<StopResult | null>;
 };
 
 export type StopResult = {
@@ -85,11 +94,24 @@ export type KillTreeResult = { terminated: number[]; killed: number[]; survivors
 /** Dependencies the checkpoint-and-kill routine needs from the git/procs
  * libraries, injected so the routine is unit-testable with fakes. */
 export type StopDeps = {
-  commitTree: (args: { worktreePath: string; message: string }) => Promise<string | null>;
+  commitTree: (args: {
+    worktreePath: string;
+    message: string;
+    allowEmpty?: boolean;
+  }) => Promise<string | null>;
   updateRef: (args: { repoPath: string; ref: string; sha: string }) => Promise<void>;
-  killTree: (args: { rootPid: number; pgid: number }) => Promise<KillTreeResult>;
+  killTree: (args: { rootPid: number; pgid: number; graceMs?: number }) => Promise<KillTreeResult>;
   survivorScan: (attemptId: string) => Promise<number[]>;
+  /** Optional local evidence sink: appended one JSON line per step so the
+   * stop sequence is inspectable from disk even when the Trigger run is
+   * already final and rejects metadata writes (observed 2026-09-07). */
+  record?: (event: Record<string, unknown>) => Promise<void>;
 };
+
+/** Grace before SIGKILL on the abort path: Trigger gives roughly one second
+ * between the abort signal and SIGTERM of the task process on maxDuration,
+ * so the kill-first path cannot afford the default 3 s. */
+const KILL_FIRST_GRACE_MS = 400;
 
 export function registerRunState(
   states: Map<string, RunState>,
@@ -107,9 +129,13 @@ async function checkpoint(
   state: RunState,
   deps: Pick<StopDeps, "commitTree" | "updateRef">,
 ): Promise<string | null> {
+  // `allowEmpty`: a checkpoint ref must exist after every stop, even when the
+  // worker changed nothing, so the coordinator can always read it (ADR-0007
+  // item 7) and the trial can assert on it deterministically.
   const commitId = await deps.commitTree({
     worktreePath: state.worktreePath,
     message: "agencyhq checkpoint",
+    allowEmpty: true,
   });
   if (commitId) {
     // Fully-qualified so this is a real branch ref (`git for-each-ref`,
@@ -125,8 +151,27 @@ async function checkpoint(
   return commitId;
 }
 
-async function kill(state: RunState, deps: Pick<StopDeps, "killTree">): Promise<KillTreeResult> {
-  return deps.killTree({ rootPid: state.pid, pgid: state.pgid });
+async function kill(
+  state: RunState,
+  deps: Pick<StopDeps, "killTree">,
+  graceMs?: number,
+): Promise<KillTreeResult> {
+  return deps.killTree({
+    rootPid: state.pid,
+    pgid: state.pgid,
+    ...(graceMs === undefined ? {} : { graceMs }),
+  });
+}
+
+async function record(deps: Pick<StopDeps, "record">, event: Record<string, unknown>) {
+  if (!deps.record) {
+    return;
+  }
+  try {
+    await deps.record({ at: new Date().toISOString(), ...event });
+  } catch {
+    // Evidence is best-effort; never let it block the kill.
+  }
 }
 
 /**
@@ -153,29 +198,57 @@ export async function checkpointAndKill(
   deps: StopDeps,
 ): Promise<StopResult | null> {
   const state = states.get(runId);
-  if (!state || state.cancelled) {
-    // Either there is no such run, or another caller (the run()-scoped
-    // abort listener, or the separate `onCancel` hook — whichever wins the
-    // race) already claimed and is handling/has handled it.
+  if (!state) {
     return null;
+  }
+  if (state.cancelled) {
+    // Another caller (the run()-scoped abort listener, or the separate
+    // `onCancel` hook — whichever won the race) owns the sequence. Await it
+    // so this caller's hook does not return before the kill has finished;
+    // returning early lets Trigger terminate the task process mid-kill.
+    return state.stopPromise ? await state.stopPromise : null;
   }
   // Claimed synchronously, before any await, so a concurrent caller sees
   // `cancelled === true` immediately rather than racing into its own run of
   // this routine.
   state.cancelled = true;
+  state.stopPromise = runStopSequence(state, order, deps);
+  return state.stopPromise;
+}
+
+async function runStopSequence(
+  state: RunState,
+  order: "kill-first" | "checkpoint-first",
+  deps: StopDeps,
+): Promise<StopResult> {
+  await record(deps, { step: "stop_start", order, pid: state.pid, pgid: state.pgid });
 
   let checkpointCommit: string | null = null;
   let killResult: KillTreeResult = { terminated: [], killed: [], survivors: [] };
 
   if (order === "kill-first") {
-    killResult = await kill(state, deps);
-    checkpointCommit = await checkpoint(state, deps);
+    killResult = await kill(state, deps, KILL_FIRST_GRACE_MS);
+    await record(deps, { step: "killed", ...killResult });
+    try {
+      checkpointCommit = await checkpoint(state, deps);
+      await record(deps, { step: "checkpoint", checkpointCommit });
+    } catch (error: unknown) {
+      await record(deps, { step: "checkpoint_failed", error: String(error) });
+    }
   } else {
-    checkpointCommit = await checkpoint(state, deps);
+    try {
+      checkpointCommit = await checkpoint(state, deps);
+      await record(deps, { step: "checkpoint", checkpointCommit });
+    } catch (error: unknown) {
+      // The kill must happen even when the checkpoint cannot be written.
+      await record(deps, { step: "checkpoint_failed", error: String(error) });
+    }
     killResult = await kill(state, deps);
+    await record(deps, { step: "killed", ...killResult });
   }
 
   const survivors = await deps.survivorScan(state.attemptId);
+  await record(deps, { step: "stop_done", survivors });
 
   return {
     checkpointCommit,

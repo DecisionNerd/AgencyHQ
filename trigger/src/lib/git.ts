@@ -66,6 +66,9 @@ export async function commitTree(args: {
   worktreePath: string;
   message: string;
   env?: NodeJS.ProcessEnv;
+  /** Commit even when the tree is unchanged (used for checkpoints so the
+   * checkpoint ref always exists and always points at a real commit). */
+  allowEmpty?: boolean;
 }): Promise<string | null> {
   const gitOptions: GitOptions = { cwd: args.worktreePath };
   if (args.env) {
@@ -80,6 +83,7 @@ export async function commitTree(args: {
         "-c",
         "user.email=agencyhq@localhost",
         "commit",
+        ...(args.allowEmpty ? ["--allow-empty"] : []),
         "-m",
         args.message,
       ],

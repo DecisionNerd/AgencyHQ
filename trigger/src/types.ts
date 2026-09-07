@@ -79,7 +79,7 @@ export type WorkerAttemptPayload = {
  * process already reaped. */
 export type WorkerAttemptOutput = {
   attemptId: string;
-  outcome: "completed" | "path_violation" | "opencode_error" | "cancelled";
+  outcome: "completed" | "path_violation" | "opencode_error" | "cancelled" | "timed_out";
   worktreePath: string;
   runDir: string;
   commitId: string | null;

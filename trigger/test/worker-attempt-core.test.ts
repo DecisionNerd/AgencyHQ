@@ -147,7 +147,7 @@ test("checkpointAndKill does not call updateRef when commitTree has nothing to c
   assert.equal(result?.checkpointCommit, null);
 });
 
-test("checkpointAndKill is idempotent: a second call for the same run id is a no-op", async () => {
+test("checkpointAndKill is idempotent: a second call returns the first call's result", async () => {
   const states = new Map<string, RunState>();
   registerRunState(states, "run-1", fakeState());
   const { deps, calls } = fakeDeps();
@@ -156,7 +156,9 @@ test("checkpointAndKill is idempotent: a second call for the same run id is a no
   const second = await checkpointAndKill(states, "run-1", "checkpoint-first", deps);
 
   assert.notEqual(first, null);
-  assert.equal(second, null);
+  // The late caller gets the same completed result rather than null, so a
+  // hook that arrives second still waits for the kill to finish.
+  assert.deepEqual(second, first);
   // Only the first call's steps ran; the second did not repeat the kill or
   // the commit.
   assert.deepEqual(calls, ["killTree", "commitTree", "updateRef", "survivorScan"]);
@@ -192,12 +194,11 @@ test("checkpointAndKill is idempotent under concurrent callers racing on the sam
     checkpointAndKill(states, "run-1", "checkpoint-first", deps),
   ]);
 
-  const results = [fromAbortListener, fromOnCancel];
-  assert.equal(
-    results.filter((r) => r !== null).length,
-    1,
-    "exactly one caller should get a real result",
-  );
+  // Both callers observe the single completed sequence: the loser awaits the
+  // winner's promise instead of returning early (trial item 2, 2026-09-07:
+  // an early-returning onCancel let Trigger kill the task process mid-kill).
+  assert.notEqual(fromAbortListener, null);
+  assert.deepEqual(fromOnCancel, fromAbortListener);
   assert.equal(killCalls, 1);
   assert.equal(commitCalls, 1);
 });

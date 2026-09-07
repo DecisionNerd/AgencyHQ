@@ -26,7 +26,7 @@
 // failure or malformed NDJSON), never on the semantic content of an event.
 // Everything past that point is mechanical: diff, classify paths, quarantine
 // violations, commit the remainder. No other policy lives in this file.
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
 
@@ -54,6 +54,7 @@ import type { RunState, StopDeps } from "./worker-attempt-core.ts";
 import {
   buildOutput,
   checkpointAndKill,
+  getRunState,
   outcomeFromViolations,
   registerRunState,
   resolveRunDir,
@@ -62,13 +63,67 @@ import {
 
 const DEFAULT_MODEL = "openai/gpt-5.6-terra";
 
+/** Adapter soft deadline before Trigger's hard maxDuration. Observed
+ * 2026-09-07 (trial item 3, trigger.dev 4.5.16 dev): on maxDuration the
+ * worker sends MAX_DURATION_EXCEEDED, aborts the signal, and the CLI SIGTERMs
+ * the task process at once; a Node process without a SIGTERM handler exits
+ * immediately, so the abort listener gets no usable time. The adapter
+ * therefore stops the worker itself this many seconds early and reports
+ * outcome "timed_out"; the hard maxDuration remains the backstop. */
+const SOFT_DEADLINE_MARGIN_SECONDS = 15;
+const SOFT_DEADLINE_MIN_SECONDS = 5;
+
+/** SIGTERM hold: with a handler registered Node no longer exits on SIGTERM,
+ * so the in-flight stop sequences get the CLI's graceful-termination window
+ * (about one second) before its SIGKILL. Registered once per task process. */
+let sigtermHoldInstalled = false;
+function installSigtermHold(states: Map<string, RunState>): void {
+  if (sigtermHoldInstalled) {
+    return;
+  }
+  sigtermHoldInstalled = true;
+  process.on("SIGTERM", () => {
+    const pending: Promise<unknown>[] = [];
+    for (const [runId, state] of states) {
+      if (!state.cancelled) {
+        pending.push(
+          checkpointAndKill(states, runId, "kill-first", stopDepsFor(state.runDir)).catch(
+            () => null,
+          ),
+        );
+      } else if (state.stopPromise) {
+        pending.push(state.stopPromise.catch(() => null));
+      }
+    }
+    const cap = new Promise((resolve) => setTimeout(resolve, 800));
+    void Promise.race([Promise.all(pending), cap]).then(() => process.exit(143));
+  });
+}
+
 // Shared between the run()-scoped abort listener and the onCancel hook so
 // both can find the same in-flight run's process/worktree details and so
 // `checkpointAndKill` (see worker-attempt-core.ts) can guard against doing
 // the kill-and-checkpoint sequence twice.
 const RUN_STATES = new Map<string, RunState>();
 
-const STOP_DEPS: StopDeps = { commitTree, updateRef, killTree, survivorScan };
+/** Local stop evidence: one JSON line per step in `<runDir>/stop.ndjson`.
+ * Written from disk-side code because a cancelled Trigger run is already
+ * final at the API and rejects metadata writes (observed 2026-09-07). */
+function stopEvidence(runDir: string) {
+  return async (event: Record<string, unknown>) => {
+    await appendFile(`${runDir}/stop.ndjson`, `${JSON.stringify(event)}\n`);
+  };
+}
+
+function stopDepsFor(runDir: string | undefined): StopDeps {
+  return {
+    commitTree,
+    updateRef,
+    killTree,
+    survivorScan,
+    ...(runDir ? { record: stopEvidence(runDir) } : {}),
+  };
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -170,7 +225,10 @@ export const workerAttempt = task({
       repoPath: payload.repoPath,
       attemptId: payload.attemptId,
       cancelled: false,
+      runDir,
     });
+    const stopDeps = stopDepsFor(runDir);
+    installSigtermHold(RUN_STATES);
 
     metadata.set("phase", "opencode_running");
     metadata.set("pid", pid);
@@ -180,17 +238,33 @@ export const workerAttempt = task({
     // An object (not a bare `let`) so the abort listener's assignment is a
     // property write, not a closure-captured local — TypeScript would
     // otherwise narrow the read below to the variable's initial `null`.
-    const abortState: { stopPromise: ReturnType<typeof checkpointAndKill> | null } = {
-      stopPromise: null,
-    };
+    const abortState: {
+      stopPromise: ReturnType<typeof checkpointAndKill> | null;
+      softTimedOut: boolean;
+    } = { stopPromise: null, softTimedOut: false };
     const onAbort = () => {
       // Kill immediately (no await on git first); the checkpoint commit
       // happens only after the process group is already being torn down.
       // Not awaited here — the listener itself must return synchronously —
       // but `run()` awaits `abortState.stopPromise` below before it returns.
-      abortState.stopPromise = checkpointAndKill(RUN_STATES, ctx.run.id, "kill-first", STOP_DEPS);
+      void stopEvidence(runDir)({ at: new Date().toISOString(), step: "abort_signal" });
+      abortState.stopPromise = checkpointAndKill(RUN_STATES, ctx.run.id, "kill-first", stopDeps);
     };
     signal.addEventListener("abort", onAbort, { once: true });
+
+    const maxDurationSeconds = ctx.run.maxDuration ?? 600;
+    const softDeadlineMs =
+      Math.max(SOFT_DEADLINE_MIN_SECONDS, maxDurationSeconds - SOFT_DEADLINE_MARGIN_SECONDS) * 1000;
+    const softTimer = setTimeout(() => {
+      abortState.softTimedOut = true;
+      void stopEvidence(runDir)({
+        at: new Date().toISOString(),
+        step: "soft_deadline",
+        maxDurationSeconds,
+        softDeadlineMs,
+      });
+      abortState.stopPromise = checkpointAndKill(RUN_STATES, ctx.run.id, "kill-first", stopDeps);
+    }, softDeadlineMs);
 
     // "close" (not "exit"): "exit" can fire before the piped stdout/stderr
     // streams have finished flushing to events.ndjson/stderr.log, which
@@ -200,8 +274,9 @@ export const workerAttempt = task({
       child.on("close", (code) => resolve(code));
     });
     signal.removeEventListener("abort", onAbort);
+    clearTimeout(softTimer);
 
-    if (signal.aborted) {
+    if (signal.aborted || abortState.softTimedOut) {
       const stopResult = abortState.stopPromise
         ? await abortState.stopPromise.catch(() => null)
         : null;
@@ -210,9 +285,10 @@ export const workerAttempt = task({
         metadata.set("survivors", stopResult.survivors);
         metadata.set("killed", stopResult.killed);
       }
+      metadata.set("phase", abortState.softTimedOut ? "timed_out" : "cancelled");
       return buildOutput({
         attemptId: payload.attemptId,
-        outcome: "cancelled",
+        outcome: abortState.softTimedOut ? "timed_out" : "cancelled",
         worktreePath,
         runDir,
         commitId: null,
@@ -304,11 +380,15 @@ export const workerAttempt = task({
 
   onCancel: async ({ ctx }) => {
     try {
+      const runDir = getRunState(RUN_STATES, ctx.run.id)?.runDir;
+      if (runDir) {
+        await stopEvidence(runDir)({ at: new Date().toISOString(), step: "on_cancel_entered" });
+      }
       const stopResult = await checkpointAndKill(
         RUN_STATES,
         ctx.run.id,
         "checkpoint-first",
-        STOP_DEPS,
+        stopDepsFor(runDir),
       );
       if (stopResult) {
         metadata.set("checkpointCommit", stopResult.checkpointCommit);
