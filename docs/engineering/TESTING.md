@@ -16,7 +16,6 @@ Trigger run is never acceptance.
 | Execution trial | The runtime meets the recovery and isolation contract. | Recorded manual trial per pinned version set. |
 | Operator behavior | Distinct states, evidence inspection, decisions, stop status. | Browser tests against the composed system. |
 
-**Implemented test layers (Slice 2):** Architecture baseline + dependency rules (`tests/architecture-baseline.test.mjs`, `tests/dependency-rules.test.mjs`); domain unit and property tests (`packages/domain`); persistence integration tests against Postgres 17.6 (`packages/db`); adapter fakes (`trigger/src/client/fake.ts`, `trigger/test/worker-attempt-core.test.ts`). Execution trial items 1–4 recorded (2026-09-07). Operator behavior tests not yet implemented.
 
 ## Behavior coverage
 
@@ -132,7 +131,13 @@ and image versions on the real self-hosted stack:
 Deterministic fakes cover these in CI; the recorded real trial qualifies the
 version set. Items 1–4 ran on 2026-09-07 with Trigger.dev 4.5.16, OpenCode
 1.18.29, and Node 24.16.0; the full record is in
-[trials/2026-09-slice1.md](trials/2026-09-slice1.md). Items 5–7 have not run.
+[trials/2026-09-slice1.md](trials/2026-09-slice1.md). Items 5–7 ran on
+2026-09-07 on the complete Slice 3 stack; item 5 PASS, item 6 PARTIAL
+(worker resisted adversarial house rules; weakened-test path not exercised
+live — covered by deterministic tests), item 7 PASS. Full record:
+[trials/2026-09-slice3.md](trials/2026-09-slice3.md).
+
+**Implemented test layers (Slice 3):** Architecture baseline + dependency rules (`tests/architecture-baseline.test.mjs`, `tests/dependency-rules.test.mjs`); domain unit and property tests (`packages/domain`); persistence integration tests against Postgres 17.6 (`packages/db`); adapter fakes and unit tests (`trigger/`, `apps/coordinator/`); verification package unit tests (`packages/verification`); web view-model unit tests (`apps/web/`); CI integration job. Execution trial items 1–7 recorded (2026-09-07). Operator behavior: view-model tests only; browser journey tests deferred to Slice 5.
 
 ## Baseline check
 

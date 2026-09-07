@@ -66,6 +66,8 @@ verification profiles, review depth, boundaries, Finding dispositions, failure
 classifications, review findings, and acceptance. Proposals become Decisions
 only through the coordinator.
 
+**Mechanism (Slice 3, 2026-09-07).** Lead tasks (`lead.plan`, `lead.review`, `lead.accept`) use the OpenCode SDK: `opencode serve --port 0` is spawned with a read-only permission ruleset, a single prompt is sent with `format: { type: "json_schema" }`, and the `StructuredOutput` tool is allowed so the JSON loop completes. The structured output is validated by `LeadPlanOutputSchema` / `ReviewOutput` / `AcceptanceProposal` before the coordinator records any Decision. The project's **verification profile catalog is an authority ceiling**: the Lead may only choose a `profileId` that appears in the project's catalog; a proposal naming an unknown profile is recorded as `pending_human` with `PROFILE_NOT_IN_CATALOG` and is not retried automatically. This was observed in the Slice 3 trial; see [trials/2026-09-slice3.md](trials/2026-09-slice3.md).
+
 ### Trigger.dev (execution runtime)
 
 Self-hosted v4 webapp stack (ADR-0005) plus, on the host profile, `trigger dev`

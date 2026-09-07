@@ -44,7 +44,7 @@ on it.
   11/11; authority subset check with 15 violation codes, acceptance rule with 13
   reason codes, FakeExecutionRuntime and RealExecutionRuntime, 15-table ledger.
 
-## Slice 3 — one complete bounded repair (current)
+## Slice 3 — one complete bounded repair
 
 - Implement `lead.plan`, `verify.run`, `lead.review`, `lead.accept`, and the
   coordinator flow through acceptance at the `artifact` boundary.
@@ -53,8 +53,14 @@ on it.
   Realtime for execution state and links to Trigger runs for logs.
 - Run the full execution trial on the real stack and record it. CI runs the
   baseline check and all slice tests.
+- Outcome (2026-09-07): items 1–7 run; items 1–5 PASS, item 6 PARTIAL
+  (weakened-test path not exercised live; deterministic tests cover the gate),
+  item 7 PASS (work item `89cfe999-9710-4388-8dd1-caf520d26d49` completed at
+  artifact, no Approval, ~150 s end to end). 787 unit tests, 86 integration
+  tests. Full record:
+  [trials/2026-09-slice3.md](../engineering/trials/2026-09-slice3.md).
 
-## Slice 4 — integration boundaries and multiple repositories
+## Slice 4 — integration boundaries and multiple repositories (current)
 
 - `integrate.merge` with compare-and-set and per-repository serialization;
   `merge` boundary completion.

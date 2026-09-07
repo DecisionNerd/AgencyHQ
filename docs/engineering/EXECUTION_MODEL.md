@@ -8,7 +8,10 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
 
 1. **Plan.** The coordinator dispatches `lead.plan` for the WorkItem. The Lead
    proposal is checked against delegated authority; the result is a Decision
-   and a frozen StepContract (or a pending human decision).
+   and a frozen StepContract (or a pending human decision). The proposed
+   `profileId` must come from the project's verification profile catalog; a
+   proposal naming an unlisted profile becomes a `pending_human` decision with
+   `PROFILE_NOT_IN_CATALOG` and is not retried automatically.
 2. **Admit.** The coordinator confirms rank, budget, and that every bound the
    contract requires is enforceable by the runtime. It records an Attempt with
    a new authority generation and a DispatchIntent, in one transaction.

@@ -4,7 +4,7 @@
 - Date: 2026-09-07
 - Extends: ADR-0004 (defines what the "supervisor" is and renames it)
 - Amends: R-005 wording (see REQUIREMENTS.md)
-- Implementation status: Authority subset check with 15 violation codes, fast-check property laws, and human-approval determination implemented in `packages/domain/src/authority/` (Slice 2). Lead task (`lead.plan`) and coordinator flow not yet implemented.
+- Implementation status: Authority subset check with 15 violation codes, fast-check property laws, and human-approval determination implemented in `packages/domain/src/authority/` (Slice 2). Lead tasks (`lead.plan`, `lead.review`, `lead.accept`) implemented via the OpenCode SDK with structured output; `BoundedRepairFlow` coordinator flow implemented (Slice 3). Qualified by the Slice 3 execution trial items 5–7 on 2026-09-07; see [../trials/2026-09-slice3.md](../trials/2026-09-slice3.md).
 
 ## Context
 

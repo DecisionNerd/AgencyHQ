@@ -62,6 +62,8 @@ The schema is defined in ADR-0006. Two rules govern it here:
 2. Widening any bound is a new StepContract version and, where `humanRequired`
    applies, an Approval. Workers cannot request widening; they report Findings.
 
+The Project's **verification profile catalog is an authority ceiling**: the Lead may only choose a `profileId` from this catalog. A proposal naming an unknown profile becomes a `pending_human` decision with `PROFILE_NOT_IN_CATALOG`.
+
 *Implementation: authority subset check with 15 violation codes in `packages/domain/src/authority/subset.ts`; human-approval determination in `packages/domain/src/authority/human-required.ts`; dispatch enforceability in `packages/domain/src/authority/runtime.ts`.*
 
 ## Allocation

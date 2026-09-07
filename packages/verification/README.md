@@ -24,3 +24,7 @@ Package name: `@agencyhq/verification`. Scripts: `typecheck` runs `tsc --noEmit`
 `src/run-profile.ts` exports `runProfile(input)`, which runs all checks in a profile sequentially (regardless of individual failures) and returns one `VerificationResult` per check.
 
 All modules are re-exported from `src/index.ts`. The package depends only on `@agencyhq/contracts` and `@agencyhq/domain`.
+
+## Trial
+
+`verify.run` used the profiles and result builder from this package in the Slice 3 trial on 2026-09-07. Both `pnpm-typecheck@1` and `pnpm-test@1` checks passed on the fixture parser at attempt revision `63a2eb1029468b81af5c3ed2c71fb2bd1b970308`. See [docs/engineering/trials/2026-09-slice3.md](../../docs/engineering/trials/2026-09-slice3.md).

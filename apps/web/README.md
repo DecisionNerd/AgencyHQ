@@ -3,7 +3,7 @@
 React/TypeScript operator interface. Renders coordinator state, submits typed
 commands, and subscribes to Trigger.dev Realtime (scoped public access tokens)
 for live execution state. Links to Trigger runs for raw logs. Owns no policy.
-The minimal return-after-interruption view ships in slice 3.
+The minimal return-after-interruption view ships in Slice 3 and was exercised in the Slice 3 trial on 2026-09-07; see [docs/engineering/trials/2026-09-slice3.md](../../docs/engineering/trials/2026-09-slice3.md).
 
 ## Package
 
