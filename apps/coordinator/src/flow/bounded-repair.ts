@@ -312,6 +312,9 @@ export class BoundedRepairFlow {
         baseRevision,
         worktreeBase: config.worktreeBase,
         authority: projectRow.authority,
+        profileCatalog: Array.isArray(projectRow.profile_catalog)
+          ? (projectRow.profile_catalog as string[])
+          : [],
         ...(wiRow.defect ? { defect: wiRow.defect } : {}),
         operatorIntent: wiRow.intent,
         model: config.leadModel,
