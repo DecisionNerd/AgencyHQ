@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
+import { buildPermissionRuleset } from "../src/lib/opencode.ts";
 import { classifyPaths, matchesGlob, quarantinePatch } from "../src/lib/paths.ts";
 
 const execFileAsync = promisify(execFile);
@@ -41,6 +42,61 @@ test("classifyPaths allows nested paths under a ** pattern", () => {
   });
   assert.deepEqual(allowed, ["src/nested/deep/file.ts"]);
   assert.deepEqual(violations, []);
+});
+
+// ---------------------------------------------------------------------------
+// F-4: classifyPaths with denied list
+// ---------------------------------------------------------------------------
+
+test("classifyPaths: denied glob quarantines a path even when it matches allowed", () => {
+  // src/parser/public-api.ts matches src/parser/** (allowed) but also matches
+  // the specific deny glob — it must be quarantined.
+  const { allowed, violations } = classifyPaths({
+    changed: ["src/parser/public-api.ts", "src/parser/internal.ts"],
+    allowed: ["src/parser/**"],
+    denied: ["src/parser/public-api.ts"],
+  });
+  assert.deepEqual(violations, ["src/parser/public-api.ts"]);
+  assert.deepEqual(allowed, ["src/parser/internal.ts"]);
+});
+
+test("classifyPaths: path in neither allowed nor denied is still a violation", () => {
+  const { allowed, violations } = classifyPaths({
+    changed: ["unrelated/file.ts"],
+    allowed: ["src/**"],
+    denied: ["src/parser/public-api.ts"],
+  });
+  assert.deepEqual(violations, ["unrelated/file.ts"]);
+  assert.deepEqual(allowed, []);
+});
+
+test("classifyPaths: empty denied list behaves the same as omitting denied", () => {
+  const withEmpty = classifyPaths({
+    changed: ["src/a.ts"],
+    allowed: ["src/**"],
+    denied: [],
+  });
+  const withOmit = classifyPaths({
+    changed: ["src/a.ts"],
+    allowed: ["src/**"],
+  });
+  assert.deepEqual(withEmpty, withOmit);
+});
+
+test("buildPermissionRuleset: denied path entry appears after allow in edit map (last-match-wins)", () => {
+  const ruleset = buildPermissionRuleset({
+    allowedPaths: ["src/parser/**"],
+    worktreePath: "/wt",
+    deniedPaths: ["src/parser/public-api.ts"],
+  });
+  const keys = Object.keys(ruleset.edit);
+  const allowIdx = keys.indexOf("src/parser/**");
+  const denyIdx = keys.indexOf("src/parser/public-api.ts");
+  assert.ok(allowIdx !== -1, "allow glob must be in edit map");
+  assert.ok(denyIdx !== -1, "deny glob must be in edit map");
+  assert.ok(denyIdx > allowIdx, "deny entry must appear after allow entry for last-match-wins");
+  assert.equal(ruleset.edit["src/parser/public-api.ts"], "deny");
+  assert.equal(ruleset.edit["src/parser/**"], "allow");
 });
 
 test("quarantinePatch contains the violating file's content", async () => {

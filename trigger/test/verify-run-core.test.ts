@@ -464,3 +464,70 @@ test("verify-run-core.ts does not reference 'report' or 'checksRun' (TESTING.md 
     "verify-run-core.ts must not reference 'checksRun'",
   );
 });
+
+// ---------------------------------------------------------------------------
+// F-6: protectedPaths from payload (single source of truth)
+// ---------------------------------------------------------------------------
+
+// T11: when payload.protectedPaths is absent, DEFAULT_PROTECTED_PATHS are used.
+test("protectedPaths absent: default list catches package.json tamper", async () => {
+  // includeTamperedFile adds package.json — it is in DEFAULT_PROTECTED_PATHS.
+  const fixture = await makeFixture({ includeTamperedFile: true });
+  try {
+    const payload = makePayload(fixture);
+    assert.equal(
+      payload.protectedPaths,
+      undefined,
+      "fixture payload should have no protectedPaths",
+    );
+
+    const { runner } = makeFakeRunner();
+    const deps = makeDeps(runner);
+    const output = await runVerification(payload, deps);
+
+    assert.ok(
+      output.integrity.tamperedPaths.includes("package.json"),
+      `expected package.json in tamperedPaths; got ${JSON.stringify(output.integrity.tamperedPaths)}`,
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+// T12: when payload.protectedPaths is an explicit list, only those paths are checked.
+test("protectedPaths explicit: custom list overrides DEFAULT_PROTECTED_PATHS", async () => {
+  // includeTamperedFile adds package.json, which is in the default list but
+  // NOT in our custom explicit list.
+  const fixture = await makeFixture({ includeTamperedFile: true });
+  try {
+    const payload = makePayload(fixture, {
+      protectedPaths: ["src/critical-verifier.ts"],
+    });
+
+    const { runner } = makeFakeRunner();
+    const deps = makeDeps(runner);
+    const output = await runVerification(payload, deps);
+
+    assert.equal(
+      output.integrity.tamperedPaths.length,
+      0,
+      "package.json must NOT be flagged when it is outside the explicit protectedPaths list",
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+// T13: test/parser/reject.test.ts is flagged by the default list.
+// DEFAULT_PROTECTED_PATHS includes test/** and **/*.test.* — both patterns cover this path.
+test("protectedPaths default: test/parser/reject.test.ts is covered by DEFAULT_PROTECTED_PATHS", async () => {
+  const { DEFAULT_PROTECTED_PATHS } = await import("@agencyhq/domain");
+  const { matchesGlob } = await import("../src/lib/paths.ts");
+
+  const testFilePath = "test/parser/reject.test.ts";
+  const covered = DEFAULT_PROTECTED_PATHS.some((p) => matchesGlob(p, testFilePath));
+  assert.ok(
+    covered,
+    `${testFilePath} must be covered by at least one DEFAULT_PROTECTED_PATHS pattern`,
+  );
+});

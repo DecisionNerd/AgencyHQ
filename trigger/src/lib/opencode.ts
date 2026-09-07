@@ -87,11 +87,20 @@ const DENIED_BASH_PATTERNS = [
 export function buildPermissionRuleset(args: {
   allowedPaths: string[];
   worktreePath: string;
+  /** Glob patterns the worker must NOT edit. Inserted AFTER allows in the edit
+   * map so last-match-wins semantics mirror the on-output `classifyPaths` deny
+   * check. */
+  deniedPaths?: string[];
 }): PermissionRuleset {
   const edit: Record<string, "allow" | "deny"> = { "*": "deny" };
   for (const glob of args.allowedPaths) {
     edit[glob] = "allow";
     edit[`${args.worktreePath}/${glob}`] = "allow";
+  }
+  // Deny entries come after allows (last-match-wins).
+  for (const glob of args.deniedPaths ?? []) {
+    edit[glob] = "deny";
+    edit[`${args.worktreePath}/${glob}`] = "deny";
   }
 
   const bash: Record<string, "allow" | "deny"> = { "*": "allow" };

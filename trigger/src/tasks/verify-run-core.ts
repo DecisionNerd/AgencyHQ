@@ -167,7 +167,13 @@ export async function runVerification(
       worktreePath,
       baseRev: payload.baseRevision,
     });
-    const tamperedFindings = detectVerifierTampering(changed, DEFAULT_PROTECTED_PATHS);
+    // F-6: use the payload's frozen protectedPaths (from the profile, set by the
+    // coordinator) as the single source of truth. Fall back to the domain default
+    // only when the coordinator did not supply the field (older payloads).
+    const tamperedFindings = detectVerifierTampering(
+      changed,
+      payload.protectedPaths ?? DEFAULT_PROTECTED_PATHS,
+    );
     const tamperedPaths = tamperedFindings
       .map((f) => {
         // Extract "path:X" from evidence field.

@@ -10,6 +10,9 @@ import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 
+import type { ContractBounds, PermissionRuleset } from "@agencyhq/contracts";
+import { permissionRulesFor } from "@agencyhq/contracts";
+
 import { assertPushBlocked, scrubbedChildEnv } from "../src/lib/env.ts";
 import { descendants, survivorScan } from "../src/lib/procs.ts";
 import { resolveRunDir, resolveWorktreePath } from "../src/tasks/worker-attempt-core.ts";
@@ -26,6 +29,40 @@ import {
 const execFileAsync = promisify(execFile);
 
 const ALLOWED_PATHS = ["src/**", "docs/**"];
+
+// Trial contract bounds: a small ContractBounds used in basePayload to exercise
+// the contract path (permissionRules present → permissionSource: "contract").
+// The bounds allow edits to src/** and docs/**, and bash commands pnpm test*
+// and git status*.
+const TRIAL_BOUNDS: ContractBounds = {
+  paths: { allow: ALLOWED_PATHS, deny: [] },
+  capabilities: {
+    bash: {
+      allow: ["pnpm test*", "git status*", "git diff*", "pnpm typecheck"],
+      deny: [],
+    },
+    tools: {
+      edit: true,
+      webfetch: false,
+      websearch: false,
+      task: false,
+      external_directory: false,
+      skill: false,
+    },
+  },
+  boundary: "artifact",
+  budget: {
+    maxAttempts: 3,
+    maxDurationSeconds: 300,
+    estimatedSpendUsd: 0.5,
+  },
+  review: "lead_inspection",
+  changeClass: "behavior",
+  models: {
+    worker: "openai/gpt-5.6-terra",
+    reviewer: "openai/gpt-5.6-terra",
+  },
+};
 
 function evidence(line: string): void {
   console.log(`EVIDENCE ${line}`);
@@ -77,6 +114,13 @@ type TrialContext = {
 };
 
 function basePayload(ctx: TrialContext, attemptId: string, prompt: string): WorkerAttemptPayload {
+  // Build the contract ruleset via permissionRulesFor so a future live run
+  // exercises the "contract" path (permissionSource: "contract") rather than
+  // the spike fallback. The worktreePath is not known at payload-build time;
+  // we use a placeholder — the real path is filled in by the task when it
+  // creates the worktree (the task calls enforceAlwaysDeny then writeRunConfig).
+  const worktreePath = `${ctx.worktreeBase}/attempts/${attemptId}`;
+  const permissionRules: PermissionRuleset = permissionRulesFor(TRIAL_BOUNDS, { worktreePath });
   return {
     attemptId,
     repoPath: ctx.repoPath,
@@ -84,7 +128,48 @@ function basePayload(ctx: TrialContext, attemptId: string, prompt: string): Work
     prompt,
     allowedPaths: ALLOWED_PATHS,
     worktreeBase: ctx.worktreeBase,
+    bounds: TRIAL_BOUNDS,
+    permissionRules,
   };
+}
+
+/**
+ * Trial item 4d assertion helper (do NOT run — static analysis only).
+ *
+ * Reads the opencode.worker.json produced by a completed trial run and
+ * asserts that the applied ruleset came from the contract (not the spike
+ * fallback). Specifically:
+ *   - bash["*"] === "deny"  (contract path has bash default deny when
+ *     bash.allow is non-empty, vs spike's "allow")
+ *   - The allow entries match the contract's bash.allow list.
+ *
+ * @param runDir - The run directory produced by worker-attempt.ts.
+ */
+async function assertRulesetFromContract(runDir: string): Promise<void> {
+  const configPath = `${runDir}/opencode.worker.json`;
+  const raw = await readFile(configPath, "utf8");
+  const config = JSON.parse(raw) as {
+    permission?: { bash?: Record<string, string> };
+  };
+  const bash = config.permission?.bash ?? {};
+
+  if (bash["*"] !== "deny") {
+    throw new Error(
+      `assertRulesetFromContract: expected bash["*"] === "deny" (contract path), got "${bash["*"]}".\n` +
+        `This means the spike fallback was used instead of the contract ruleset.\n` +
+        `Config at: ${configPath}`,
+    );
+  }
+
+  const contractAllows = TRIAL_BOUNDS.capabilities.bash.allow;
+  for (const pattern of contractAllows) {
+    if (bash[pattern] !== "allow") {
+      throw new Error(
+        `assertRulesetFromContract: expected bash["${pattern}"] === "allow", got "${bash[pattern] ?? "(missing)"}".\n` +
+          `Config at: ${configPath}`,
+      );
+    }
+  }
 }
 
 // --- Item 1: dropped-response idempotency ------------------------------
