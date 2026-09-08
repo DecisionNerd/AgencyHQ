@@ -8,6 +8,12 @@
 export { ackVisit, lastAckAt } from "./ack-visit.ts";
 export type { ApproveDeps } from "./approve.ts";
 export { approveWorkItem } from "./approve.ts";
+export {
+  assignCampaign,
+  createCampaign,
+  setMainEffort,
+  setWorkItemRank,
+} from "./campaign.ts";
 export { confirmStop, readStopEvidence } from "./confirm-stop.ts";
 export { createWorkItem } from "./create-work-item.ts";
 export type {
@@ -17,19 +23,26 @@ export type {
   DispositionValue,
 } from "./disposition.ts";
 export { dispositionFinding } from "./disposition.ts";
+export { invalidateAcceptance } from "./invalidate-acceptance.ts";
 export { pauseWorkItem, resumeWorkItem } from "./pause.ts";
+export { rejectWorkItem } from "./reject.ts";
 export type { CommandDeps } from "./stop.ts";
 export { stopAttempt } from "./stop.ts";
+export { updateAuthority } from "./update-authority.ts";
 
 import { ackVisit, lastAckAt } from "./ack-visit.ts";
 import type { ApproveDeps } from "./approve.ts";
 import { approveWorkItem } from "./approve.ts";
+import { assignCampaign, createCampaign, setMainEffort, setWorkItemRank } from "./campaign.ts";
 import { confirmStop } from "./confirm-stop.ts";
 import { createWorkItem } from "./create-work-item.ts";
 import type { DispositionDeps } from "./disposition.ts";
 import { dispositionFinding } from "./disposition.ts";
+import { invalidateAcceptance } from "./invalidate-acceptance.ts";
 import { pauseWorkItem, resumeWorkItem } from "./pause.ts";
+import { rejectWorkItem } from "./reject.ts";
 import { stopAttempt } from "./stop.ts";
+import { updateAuthority } from "./update-authority.ts";
 
 export function commandHandlers(deps: ApproveDeps & DispositionDeps) {
   return {
@@ -46,5 +59,14 @@ export function commandHandlers(deps: ApproveDeps & DispositionDeps) {
     disposition: (input: Parameters<typeof dispositionFinding>[1]) =>
       dispositionFinding(deps, input),
     lastAckAt,
+    // Control-plane commands (slice 5)
+    reject: (input: Parameters<typeof rejectWorkItem>[1]) => rejectWorkItem(deps, input),
+    invalidateAcceptance: (input: Parameters<typeof invalidateAcceptance>[1]) =>
+      invalidateAcceptance(deps, input),
+    createCampaign: (input: Parameters<typeof createCampaign>[1]) => createCampaign(deps, input),
+    assignCampaign: (input: Parameters<typeof assignCampaign>[1]) => assignCampaign(deps, input),
+    setMainEffort: (input: Parameters<typeof setMainEffort>[1]) => setMainEffort(deps, input),
+    setWorkItemRank: (input: Parameters<typeof setWorkItemRank>[1]) => setWorkItemRank(deps, input),
+    updateAuthority: (input: Parameters<typeof updateAuthority>[1]) => updateAuthority(deps, input),
   };
 }

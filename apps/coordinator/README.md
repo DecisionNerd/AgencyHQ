@@ -50,6 +50,38 @@ Integration tests use `withTestSchema` (isolated Postgres schema per test) and `
 DATABASE_URL=postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test pnpm --filter @agencyhq/coordinator test:integration
 ```
 
+## Control-plane API (slice 5)
+
+### Routes
+
+All routes require `Authorization: Bearer <token>`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/overview` | Campaigns with main effort, projects, work items ranked by `rank` with lifecycle/condition/boundary/pending decision count |
+| `GET` | `/api/decisions` | Every `pending_human` decision with obstacle, recommendation, impact, no-action consequence, and available actions |
+| `GET` | `/api/work-items/:id/evidence` | Artifacts, verification results, reviews, findings, decisions, approvals, integrations, manifest rows, attempts with run ids |
+| `GET` | `/api/projects/:id/authority` | Current authority version plus full history from `authority_versions` |
+| `PUT` | `/api/projects/:id/authority` | Body `{ commandId, authority, actor }` — dispatches `update_authority` command |
+
+### Commands (POST /api/commands)
+
+All commands are idempotent by `commandId` (R-010). Repeated delivery with the same id returns `replayed: true`.
+
+| `kind` | Required fields | Effect |
+|--------|-----------------|--------|
+| `reject` | `workItemId`, `decisionId`, `reason` | Pending decision becomes `rejected`; work item lifecycle set to `halted` |
+| `invalidate_acceptance` | `workItemId`, `attemptId`, `reason` | Inserts new decision of kind `invalidate` referencing historical accept; work item lifecycle set to `reopened`; historical rows untouched (R-017) |
+| `create_campaign` | `name` | Creates a campaign; returns `campaignId` (`cmp-<commandId[:8]>`) |
+| `assign_campaign` | `workItemId`, `campaignId` | Sets `campaign_id` on the work item |
+| `set_main_effort` | `campaignId`, `workItemId` | Sets `main_effort_work_item_id` on the campaign |
+| `set_rank` | `workItemId`, `rank`, `expectedVersion` | Updates work item rank; returns `{ ok: false, reason: "stale_version" }` if current version does not match |
+| `update_authority` | `projectId`, `authority`, `actor` | Validated with `AuthoritySchema`; version must increase numerically; stored on project and appended to `authority_versions`; inserts `authority_update` decision; frozen contract digests/bounds untouched |
+
+### Schema note
+
+`campaigns`, `work_items.campaign_id`, and `authority_versions` are introduced by migration 0004 (absent in this worktree). Integration tests apply the DDL via `withControlPlaneSchema` in `apps/coordinator/test/helpers/control-plane-schema.ts` — never in `packages/db`.
+
 ## Network isolation
 
 The coordinator binds to `AGENCYHQ_BIND_HOST` (default `127.0.0.1`). All
