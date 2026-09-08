@@ -702,6 +702,19 @@ export async function finalizeAcceptedAttempt(
 }
 
 // ---------------------------------------------------------------------------
+// LeadHandlerResult
+// ---------------------------------------------------------------------------
+
+/**
+ * Result returned by onReviewFinal and onAcceptFinal.
+ *
+ * ok: false means the handler already handled the failure (failure row recorded,
+ * intent closed as 'failed', retry dispatched or pending_human recorded);
+ * the reconciler must NOT call closeIntent('observed') for this observation.
+ */
+export type LeadHandlerResult = { ok: true } | { ok: false };
+
+// ---------------------------------------------------------------------------
 // BoundedRepairFlow
 // ---------------------------------------------------------------------------
 
@@ -1279,7 +1292,121 @@ export class BoundedRepairFlow {
       if (classification.attemptStatus === "completed") {
         const workerOutput = WorkerAttemptOutputSchema.safeParse(obs.output);
         if (!workerOutput.success) {
-          throw new Error(`Invalid worker output: ${workerOutput.error.message}`);
+          // COMPLETED run with schema-invalid output: record execution failure,
+          // mark attempt failed, close intent failed, and let budget-based retry
+          // decide on a new attempt — never throw (R-004).
+          const invalidCause = `execution output schema invalid: ${workerOutput.error.message.slice(0, 400)} (run ${obs.runId})`;
+          const invalidFailureId = ids.next("fail") as FailureId;
+          const invalidBudget = attemptRow.budget_remaining - 1;
+
+          await client.query("BEGIN");
+          await client.query(
+            `INSERT INTO failures (id, class, phase, attempt_id, run_id, cause)
+             VALUES ($1, 'execution', 'final', $2, $3, $4)`,
+            [String(invalidFailureId), attemptRow.id, obs.runId, invalidCause],
+          );
+          const { rowCount: invalidFailedRows } = await client.query(
+            "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1 AND status IN ('admitted','dispatched','running')",
+            [attemptRow.id, String(invalidFailureId)],
+          );
+          if (!invalidFailedRows) {
+            await client.query("ROLLBACK");
+            await completeCommand(client, commandId, { skipped: "stale_status" });
+            return;
+          }
+
+          if (invalidBudget > 0) {
+            // Budget allows a new attempt.
+            const invalidNewAttemptId = ids.next("att") as AttemptId;
+            const invalidWorktreePath = `${config.worktreeBase}/${String(invalidNewAttemptId)}`;
+            const invalidNewPayload = WorkerAttemptPayloadSchema.parse({
+              attemptId: String(invalidNewAttemptId),
+              generation: 1,
+              contractId: contractRow.id,
+              contractVersion: String(contractRow.version),
+              repoPath: projectRow.clone_path ?? config.worktreeBase,
+              baseRev: contractRow.base_revision,
+              prompt: contractRow.inputs?.intent ?? "",
+              allowedPaths: contractRow.bounds.paths.allow,
+              bounds: contractRow.bounds,
+              permissionRules: permissionRulesFor(contractRow.bounds, {
+                worktreePath: invalidWorktreePath,
+              }),
+              model: config.workerModel,
+              worktreeBase: config.worktreeBase,
+            });
+            const invalidNewIntentId = ids.next("di") as DispatchIntentId;
+            const invalidNewIntentKey = `${String(invalidNewIntentId)}:g1`;
+
+            await client.query(
+              `INSERT INTO attempts
+                 (id, contract_id, contract_version, generation, status, budget_remaining)
+               VALUES ($1, $2, $3, 1, 'admitted', $4)`,
+              [String(invalidNewAttemptId), contractRow.id, contractRow.version, invalidBudget],
+            );
+            await client.query(
+              `INSERT INTO dispatch_intents
+                 (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
+               VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+              [
+                String(invalidNewIntentId),
+                TASK_IDS.workerAttempt,
+                String(digestOf(invalidNewPayload)),
+                String(invalidNewAttemptId),
+                invalidNewIntentKey,
+              ],
+            );
+            await client.query(
+              "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+              [workerIntentRow.id],
+            );
+            await client.query("COMMIT");
+
+            const { runId: invalidNewRunId } = await runtime.trigger({
+              intentId: invalidNewIntentId,
+              task: TASK_IDS.workerAttempt,
+              payload: invalidNewPayload,
+              options: {
+                idempotencyKey: invalidNewIntentKey,
+                maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+                concurrencyKey: contractRow.project_id,
+                tags: triggerTags({
+                  projectId: contractRow.project_id,
+                  workItemId: contractRow.work_item_id,
+                  contractId: contractRow.id,
+                  contractVersion: contractRow.version,
+                  attemptId: String(invalidNewAttemptId),
+                }),
+              },
+            });
+            await pool.query(
+              "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+              [String(invalidNewIntentId), invalidNewRunId],
+            );
+            await pool.query(
+              "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",
+              [String(invalidNewAttemptId), invalidNewRunId],
+            );
+            await completeCommand(client, commandId, {
+              failureId: String(invalidFailureId),
+              invalidOutput: true,
+              newAttemptId: String(invalidNewAttemptId),
+              newRunId: invalidNewRunId,
+            });
+          } else {
+            // Budget exhausted — just close the intent as failed.
+            await client.query(
+              "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+              [workerIntentRow.id],
+            );
+            await client.query("COMMIT");
+            await completeCommand(client, commandId, {
+              failureId: String(invalidFailureId),
+              invalidOutput: true,
+              budgetExhausted: true,
+            });
+          }
+          return;
         }
         const output = workerOutput.data;
 
@@ -1879,13 +2006,18 @@ export class BoundedRepairFlow {
   // onReviewFinal
   // -------------------------------------------------------------------------
 
-  async onReviewFinal(obs: RunObservation, commandId: string): Promise<void> {
+  async onReviewFinal(obs: RunObservation, commandId: string): Promise<LeadHandlerResult> {
     const { pool, runtime, ids, config, profileResolver } = this.deps;
 
     const client = await pool.connect();
     try {
       const claim = await claimCommand(client, commandId, "onReviewFinal");
-      if (!claim.claimed) return;
+      if (!claim.claimed) {
+        // Return stored result on replay; treat in-flight (null) as ok:true.
+        const stored = claim.result as { ok?: boolean } | null;
+        if (stored?.ok === false) return { ok: false };
+        return { ok: true };
+      }
 
       const intentRow = await loadIntentByRunAndTask(pool, obs.runId, TASK_IDS.leadReview);
       if (!intentRow.attempt_id) throw new Error(`Intent ${intentRow.id} has no attempt_id`);
@@ -1894,14 +2026,125 @@ export class BoundedRepairFlow {
       const contractRow = await loadContract(pool, attemptRow.contract_id);
       const artifactRow = await loadArtifact(pool, attemptRow.id);
       const resolvedProfile = await profileResolver(contractRow.profile_id);
+      // Load these for both the success path and the failure retry path.
+      const verificationResults = await loadVerificationResults(pool, attemptRow.id);
+      const projectRow = await loadProject(pool, contractRow.project_id);
 
       const reviewOutput = ReviewOutputSchema.safeParse(obs.output);
-      if (!reviewOutput.success) {
-        throw new Error(`Invalid review output: ${reviewOutput.error.message}`);
-      }
-      const review = reviewOutput.data;
 
-      const verificationResults = await loadVerificationResults(pool, attemptRow.id);
+      // Invalid output or non-COMPLETED run → record failure, close intent, dispatch retry
+      // or record pending_human; never throw (R-004, R-007, R-010).
+      if (obs.status !== "COMPLETED" || !reviewOutput.success) {
+        const cause = !reviewOutput.success
+          ? `schema validation failed: ${reviewOutput.error.message.slice(0, 200)} (run ${obs.runId})`
+          : `run status ${obs.status} (run ${obs.runId})`;
+
+        const isRetry = intentRow.idempotency_key.endsWith(":r1");
+
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO failures (id, class, phase, attempt_id, run_id, cause, evidence)
+           VALUES ($1, 'execution', 'review', $2, $3, $4, $5)`,
+          [
+            String(ids.next("fl")),
+            attemptRow.id,
+            obs.runId,
+            cause,
+            JSON.stringify({ status: obs.status, observedAt: obs.observedAt }),
+          ],
+        );
+
+        if (!isRetry) {
+          // First failure: dispatch a bounded retry with idempotency key <intentId>:r1.
+          const retryIntentId = ids.next("di") as DispatchIntentId;
+          const retryKey = `${intentRow.id}:r1`;
+          const retryPayload = LeadReviewPayloadSchema.parse({
+            attemptId: attemptRow.id,
+            generation: attemptRow.generation,
+            contractId: contractRow.id,
+            criteria: contractRow.criteria,
+            criteriaDigest: contractRow.criteria_digest,
+            profileDigest: resolvedProfile.digest,
+            attemptRevision: artifactRow?.revision ?? "",
+            diffDigest: artifactRow?.diff_digest ?? "",
+            patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
+            verificationResults,
+            model: config.reviewerModel,
+            repoPath: projectRow.clone_path ?? config.worktreeBase,
+            worktreeBase: config.worktreeBase,
+            baseRevision: contractRow.base_revision,
+          });
+
+          // ON CONFLICT ensures idempotency across reconciler replays.
+          await client.query(
+            `INSERT INTO dispatch_intents
+               (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
+             VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)
+             ON CONFLICT (idempotency_key) DO NOTHING`,
+            [
+              String(retryIntentId),
+              TASK_IDS.leadReview,
+              String(digestOf(retryPayload)),
+              attemptRow.id,
+              retryKey,
+            ],
+          );
+          await client.query(
+            "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+            [intentRow.id],
+          );
+          await client.query("COMMIT");
+
+          // Trigger the retry; ON CONFLICT idempotency key handles re-triggers.
+          const { runId: retryRunId } = await runtime.trigger({
+            intentId: retryIntentId,
+            task: TASK_IDS.leadReview,
+            payload: retryPayload,
+            options: {
+              idempotencyKey: retryKey,
+              maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+              concurrencyKey: contractRow.project_id,
+              tags: triggerTags({
+                projectId: contractRow.project_id,
+                workItemId: contractRow.work_item_id,
+                contractId: contractRow.id,
+                contractVersion: contractRow.version,
+                attemptId: attemptRow.id,
+              }),
+            },
+          });
+          await pool.query(
+            "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+            [String(retryIntentId), retryRunId],
+          );
+        } else {
+          // Retry also failed: record pending_human decision and stop.
+          const decisionId = ids.next("dec") as DecisionId;
+          await client.query(
+            `INSERT INTO decisions
+               (id, kind, actor, work_item_id, contract_id, contract_version, attempt_id, outcome, causation_id, at)
+             VALUES ($1, 'review', 'coordinator', $2, $3, $4, $5, 'pending_human', $6, now())`,
+            [
+              String(decisionId),
+              contractRow.work_item_id,
+              contractRow.id,
+              contractRow.version,
+              attemptRow.id,
+              intentRow.id,
+            ],
+          );
+          await client.query(
+            "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+            [intentRow.id],
+          );
+          await client.query("COMMIT");
+        }
+
+        await completeCommand(client, commandId, { ok: false });
+        return { ok: false };
+      }
+
+      const review = reviewOutput.data;
 
       const acceptIntentId = ids.next("di") as DispatchIntentId;
       const acceptPayload = LeadAcceptPayloadSchema.parse({
@@ -1986,6 +2229,7 @@ export class BoundedRepairFlow {
         acceptIntentId: String(acceptIntentId),
         acceptRunId,
       });
+      return { ok: true };
     } catch (err) {
       try {
         await client.query("ROLLBACK");
@@ -2002,21 +2246,187 @@ export class BoundedRepairFlow {
   // onAcceptFinal
   // -------------------------------------------------------------------------
 
-  async onAcceptFinal(obs: RunObservation, commandId: string): Promise<void> {
-    const { pool, ids, config, profileResolver } = this.deps;
+  async onAcceptFinal(obs: RunObservation, commandId: string): Promise<LeadHandlerResult> {
+    const { pool, runtime, ids, config, profileResolver } = this.deps;
 
     const client = await pool.connect();
     try {
       const claim = await claimCommand(client, commandId, "onAcceptFinal");
-      if (!claim.claimed) return;
+      if (!claim.claimed) {
+        // Return stored result on replay; treat in-flight (null) as ok:true.
+        const stored = claim.result as { ok?: boolean } | null;
+        if (stored?.ok === false) return { ok: false };
+        return { ok: true };
+      }
 
       const intentRow = await loadIntentByRunAndTask(pool, obs.runId, TASK_IDS.leadAccept);
       if (!intentRow.attempt_id) throw new Error(`Intent ${intentRow.id} has no attempt_id`);
 
       const proposalResult = AcceptanceProposalSchema.safeParse(obs.output);
-      if (!proposalResult.success) {
-        throw new Error(`Invalid acceptance proposal: ${proposalResult.error.message}`);
+
+      // Invalid output or non-COMPLETED run → failure path (R-004, R-007, R-010).
+      if (obs.status !== "COMPLETED" || !proposalResult.success) {
+        const cause = !proposalResult.success
+          ? `schema validation failed: ${proposalResult.error.message.slice(0, 200)} (run ${obs.runId})`
+          : `run status ${obs.status} (run ${obs.runId})`;
+
+        const isRetry = intentRow.idempotency_key.endsWith(":r1");
+
+        // Load data needed for failure record and retry dispatch.
+        const failAttemptRow = await loadAttempt(pool, intentRow.attempt_id);
+        const failContractRow = await loadContract(pool, failAttemptRow.contract_id);
+
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO failures (id, class, phase, attempt_id, run_id, cause, evidence)
+           VALUES ($1, 'execution', 'accept', $2, $3, $4, $5)`,
+          [
+            String(ids.next("fl")),
+            failAttemptRow.id,
+            obs.runId,
+            cause,
+            JSON.stringify({ status: obs.status, observedAt: obs.observedAt }),
+          ],
+        );
+
+        if (!isRetry) {
+          // First failure: reconstruct accept payload and dispatch bounded retry.
+          const failArtifactRow = await loadArtifact(pool, failAttemptRow.id);
+          const failResolvedProfile = await profileResolver(failContractRow.profile_id);
+          const failVerificationResults = await loadVerificationResults(pool, failAttemptRow.id);
+          const failReviewRow = await loadReview(pool, failAttemptRow.id);
+
+          if (failReviewRow) {
+            // Reconstruct ReviewOutput from stored review row.
+            const failReview = {
+              reviewer: { model: failReviewRow.reviewer_model ?? config.reviewerModel },
+              subject: {
+                attemptRevision: failReviewRow.attempt_revision ?? "",
+                diffDigest: (failReviewRow.diff_digest ?? "") as Digest,
+                criteriaDigest: (failReviewRow.criteria_digest ?? "") as Digest,
+                profileDigest: (failReviewRow.profile_digest ?? "") as Digest,
+              },
+              findings: (failReviewRow.findings ?? []) as Array<{
+                id: string;
+                severity: "blocking" | "non_blocking";
+                kind:
+                  | "unmet_criterion"
+                  | "weakened_check"
+                  | "verifier_tampered"
+                  | "scope_violation"
+                  | "defect"
+                  | "style"
+                  | "unrelated";
+                description: string;
+                evidence: string;
+              }>,
+            };
+
+            const retryIntentId = ids.next("di") as DispatchIntentId;
+            const retryKey = `${intentRow.id}:r1`;
+            const retryPayload = LeadAcceptPayloadSchema.parse({
+              attemptId: failAttemptRow.id,
+              generation: failAttemptRow.generation,
+              contractId: failContractRow.id,
+              criteria: failContractRow.criteria,
+              criteriaDigest: failContractRow.criteria_digest,
+              profileDigest: failResolvedProfile.digest,
+              attemptRevision: failArtifactRow?.revision ?? "",
+              diffDigest: failArtifactRow?.diff_digest ?? "",
+              verificationResults: failVerificationResults,
+              review: failReview,
+              model: config.leadModel,
+            });
+
+            await client.query(
+              `INSERT INTO dispatch_intents
+                 (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
+               VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)
+               ON CONFLICT (idempotency_key) DO NOTHING`,
+              [
+                String(retryIntentId),
+                TASK_IDS.leadAccept,
+                String(digestOf(retryPayload)),
+                failAttemptRow.id,
+                retryKey,
+              ],
+            );
+            await client.query(
+              "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+              [intentRow.id],
+            );
+            await client.query("COMMIT");
+
+            const { runId: retryRunId } = await runtime.trigger({
+              intentId: retryIntentId,
+              task: TASK_IDS.leadAccept,
+              payload: retryPayload,
+              options: {
+                idempotencyKey: retryKey,
+                maxDurationSeconds: failContractRow.bounds.budget.maxDurationSeconds,
+                concurrencyKey: failContractRow.project_id,
+                tags: triggerTags({
+                  projectId: failContractRow.project_id,
+                  workItemId: failContractRow.work_item_id,
+                  contractId: failContractRow.id,
+                  contractVersion: failContractRow.version,
+                  attemptId: failAttemptRow.id,
+                }),
+              },
+            });
+            await pool.query(
+              "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+              [String(retryIntentId), retryRunId],
+            );
+          } else {
+            // No review row → cannot rebuild payload; escalate to pending_human.
+            const decisionId = ids.next("dec") as DecisionId;
+            await client.query(
+              `INSERT INTO decisions
+                 (id, kind, actor, work_item_id, contract_id, contract_version, attempt_id, outcome, causation_id, at)
+               VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'pending_human', $6, now())`,
+              [
+                String(decisionId),
+                failContractRow.work_item_id,
+                failContractRow.id,
+                failContractRow.version,
+                failAttemptRow.id,
+                intentRow.id,
+              ],
+            );
+            await client.query(
+              "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+              [intentRow.id],
+            );
+            await client.query("COMMIT");
+          }
+        } else {
+          // Retry also failed: record pending_human decision and stop.
+          const decisionId = ids.next("dec") as DecisionId;
+          await client.query(
+            `INSERT INTO decisions
+               (id, kind, actor, work_item_id, contract_id, contract_version, attempt_id, outcome, causation_id, at)
+             VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'pending_human', $6, now())`,
+            [
+              String(decisionId),
+              failContractRow.work_item_id,
+              failContractRow.id,
+              failContractRow.version,
+              failAttemptRow.id,
+              intentRow.id,
+            ],
+          );
+          await client.query(
+            "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+            [intentRow.id],
+          );
+          await client.query("COMMIT");
+        }
+
+        await completeCommand(client, commandId, { ok: false });
+        return { ok: false };
       }
+
       const proposal = proposalResult.data;
 
       // Use shared acceptance-evaluation function (also used by the approve command).
@@ -2060,7 +2470,7 @@ export class BoundedRepairFlow {
           humanRequired: true,
           decisionId: String(decisionId),
         });
-        return;
+        return { ok: true };
       }
 
       if (acceptResult.ok) {
@@ -2095,6 +2505,7 @@ export class BoundedRepairFlow {
             revision: ctx.artifactRevision,
           });
         }
+        return { ok: true };
       } else {
         await client.query("BEGIN");
         await client.query(
@@ -2131,6 +2542,7 @@ export class BoundedRepairFlow {
           decisionId: String(decisionId),
           reasons: acceptResult.reasons,
         });
+        return { ok: true };
       }
     } catch (err) {
       try {
