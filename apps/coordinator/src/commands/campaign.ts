@@ -8,19 +8,17 @@
  * All commands are idempotent by commandId (R-010).
  *
  * DB repos used: insertCampaign, getCampaign, assignWorkItemToCampaign,
- * getWorkItem, setWorkItemRank (from @agencyhq/db).
+ * getWorkItem, setWorkItemRank, setMainEffort (from @agencyhq/db).
  *
- * Note on setMainEffort: the db repo setMainEffort enforces that the work item
- * must already belong to the campaign (campaign_id match). This command uses
- * getCampaign for existence check and raw SQL for the update to preserve the
- * existing permissive semantics (set main_effort_work_item_id regardless of
- * campaign membership, mirroring the original coordinator behavior).
+ * Note on setMainEffort: uses the db repo which enforces membership — the work
+ * item must already belong to the campaign. Returns not_a_member otherwise.
  */
 
 import {
   assignWorkItemToCampaign,
   claimCommand,
   completeCommand,
+  setMainEffort as dbSetMainEffort,
   setWorkItemRank as dbSetWorkItemRank,
   getCampaign,
   getWorkItem,
@@ -135,7 +133,7 @@ export type SetMainEffortInput = {
 
 export type SetMainEffortResult =
   | { ok: true; replayed?: boolean }
-  | { ok: false; reason: "not_found"; replayed?: boolean };
+  | { ok: false; reason: "not_found" | "not_a_member"; replayed?: boolean };
 
 export async function setMainEffort(
   deps: CampaignDeps,
@@ -151,21 +149,16 @@ export async function setMainEffort(
       return { ...stored, replayed: true };
     }
 
-    // Check campaign exists via db repo
-    const campaign = await getCampaign(client, campaignId);
-    if (!campaign) {
-      const result: SetMainEffortResult = { ok: false, reason: "not_found" };
+    // Use db repo which enforces campaign membership guard (T-8).
+    const outcome = await dbSetMainEffort(client, campaignId, workItemId);
+
+    if (!outcome.ok) {
+      const reason: "not_found" | "not_a_member" =
+        outcome.reason === "campaign_not_found" ? "not_found" : "not_a_member";
+      const result: SetMainEffortResult = { ok: false, reason };
       await completeCommand(client, commandId, result);
       return result;
     }
-
-    // Update main_effort_work_item_id directly — permissive: does not require
-    // the work item to already belong to the campaign (db.setMainEffort enforces
-    // that guard; this command intentionally does not to preserve existing behavior).
-    await client.query(
-      `UPDATE campaigns SET main_effort_work_item_id = $1, updated_at = now() WHERE id = $2`,
-      [workItemId, campaignId],
-    );
 
     const result: SetMainEffortResult = { ok: true };
     await completeCommand(client, commandId, result);

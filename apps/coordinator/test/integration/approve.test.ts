@@ -678,11 +678,17 @@ test("approve(ii): wrong attemptRevision → APPROVAL_VERSION_MISMATCH, work ite
       const { rows: approvalRows } = await client.query<{ id: string }>("SELECT id FROM approvals");
       assert.equal(approvalRows.length, 0, "no approvals row on mismatch");
 
-      // A rejected decision recorded.
-      const { rows: rejectedRows } = await client.query<{ outcome: string }>(
-        "SELECT outcome FROM decisions WHERE kind = 'accept' AND outcome = 'rejected'",
+      // An approval_mismatch decision recorded (T-4: not 'rejected', so pending remains open).
+      const { rows: mismatchRows } = await client.query<{ outcome: string }>(
+        "SELECT outcome FROM decisions WHERE kind = 'accept' AND outcome = 'approval_mismatch'",
       );
-      assert.equal(rejectedRows.length, 1, "rejected decision recorded");
+      assert.equal(mismatchRows.length, 1, "approval_mismatch decision recorded");
+
+      // The pending_human decision remains open (not resolved by mismatch — T-4).
+      const { rows: pendingRows } = await client.query<{ outcome: string }>(
+        "SELECT outcome FROM decisions WHERE kind = 'accept' AND outcome = 'pending_human'",
+      );
+      assert.equal(pendingRows.length, 1, "pending_human decision still open after mismatch");
     } finally {
       await pool.end();
     }

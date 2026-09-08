@@ -20,7 +20,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { claimCommand, completeCommand } from "@agencyhq/db";
+import { claimCommand, completeCommand, insertDecision } from "@agencyhq/db";
 import type pg from "pg";
 
 // ---------------------------------------------------------------------------
@@ -50,7 +50,7 @@ export async function invalidateAcceptance(
   deps: InvalidateAcceptanceDeps,
   input: InvalidateAcceptanceInput,
 ): Promise<InvalidateAcceptanceResult> {
-  const { commandId, workItemId, attemptId } = input;
+  const { commandId, workItemId, attemptId, reason } = input;
   const client = await deps.pool.connect();
 
   try {
@@ -99,22 +99,18 @@ export async function invalidateAcceptance(
     await client.query("BEGIN");
     try {
       // Insert new invalidation decision (kind = "invalidate", references historic accept)
-      await client.query(
-        `INSERT INTO decisions
-           (id, kind, actor, work_item_id, attempt_id, causation_id, command_id, outcome, at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [
-          invalidationDecisionId,
-          "invalidate",
-          "coordinator",
-          workItemId,
-          attemptId,
-          historicAcceptDecisionId, // causation_id references historic accept decision
-          commandId,
-          "invalidated",
-          now,
-        ],
-      );
+      await insertDecision(client, {
+        id: invalidationDecisionId,
+        kind: "invalidate",
+        actor: "coordinator",
+        work_item_id: workItemId,
+        attempt_id: attemptId,
+        causation_id: historicAcceptDecisionId, // references historic accept decision
+        command_id: commandId,
+        outcome: "invalidated",
+        reason,
+        at: now,
+      });
 
       // Update work item lifecycle to reopened
       const { rows: wiRows } = await client.query<{ lifecycle: string }>(

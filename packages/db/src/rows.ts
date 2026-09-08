@@ -240,6 +240,10 @@ export const DecisionRowSchema = z
     causation_id: NullableText,
     command_id: NullableText,
     outcome: NullableText,
+    reason: z
+      .string()
+      .nullish()
+      .transform((v) => v ?? null),
     at: z.date(),
   })
   .merge(Timestamps);

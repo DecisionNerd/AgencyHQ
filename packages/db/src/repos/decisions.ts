@@ -20,6 +20,7 @@ export interface DecisionInsert {
   causation_id?: string | null;
   command_id?: string | null;
   outcome?: string | null;
+  reason?: string | null;
   at: Date;
 }
 
@@ -31,8 +32,8 @@ export async function insertDecision(
   const { rows } = await client.query<DecisionRow>(
     `INSERT INTO decisions
        (id, kind, actor, proposal_digest, authority_version, work_item_id,
-        contract_id, contract_version, attempt_id, causation_id, command_id, outcome, at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        contract_id, contract_version, attempt_id, causation_id, command_id, outcome, reason, at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      RETURNING *`,
     [
       row.id,
@@ -47,6 +48,7 @@ export async function insertDecision(
       row.causation_id ?? null,
       row.command_id ?? null,
       row.outcome ?? null,
+      row.reason ?? null,
       row.at,
     ],
   );

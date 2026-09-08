@@ -82,9 +82,10 @@ export async function approveWorkItem(
     }
 
     // 2. Load the pending accept decision for this work item.
-    // S-16: only match the pending_human decision when no approved/rejected decision
+    // S-16: only match the pending_human decision when no resolving decision
     // already exists for the same attempt — a second approve with a fresh commandId
     // must return state_mismatch rather than re-run finalizeAcceptedAttempt.
+    // approval_mismatch is NOT a resolving outcome — the pending decision remains open.
     const { rows: decisionRows } = await client.query<{ id: string; attempt_id: string | null }>(
       `SELECT d.id, d.attempt_id FROM decisions d
        WHERE d.work_item_id = $1 AND d.kind = 'accept' AND d.outcome = 'pending_human'
@@ -92,7 +93,7 @@ export async function approveWorkItem(
            SELECT 1 FROM decisions d2
            WHERE d2.attempt_id = d.attempt_id
              AND d2.kind = 'accept'
-             AND d2.outcome IN ('approved', 'rejected')
+             AND d2.outcome IN ('approved', 'rejected', 'accepted', 'invalidated')
          )
        ORDER BY d.at DESC LIMIT 1`,
       [workItemId],
@@ -217,12 +218,13 @@ export async function approveWorkItem(
 
       await client.query("BEGIN");
       try {
-        // Insert rejection decision (outcome=rejected).
+        // Insert approval_mismatch decision — not a resolving outcome, so the
+        // pending_human decision remains open for a corrected approve. (T-4)
         await client.query(
           `INSERT INTO decisions
              (id, kind, actor, work_item_id, contract_id, contract_version, attempt_id,
               causation_id, command_id, outcome, at)
-           VALUES ($1, 'accept', 'human', $2, $3, $4, $5, $6, $6, 'rejected', $7)`,
+           VALUES ($1, 'accept', 'human', $2, $3, $4, $5, $6, $6, 'approval_mismatch', $7)`,
           [
             decisionId,
             ctx.workItemId,

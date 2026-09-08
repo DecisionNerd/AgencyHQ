@@ -56,6 +56,7 @@ export type EvidenceDecisionLike = {
   kind: string;
   actor: string;
   outcome: string | null;
+  reason?: string | null;
   contractVersion?: number | null;
   attemptId?: string | null;
   at: string;
