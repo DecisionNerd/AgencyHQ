@@ -157,6 +157,22 @@ export class Reconciler {
         try {
           if (intent.task === TASK_IDS.workerAttempt) {
             await this.flow.onWorkerFinal(obs, commandId);
+            // J-1: COMPLETED run stop-race follow-through.
+            // If a stop landed during onWorkerFinal (between applyObservation and
+            // the attempt status UPDATE), the attempt is now `stopping` but the
+            // intent was not closed (transaction rolled back).  Detect this and
+            // route to handleStoppingWorker so the intent is resolved rather than
+            // closed as `observed` while the attempt is still in `stopping`.
+            if (obs.status === "COMPLETED" && intent.attempt_id) {
+              const attemptStatus = await this.loadAttemptStatus(intent.attempt_id);
+              if (attemptStatus === "stopping") {
+                const result = await this.handleStoppingWorker(obs, intent);
+                if (result !== "pending") {
+                  await this.closeIntent(intent.id, "observed");
+                }
+                continue;
+              }
+            }
           } else if (intent.task === TASK_IDS.verifyRun) {
             await this.flow.onVerifyFinal(obs, commandId);
           } else if (intent.task === TASK_IDS.leadReview) {

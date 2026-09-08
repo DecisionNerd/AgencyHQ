@@ -9,9 +9,9 @@ import { FindingRowSchema } from "../rows.ts";
 export interface FindingInsert {
   id: string;
   attempt_id?: string | null;
-  severity?: string | null;
-  kind?: string | null;
-  description?: string | null;
+  severity: string;
+  kind: string;
+  description: string;
   evidence?: string | null;
   disposition?: string | null;
 }
@@ -29,9 +29,9 @@ export async function insertFinding(
     [
       row.id,
       row.attempt_id ?? null,
-      row.severity ?? null,
-      row.kind ?? null,
-      row.description ?? null,
+      row.severity,
+      row.kind,
+      row.description,
       row.evidence ?? null,
       row.disposition ?? null,
     ],

@@ -9,8 +9,8 @@ import { DecisionRowSchema } from "../rows.ts";
 
 export interface DecisionInsert {
   id: string;
-  kind?: string | null;
-  actor?: string | null;
+  kind: string;
+  actor: string;
   proposal_digest?: string | null;
   authority_version?: string | null;
   work_item_id?: string | null;
@@ -36,8 +36,8 @@ export async function insertDecision(
      RETURNING *`,
     [
       row.id,
-      row.kind ?? null,
-      row.actor ?? null,
+      row.kind,
+      row.actor,
       row.proposal_digest ?? null,
       row.authority_version ?? null,
       row.work_item_id ?? null,

@@ -1126,10 +1126,19 @@ test("flow.stop (rw4b-iv): TIMED_OUT dispatched attempt → auto-stop (actor coo
 });
 
 // ---------------------------------------------------------------------------
-// CR-4: onWorkerFinal stopping path honors config.uncertainAfterMs
+// CR-2a: COMPLETED run race → stale_status guard fires → reconciler-route
+// deadline → uncertain.
+//
+// The stop is injected inside onWorkerFinal's transaction via a pool/client
+// wrapper (same technique as the scratchpad cr2.test.ts test B).  Asserts:
+//   - command result = {skipped:"stale_status"}
+//   - attempt = stopping gen 2
+//   - no artifact, no verify.run trigger
+//   - worker intent still open (J-1 fix keeps it triggered)
+//   - after reconciler poll past uncertainAfterMs deadline → attempt uncertain
 // ---------------------------------------------------------------------------
 
-test("flow.stop (CR-4): onWorkerFinal stopping path uses config.uncertainAfterMs (clock-driven)", async (t) => {
+test("flow.stop (CR-2a): COMPLETED run race → stale_status; reconciler poll past deadline → uncertain", async (t) => {
   if (!DATABASE_URL) {
     t.skip("DATABASE_URL is not set");
     return;
@@ -1140,26 +1149,66 @@ test("flow.stop (CR-4): onWorkerFinal stopping path uses config.uncertainAfterMs
 
     const poolUrl = new URL(DATABASE_URL!);
     poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
-    const pool = createPool(poolUrl.toString());
+    const rawPool = createPool(poolUrl.toString());
 
     try {
       const { workItemId } = await seedProjectAndWorkItem(client);
 
+      const commitId = "aabbccdd1234567890aabbccdd1234567890aabb";
       let nowMs = Date.now();
       const clock2 = { now: () => new Date(nowMs).toISOString() };
       const fake = new FakeExecutionRuntime(() => new Date(nowMs).toISOString());
       const uncertainAfterMs = 300;
 
       fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
-      // Worker stays executing so we can manually control state
-      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+      fake.script(TASK_IDS.workerAttempt, (payload: unknown) => {
+        const p = payload as { attemptId: string };
+        return { status: "COMPLETED", output: workerCompletedOutput(p.attemptId, { commitId }) };
+      });
 
-      // Flow with non-default uncertainAfterMs in config
-      const deps = makeFlowDepsWithClock(pool, fake, clock2);
-      const depsWithUncertain: FlowDeps = {
-        ...deps,
-        config: { ...deps.config, uncertainAfterMs },
-      };
+      // Pool wrapper: inject stop inside onWorkerFinal after INSERT INTO artifacts
+      let injected = false;
+      let attemptIdRef = "";
+      // biome-ignore lint/suspicious/noExplicitAny: wrapper intentionally untyped
+      const wrapClient = (c: any) =>
+        // biome-ignore lint/suspicious/noExplicitAny: wrapper intentionally untyped
+        new Proxy(c, {
+          // biome-ignore lint/suspicious/noExplicitAny: wrapper intentionally untyped
+          get(target: any, prop: string | symbol) {
+            if (prop === "query") {
+              // biome-ignore lint/suspicious/noExplicitAny: wrapper intentionally untyped
+              return async (...args: any[]) => {
+                const sql =
+                  typeof args[0] === "string"
+                    ? args[0]
+                    : ((args[0] as { text?: string })?.text ?? "");
+                if (!injected && sql.includes("INSERT INTO artifacts")) {
+                  injected = true;
+                  await stopAttempt(
+                    { pool: rawPool, runtime: fake, clock: clock2 },
+                    {
+                      attemptId: attemptIdRef,
+                      commandId: newId("cmd"),
+                      actor: "human",
+                      reason: "CR-2a race",
+                    },
+                  );
+                }
+                return target.query(...args);
+              };
+            }
+            const v = target[prop];
+            return typeof v === "function" ? v.bind(target) : v;
+          },
+        });
+      const wrappedPool = {
+        query: (...a: Parameters<typeof rawPool.query>) => rawPool.query(...a),
+        connect: async () => wrapClient(await rawPool.connect()),
+        end: () => rawPool.end(),
+      } as unknown as typeof rawPool;
+
+      const deps = makeFlowDepsWithClock(wrappedPool, fake, clock2);
+      const depsWithUncertain: FlowDeps = { ...deps, config: { ...deps.config, uncertainAfterMs } };
       const flow = new BoundedRepairFlow(depsWithUncertain);
 
       const { workerRunId, attemptId } = await setupWorkerRunning(
@@ -1169,64 +1218,120 @@ test("flow.stop (CR-4): onWorkerFinal stopping path uses config.uncertainAfterMs
         workItemId,
         client,
       );
+      attemptIdRef = attemptId;
 
-      // Stop the attempt (sets status=stopping, bumps generation)
-      await stopAttempt(
-        { pool, runtime: fake, clock: clock2 },
-        { attemptId, commandId: newId("cmd"), actor: "human", reason: "CR-4 test" },
+      // Advance worker run to COMPLETED
+      fake.advance(workerRunId);
+      fake.advance(workerRunId);
+      const completedObs = await fake.retrieve(workerRunId);
+      assert.equal(completedObs.status, "COMPLETED", "(CR-2a) obs is COMPLETED");
+
+      // Direct call — stop is injected inside → stale_status
+      const directCmd = newId("cmd");
+      await flow.onWorkerFinal(completedObs, directCmd);
+
+      assert.equal(injected, true, "(CR-2a) stop was injected inside onWorkerFinal");
+
+      // Command result must be stale_status
+      const { rows: cmdRows } = await client.query<{ result: unknown }>(
+        "SELECT result FROM commands WHERE command_id = $1",
+        [directCmd],
+      );
+      assert.deepEqual(
+        cmdRows[0]?.result,
+        { skipped: "stale_status" },
+        "(CR-2a) command = stale_status",
       );
 
-      // Manually set the intent's idempotency_key generation to match the new generation
-      // so that onWorkerFinal does NOT classify the observation as stale.
-      // After stop, attempt.generation = 2, so we need intent key :g2.
-      const { rows: intentRows } = await client.query<{ id: string; idempotency_key: string }>(
-        "SELECT id, idempotency_key FROM dispatch_intents WHERE task = $1",
+      // Attempt must be stopping gen 2
+      const { rows: aRows } = await client.query<{ status: string; generation: number }>(
+        "SELECT status, generation FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(aRows[0]?.status, "stopping", "(CR-2a) attempt stopping");
+      assert.equal(aRows[0]?.generation, 2, "(CR-2a) gen 2");
+
+      // No artifact
+      const { rows: artRows } = await client.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM artifacts",
+      );
+      assert.equal(artRows[0]?.n, 0, "(CR-2a) no artifact");
+
+      // No verify.run trigger
+      const verifyTriggers = fake.calls.filter(
+        (c) =>
+          c.method === "trigger" && (c.args[0] as { task: string }).task === TASK_IDS.verifyRun,
+      );
+      assert.equal(verifyTriggers.length, 0, "(CR-2a) no verify.run triggered");
+
+      // Worker intent still open (J-1 fix: stale_status does not close intent)
+      const { rows: iRows } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
         [TASK_IDS.workerAttempt],
       );
-      const intentId = intentRows[0]?.id;
-      const oldKey = intentRows[0]?.idempotency_key ?? "";
-      // Replace :g1 with :g2 in the idempotency key
-      const newKey = oldKey.replace(/:g1$/, ":g2");
-      await client.query("UPDATE dispatch_intents SET idempotency_key = $2 WHERE id = $1", [
-        intentId,
-        newKey,
-      ]);
+      assert.equal(iRows[0]?.status, "triggered", "(CR-2a) intent still triggered");
 
-      // Script the run to return CANCELED; retrieve obs while clock is at t0
-      // so obs.observedAt = new Date(nowMs).toISOString().
-      fake.script(TASK_IDS.workerAttempt, () => ({ status: "CANCELED" }));
-      const canceledObs = await fake.retrieve(workerRunId);
+      // Reconciler poll 1: within deadline → pending (no evidence)
+      const recDeps = makeFlowDepsWithClock(rawPool, fake, clock2);
+      const recFlow = new BoundedRepairFlow({
+        ...recDeps,
+        config: { ...recDeps.config, uncertainAfterMs },
+      });
+      const rec = new Reconciler(
+        { ...recDeps, config: { ...recDeps.config, uncertainAfterMs } },
+        recFlow,
+        { uncertainAfterMs },
+      );
 
-      // Advance clock past deadline BEFORE calling onWorkerFinal.
-      // elapsed = (nowMs + uncertainAfterMs + 100) - nowMs > uncertainAfterMs → uncertain.
+      await rec.pollOnce();
+      const { rows: i2 } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      // Still within deadline — intent stays triggered
+      assert.equal(i2[0]?.status, "triggered", "(CR-2a) intent still triggered after poll 1");
+
+      // Advance clock past uncertainAfterMs deadline
       nowMs += uncertainAfterMs + 100;
 
-      // Single call: elapsed already exceeds deadline → confirmStop returns uncertain.
-      const cmd1 = newId("cmd");
-      await flow.onWorkerFinal(canceledObs, cmd1);
-
-      const { rows: a2 } = await client.query<{ status: string }>(
+      // Reconciler poll 2: past deadline → uncertain
+      await rec.pollOnce();
+      const { rows: a3 } = await client.query<{ status: string }>(
         "SELECT status FROM attempts WHERE id = $1",
         [attemptId],
       );
-      assert.equal(
-        a2[0]?.status,
-        "uncertain",
-        "(CR-4) attempt uncertain after deadline — config.uncertainAfterMs honored",
+      assert.equal(a3[0]?.status, "uncertain", "(CR-2a) attempt uncertain after deadline");
+
+      const { rows: wi } = await client.query<{ condition: string }>(
+        "SELECT condition FROM work_items WHERE id = $1",
+        [workItemId],
       );
+      assert.equal(wi[0]?.condition, "uncertain", "(CR-2a) work_item condition uncertain");
+
+      const { rows: i3 } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(i3[0]?.status, "observed", "(CR-2a) intent closed after poll 2");
+
+      // Only one run_observations row (R-010 dedup invariant)
+      const { rows: obsRows } = await client.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      assert.equal(obsRows[0]?.n, 1, "(CR-2a) exactly one run_observations row");
     } finally {
-      await pool.end();
+      await rawPool.end();
     }
   });
 });
 
 // ---------------------------------------------------------------------------
-// CR-2: status guard on attempt status update in onWorkerFinal
-// Simulate: stop arrives between applyObservation and the transaction that sets
-// status='completed'. The UPDATE with guard should skip, attempt stays stopping.
+// CR-2b: COMPLETED run race → stale_status; reconciler poll with survivors=[]
+// metadata → attempt stopped.
 // ---------------------------------------------------------------------------
 
-test("flow.stop (CR-2): stop after observation → onWorkerFinal skips stale status update, attempt stays stopping", async (t) => {
+test("flow.stop (CR-2b): COMPLETED run race → stale_status; reconciler poll with empty survivors → stopped", async (t) => {
   if (!DATABASE_URL) {
     t.skip("DATABASE_URL is not set");
     return;
@@ -1237,99 +1342,161 @@ test("flow.stop (CR-2): stop after observation → onWorkerFinal skips stale sta
 
     const poolUrl = new URL(DATABASE_URL!);
     poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
-    const pool = createPool(poolUrl.toString());
+    const rawPool = createPool(poolUrl.toString());
 
     try {
       const { workItemId } = await seedProjectAndWorkItem(client);
-      const clock2 = { now: () => new Date().toISOString() };
-      const fake = new FakeExecutionRuntime();
 
       const commitId = "aabbccdd1234567890aabbccdd1234567890aabb";
+      const clock2 = { now: () => new Date().toISOString() };
+      const fake = new FakeExecutionRuntime();
+      const uncertainAfterMs = 30_000; // large — evidence resolves before deadline
 
       fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
       fake.script(TASK_IDS.workerAttempt, (payload: unknown) => {
         const p = payload as { attemptId: string };
-        return {
-          status: "COMPLETED",
-          output: workerCompletedOutput(p.attemptId, { commitId }),
-        };
+        return { status: "COMPLETED", output: workerCompletedOutput(p.attemptId, { commitId }) };
       });
 
-      const deps = makeFlowDepsWithClock(pool, fake, clock2);
-      const flow = new BoundedRepairFlow(deps);
+      // Pool wrapper: inject stop inside onWorkerFinal after INSERT INTO artifacts
+      let injected = false;
+      let attemptIdRef = "";
+      // biome-ignore lint/suspicious/noExplicitAny: wrapper intentionally untyped
+      const wrapClient = (c: any) =>
+        // biome-ignore lint/suspicious/noExplicitAny: wrapper intentionally untyped
+        new Proxy(c, {
+          // biome-ignore lint/suspicious/noExplicitAny: wrapper intentionally untyped
+          get(target: any, prop: string | symbol) {
+            if (prop === "query") {
+              // biome-ignore lint/suspicious/noExplicitAny: wrapper intentionally untyped
+              return async (...args: any[]) => {
+                const sql =
+                  typeof args[0] === "string"
+                    ? args[0]
+                    : ((args[0] as { text?: string })?.text ?? "");
+                if (!injected && sql.includes("INSERT INTO artifacts")) {
+                  injected = true;
+                  await stopAttempt(
+                    { pool: rawPool, runtime: fake, clock: clock2 },
+                    {
+                      attemptId: attemptIdRef,
+                      commandId: newId("cmd"),
+                      actor: "human",
+                      reason: "CR-2b race",
+                    },
+                  );
+                }
+                return target.query(...args);
+              };
+            }
+            const v = target[prop];
+            return typeof v === "function" ? v.bind(target) : v;
+          },
+        });
+      const wrappedPool = {
+        query: (...a: Parameters<typeof rawPool.query>) => rawPool.query(...a),
+        connect: async () => wrapClient(await rawPool.connect()),
+        end: () => rawPool.end(),
+      } as unknown as typeof rawPool;
+
+      const deps = makeFlowDepsWithClock(wrappedPool, fake, clock2);
+      const depsWithUncertain: FlowDeps = { ...deps, config: { ...deps.config, uncertainAfterMs } };
+      const flow = new BoundedRepairFlow(depsWithUncertain);
 
       const { workerRunId, attemptId } = await setupWorkerRunning(
-        deps,
+        depsWithUncertain,
         flow,
         fake,
         workItemId,
         client,
       );
+      attemptIdRef = attemptId;
 
-      // Advance worker to COMPLETED
+      // Advance worker run to COMPLETED and set survivors=[] metadata for evidence
       fake.advance(workerRunId);
       fake.advance(workerRunId);
+      // Set metadata BEFORE retrieve so the observation carries survivors: []
+      fake.setMetadata(workerRunId, { survivors: [] });
       const completedObs = await fake.retrieve(workerRunId);
-      assert.equal(completedObs.status, "COMPLETED", "(CR-2) obs is COMPLETED");
+      assert.equal(completedObs.status, "COMPLETED", "(CR-2b) obs is COMPLETED");
 
-      // Apply the observation (records run_observations row)
-      const workerIntentRow = (
-        await client.query<{ id: string; idempotency_key: string }>(
-          "SELECT id, idempotency_key FROM dispatch_intents WHERE task = $1",
-          [TASK_IDS.workerAttempt],
-        )
-      ).rows[0]!;
-      const dispatchedGen = parseInt(workerIntentRow.idempotency_key.match(/:g(\d+)$/)?.[1] ?? "1");
-      const pgClient = (await pool.connect()) as Parameters<typeof applyObservation>[0];
-      try {
-        await applyObservation(pgClient, {
-          runId: workerRunId,
-          generation: dispatchedGen,
-          attemptId,
-          status: completedObs.status,
-          payload: completedObs,
-          observedAt: new Date(completedObs.observedAt),
-        });
-      } finally {
-        pgClient.release();
-      }
+      // Direct call — stop is injected inside → stale_status
+      const directCmd = newId("cmd");
+      await flow.onWorkerFinal(completedObs, directCmd);
 
-      // Now stop the attempt (simulates stop landing between applyObservation and transaction)
-      const stopResult = await stopAttempt(
-        { pool, runtime: fake, clock: clock2 },
-        { attemptId, commandId: newId("cmd"), actor: "human", reason: "CR-2 test" },
+      assert.equal(injected, true, "(CR-2b) stop was injected inside onWorkerFinal");
+
+      // Command result must be stale_status
+      const { rows: cmdRows } = await client.query<{ result: unknown }>(
+        "SELECT result FROM commands WHERE command_id = $1",
+        [directCmd],
       );
-      assert.equal(stopResult.ok, true, "(CR-2) stop succeeded");
+      assert.deepEqual(
+        cmdRows[0]?.result,
+        { skipped: "stale_status" },
+        "(CR-2b) command = stale_status",
+      );
 
-      const { rows: aStopped } = await client.query<{ status: string }>(
-        "SELECT status FROM attempts WHERE id = $1",
+      // Attempt must be stopping gen 2
+      const { rows: aRows } = await client.query<{ status: string; generation: number }>(
+        "SELECT status, generation FROM attempts WHERE id = $1",
         [attemptId],
       );
-      assert.equal(aStopped[0]?.status, "stopping", "(CR-2) attempt is stopping after stop");
+      assert.equal(aRows[0]?.status, "stopping", "(CR-2b) attempt stopping");
+      assert.equal(aRows[0]?.generation, 2, "(CR-2b) gen 2");
 
-      // Now call onWorkerFinal — the transaction tries to set status='completed'
-      // but the guard (AND status IN ('admitted','dispatched','running')) should block it.
-      const workerFinalCmdId = newId("cmd");
-      await flow.onWorkerFinal(completedObs, workerFinalCmdId);
-
-      // Attempt should still be stopping (not completed), no verify.run triggered
-      const { rows: aFinal } = await client.query<{ status: string }>(
-        "SELECT status FROM attempts WHERE id = $1",
-        [attemptId],
+      // No artifact, no verify.run trigger
+      const { rows: artRows } = await client.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM artifacts",
       );
-      // The observation is stale (gen mismatch after stop) so flow exits early via stale check,
-      // OR if generation matches, the status guard prevents overwriting stopping.
-      // Either way, attempt must NOT be 'completed'.
-      assert.notEqual(aFinal[0]?.status, "completed", "(CR-2) attempt must not be completed");
-
-      // No verify.run should have been triggered
+      assert.equal(artRows[0]?.n, 0, "(CR-2b) no artifact");
       const verifyTriggers = fake.calls.filter(
         (c) =>
           c.method === "trigger" && (c.args[0] as { task: string }).task === TASK_IDS.verifyRun,
       );
-      assert.equal(verifyTriggers.length, 0, "(CR-2) no verify.run triggered");
+      assert.equal(verifyTriggers.length, 0, "(CR-2b) no verify.run triggered");
+
+      // Intent still open
+      const { rows: iRows } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(iRows[0]?.status, "triggered", "(CR-2b) intent still triggered");
+
+      // Reconciler poll: evidence present (survivors=[]) → stopped immediately
+      const recDeps = makeFlowDepsWithClock(rawPool, fake, clock2);
+      const recFlow = new BoundedRepairFlow({
+        ...recDeps,
+        config: { ...recDeps.config, uncertainAfterMs },
+      });
+      const rec = new Reconciler(
+        { ...recDeps, config: { ...recDeps.config, uncertainAfterMs } },
+        recFlow,
+        { uncertainAfterMs },
+      );
+
+      await rec.pollOnce();
+
+      const { rows: a2 } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(a2[0]?.status, "stopped", "(CR-2b) attempt stopped with empty survivors");
+
+      const { rows: i2 } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.equal(i2[0]?.status, "observed", "(CR-2b) intent closed after poll");
+
+      // Exactly one run_observations row (R-010)
+      const { rows: obsRows } = await client.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      assert.equal(obsRows[0]?.n, 1, "(CR-2b) exactly one run_observations row");
     } finally {
-      await pool.end();
+      await rawPool.end();
     }
   });
 });
