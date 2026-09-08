@@ -249,7 +249,8 @@ function compareSortKeys(a: SortKey, b: SortKey): number {
  *    - effectiveCapacity "limited" → provider_limited (skipped if concurrency slot taken)
  *    - effectiveCapacity "unknown" → provider_unknown (skipped if concurrency slot taken)
  *    - effectiveCapacity "ok"      → no skip
- * 7. There must be remaining slot capacity → no_slot
+ * 7. There must be remaining slot capacity (slots − active attempts − selections
+ *    this pass must be > 0) → no_slot
  *
  * Campaign ordering (when mainEffortByCampaign is provided):
  *   Within a campaign the designated main effort is placed first; remaining
@@ -308,7 +309,8 @@ export function selectDispatch(input: SelectDispatchInput): SelectDispatchOutput
   const dispatch: { workItemId: string; repositoryId: string }[] = [];
   const skipped: { workItemId: string; reason: SkipReason }[] = [];
   let mainEffort: string | null = null;
-  let slotsUsed = 0;
+  // Slots already occupied by active attempts before this pass.
+  let slotsUsed = activeAttempts.length;
 
   for (const item of sorted) {
     // Rule 1: lifecycle gate.

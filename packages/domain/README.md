@@ -46,7 +46,7 @@ and the reason every other item was skipped.
 5. The item's repository must not be listed as uncertain — `repository_uncertain`
 6. The item's repository must not already have an active attempt or an
    earlier selection in this pass — `repository_busy`
-7. There must be remaining slot capacity — `no_slot`
+7. There must be remaining slot capacity — `no_slot`; the slot count deducts all currently active attempts (dispatched, running, or stopping) before considering selections made in this pass, so active attempts from earlier scheduler passes fully count against the limit.
 
 `mainEffort` is the id of the highest-ranked item passing rules 1–2, whether
 or not it was dispatched. It is stable when the top item is blocked by a busy

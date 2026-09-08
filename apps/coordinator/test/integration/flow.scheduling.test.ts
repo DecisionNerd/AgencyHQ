@@ -15,12 +15,19 @@
  *     pass 2 → skip_reason IS NULL and status='triggered' (R-010).
  * (g) Halted/completed items do not hold the repository — their dispatched attempt
  *     is excluded from activeAttempts so the project does not appear in busyRepos.
+ *
+ * Wake-up subscription refresh tests (Design 3):
+ * (wakeup-tags) wakeupTags() returns tags for non-terminal work items and open intents.
+ * (wakeup-a) Startup with no open work → no subscribe; after pollOnce with open work → subscribed.
+ * (wakeup-b) Tag set grows → old subscription aborted, new subscription covers both projects.
+ * (wakeup-c) subscribe() rejection is logged; poller keeps polling and retries on next pollOnce.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 import { digestOf, TASK_IDS } from "@agencyhq/contracts";
 import { createPool, withTestSchema } from "@agencyhq/db";
+import type { ExecutionRuntime } from "@agencyhq/domain";
 import { newId } from "@agencyhq/domain";
 import pg from "pg";
 import { FakeExecutionRuntime } from "../../../../trigger/src/client/fake.ts";
@@ -28,7 +35,7 @@ import type { FlowLike, ReconcilerLike, RuntimeLike } from "../../src/app.ts";
 import { createApp } from "../../src/app.ts";
 import type { CoordinatorConfig } from "../../src/config.ts";
 import { BoundedRepairFlow } from "../../src/flow/bounded-repair.ts";
-import { Reconciler } from "../../src/flow/observe.ts";
+import { Reconciler, wakeupTags } from "../../src/flow/observe.ts";
 import type { FlowDeps } from "../../src/flow/types.ts";
 import { goodPlanOutput, workerCompletedOutput } from "../helpers/fake-lead.ts";
 import { seedProjectAndWorkItem } from "../helpers/seed.ts";
@@ -290,11 +297,16 @@ test("scheduling(a): slots=1 → second item queued with skip_reason=no_slot, di
       fake.advance(firstRunId); // QUEUED→EXECUTING
       fake.advance(firstRunId); // EXECUTING→COMPLETED
 
-      // Poll: reconciler processes first worker completion + schedules second.
+      // Poll 1: reconciler processes first worker completion (scheduleOnce runs
+      // before observation routing, so wi1's attempt is still active when the
+      // scheduler runs — wi2 gets no_slot; observation then closes wi1's attempt).
       await reconciler.pollOnce();
 
-      // After poll, the first attempt should be completed or in follow-up state.
-      // The scheduler should have dispatched the second item.
+      // Poll 2: now wi1's attempt is closed; scheduleOnce sees no active
+      // attempts and dispatches wi2.
+      await reconciler.pollOnce();
+
+      // After poll 2, wi2 should be dispatched.
       const { rows: afterIntents } = await client.query(
         `SELECT di.status, sc.work_item_id
          FROM dispatch_intents di
@@ -1205,6 +1217,311 @@ test("scheduling(h): intent skipped repository_busy on pass 1, dispatched on pas
       const pass2 = (pass2Rows as { status: string; skip_reason: string | null }[])[0]!;
       assert.equal(pass2.status, "triggered", "wi2 dispatched on pass 2 (status=triggered)");
       assert.equal(pass2.skip_reason, null, "skip_reason cleared to NULL after dispatch (R-010)");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (wakeup-tags) wakeupTags() unit: returns correct project tags
+// ---------------------------------------------------------------------------
+
+test("scheduling(wakeup-tags): wakeupTags returns tags for non-terminal work items and open intents", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const pool = makeSchemaPool(DATABASE_URL!, schema);
+
+    try {
+      const poolClient = await pool.connect();
+
+      // No work → empty
+      try {
+        const tags0 = await wakeupTags(poolClient);
+        assert.deepEqual(tags0, [], "no tags when no open work");
+      } finally {
+        poolClient.release();
+      }
+
+      // Proposed lifecycle → NOT included (never admitted)
+      await seedProjectAndWorkItem(client, { lifecycle: "proposed" });
+      const poolClient2 = await pool.connect();
+      try {
+        const tags1 = await wakeupTags(poolClient2);
+        assert.deepEqual(tags1, [], "proposed lifecycle not included");
+      } finally {
+        poolClient2.release();
+      }
+
+      // Admitted lifecycle → included
+      const { projectId } = await seedProjectAndWorkItem(client, { lifecycle: "admitted" });
+      const poolClient3 = await pool.connect();
+      try {
+        const tags2 = await wakeupTags(poolClient3);
+        assert.ok(tags2.includes(`project:${projectId}`), "admitted lifecycle included in tags");
+      } finally {
+        poolClient3.release();
+      }
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (wakeup-a) Startup with no open work → no subscribe; pollOnce → subscribed
+// ---------------------------------------------------------------------------
+
+test("scheduling(wakeup-a): startWakeup with no open work does not subscribe; pollOnce after work item created subscribes", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const fake = new FakeExecutionRuntime();
+      const deps = makeFlowDeps(pool, fake);
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1, realtimeWakeup: true });
+
+      // Start wake-up with no open work — must not subscribe.
+      const wakeupPromise = reconciler.startWakeup();
+      await new Promise((r) => setTimeout(r, 10));
+
+      assert.equal(
+        fake.calls.filter((c) => c.method === "subscribe").length,
+        0,
+        "no subscribe when no open work at startup",
+      );
+
+      // Seed an admitted work item so wakeupTags() returns a non-empty set.
+      const { projectId } = await seedProjectAndWorkItem(client, { lifecycle: "admitted" });
+
+      // pollOnce → refresh at end → subscribe should be called.
+      await reconciler.pollOnce();
+
+      const subCalls = fake.calls.filter((c) => c.method === "subscribe");
+      assert.equal(subCalls.length, 1, "subscribed after pollOnce detects open work");
+      const args = subCalls[0]!.args[0] as { tags: string[] };
+      assert.ok(
+        args.tags.includes(`project:${projectId}`),
+        "subscription covers the new project's tag",
+      );
+
+      reconciler.stopWakeup();
+      await wakeupPromise;
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (wakeup-b) Tag set grows → old subscription aborted, new covers both projects
+// ---------------------------------------------------------------------------
+
+test("scheduling(wakeup-b): tag set change causes resubscription; old subscription aborted", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const fake = new FakeExecutionRuntime();
+      const deps = makeFlowDeps(pool, fake);
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1, realtimeWakeup: true });
+
+      // Seed project A with an admitted work item.
+      const { projectId: projectA } = await seedProjectAndWorkItem(client, {
+        lifecycle: "admitted",
+      });
+
+      // Start wake-up → subscribes to project A.
+      const wakeupPromise = reconciler.startWakeup();
+      await new Promise((r) => setTimeout(r, 10));
+
+      const subCallsInitial = fake.calls.filter((c) => c.method === "subscribe");
+      assert.equal(subCallsInitial.length, 1, "initial subscription to project A");
+      const firstArgs = subCallsInitial[0]!.args[0] as {
+        tags: string[];
+        signal: AbortSignal;
+      };
+      assert.ok(firstArgs.tags.includes(`project:${projectA}`), "initial sub covers project A");
+      assert.ok(!firstArgs.signal.aborted, "first subscription initially active");
+
+      // Add project B.
+      const { projectId: projectB } = await seedProjectAndWorkItem(client, {
+        lifecycle: "admitted",
+      });
+
+      // pollOnce → refresh detects added project → resubscribes.
+      await reconciler.pollOnce();
+
+      const subCallsAfter = fake.calls.filter((c) => c.method === "subscribe");
+      assert.equal(subCallsAfter.length, 2, "resubscribed after project B admitted");
+      assert.ok(firstArgs.signal.aborted, "first subscription was aborted on resubscription");
+      const secondArgs = subCallsAfter[1]!.args[0] as { tags: string[]; signal: AbortSignal };
+      assert.ok(secondArgs.tags.includes(`project:${projectA}`), "new sub covers project A");
+      assert.ok(secondArgs.tags.includes(`project:${projectB}`), "new sub covers project B");
+
+      reconciler.stopWakeup();
+      await wakeupPromise;
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (wakeup-c) subscribe() rejection → logged; poller keeps polling, retried
+// ---------------------------------------------------------------------------
+
+test("scheduling(wakeup-c): subscribe rejection is logged and poller continues polling", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const fake = new FakeExecutionRuntime();
+
+      // Runtime whose subscribe() always rejects (simulates network failure).
+      const subscribeAttempts: number[] = [];
+      const rejectingRuntime: ExecutionRuntime = {
+        trigger: (i) => fake.trigger(i),
+        cancel: (r) => fake.cancel(r),
+        retrieve: (r) => fake.retrieve(r),
+        createPublicToken: (i) => fake.createPublicToken(i),
+        subscribe: async (_input, _cb): Promise<void> => {
+          subscribeAttempts.push(Date.now());
+          throw new Error("subscribe network error");
+        },
+      };
+
+      const deps: FlowDeps = {
+        ...makeFlowDeps(pool, fake),
+        runtime: rejectingRuntime,
+      };
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1, realtimeWakeup: true });
+
+      // Seed an admitted work item so subscribe() will be attempted.
+      await seedProjectAndWorkItem(client, { lifecycle: "admitted" });
+
+      // startWakeup: subscribe() will fail.
+      const wakeupPromise = reconciler.startWakeup();
+      await new Promise((r) => setTimeout(r, 20));
+
+      assert.ok(subscribeAttempts.length >= 1, "subscribe was attempted at startup");
+
+      // pollOnce must succeed despite the subscribe failure.
+      await reconciler.pollOnce();
+      assert.ok(reconciler.healthy, "reconciler still healthy after subscribe rejection");
+
+      // subscribe retried on pollOnce (since _subscribeError=true flags a retry).
+      assert.ok(subscribeAttempts.length >= 2, "subscribe retried on next pollOnce refresh");
+
+      reconciler.stopWakeup();
+      await wakeupPromise;
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slot-counting regression: active attempts must block scheduler dispatch
+// ---------------------------------------------------------------------------
+
+test("scheduling(slot-regression): slots=1, one attempt dispatched on project A → scheduleOnce records no_slot for project B", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId: wi1 } = await seedProjectAndWorkItem(client);
+      const { workItemId: wi2 } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      // Workers stay EXECUTING — wi1's attempt remains dispatched/running.
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
+
+      // Admit wi1 — slot free, dispatched immediately.
+      const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Admit wi2 on a different project — bounded-repair sees slot occupied → queued.
+      const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      // Verify wi2 is queued before calling scheduleOnce.
+      const { rows: preRows } = await client.query(
+        `SELECT di.status FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      assert.equal(
+        (preRows as { status: string }[])[0]?.status,
+        "queued",
+        "wi2 queued before scheduler",
+      );
+
+      // Run the scheduler while wi1's attempt is still active.
+      // With the fix, slotsUsed starts at 1 (activeAttempts.length) → no_slot for wi2.
+      await reconciler.scheduleOnce();
+
+      const { rows: afterRows } = await client.query(
+        `SELECT di.status, di.skip_reason FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      const after = (afterRows as { status: string; skip_reason: string | null }[])[0]!;
+      assert.equal(after.status, "queued", "wi2 must stay queued (slot taken by wi1)");
+      assert.equal(after.skip_reason, "no_slot", "skip_reason must be no_slot");
     } finally {
       await pool.end();
     }
