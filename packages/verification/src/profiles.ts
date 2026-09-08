@@ -53,6 +53,25 @@ export const PROFILE_CATALOG: Record<string, VerificationProfile> = {
     checks: ["git-diff-clean@1"],
     protectedPaths: DEFAULT_PROTECTED_PATHS,
   },
+  /**
+   * multi-repo-v1: verifies that a multi-repository WorkItem is complete.
+   *
+   * Runs pnpm typecheck first, then manifest-consumer@1 which:
+   * 1. Asserts at least one AGENCYHQ_MANIFEST_<N> env var is set and points
+   *    to an existing directory (fails with manifest_missing otherwise).
+   * 2. Runs the project's pnpm test.
+   *
+   * Use this profile when the coordinator has assembled a manifest of sibling
+   * worktrees so the check environment can assert cross-repo consistency.
+   *
+   * R-006, R-014.
+   */
+  "multi-repo-v1": {
+    id: "multi-repo-v1",
+    version: "1",
+    checks: ["pnpm-typecheck@1", "manifest-consumer@1"],
+    protectedPaths: DEFAULT_PROTECTED_PATHS,
+  },
 };
 
 // ---------------------------------------------------------------------------
