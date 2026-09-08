@@ -119,7 +119,10 @@ export const verifyRun = task({
 
     metadata.set("phase", "done");
 
-    // Return only the VerifyRunOutput shape (strip the internal integrity field).
-    return { results: output.results };
+    // Return the VerifyRunOutput shape: include integrity but strip the
+    // adapter-internal diffDigestMatches field so the coordinator's safeParse
+    // validates against VerifyRunOutputSchema exactly.
+    const { diffDigestMatches: _dm, ...contractIntegrity } = output.integrity;
+    return { results: output.results, integrity: contractIntegrity };
   },
 });
