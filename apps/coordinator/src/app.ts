@@ -1043,6 +1043,12 @@ export function createApp(deps: AppDeps): Hono {
       if (!workItemId || typeof workItemId !== "string") {
         return c.json({ error: "workItemId required for plan" }, 400);
       }
+      // DISPATCH ORDERING NOTE: the coordinator dispatches work items one at a
+      // time on demand (per-command). If a batch scheduler is ever added, call
+      // selectDispatch({ workItems, activeAttempts, slots, uncertainRepositories,
+      // mainEffortByCampaign }) from @agencyhq/domain here to select the next
+      // item and respect campaign ordering (main-effort first within a campaign).
+      //
       // When real commands are wired, the flow manages its own claim/complete cycle.
       // When commands are absent (test/legacy mode), the app handles idempotency.
       if (commands) {
