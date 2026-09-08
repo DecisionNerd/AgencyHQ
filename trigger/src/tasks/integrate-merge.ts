@@ -17,6 +17,7 @@
 import { mkdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { IntegrateMergePayloadSchema } from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
 import {
   fetchRef,
@@ -32,46 +33,6 @@ import type { IntegrateMergeDeps } from "./integrate-merge-core.ts";
 import { runIntegrateMerge } from "./integrate-merge-core.ts";
 
 // ---------------------------------------------------------------------------
-// Payload validation
-// ---------------------------------------------------------------------------
-
-function parsePayload(raw: unknown): IntegrateMergePayload {
-  if (typeof raw !== "object" || raw === null) {
-    throw new AbortTaskRunError("integrate.merge: invalid payload: not an object");
-  }
-  const p = raw as Record<string, unknown>;
-  const requiredStrings: (keyof IntegrateMergePayload)[] = [
-    "attemptId",
-    "contractId",
-    "contractVersion",
-    "projectId",
-    "repoPath",
-    "remote",
-    "targetRef",
-    "expectedBaseRevision",
-    "attemptRevision",
-  ];
-  for (const key of requiredStrings) {
-    if (typeof p[key] !== "string" || !(p[key] as string).trim()) {
-      throw new AbortTaskRunError(
-        `integrate.merge: invalid payload: missing or empty field "${key}"`,
-      );
-    }
-  }
-  if (typeof p.generation !== "number") {
-    throw new AbortTaskRunError(
-      'integrate.merge: invalid payload: field "generation" must be a number',
-    );
-  }
-  if (p.strategy !== "merge_commit" && p.strategy !== "fast_forward") {
-    throw new AbortTaskRunError(
-      'integrate.merge: invalid payload: strategy must be "merge_commit" or "fast_forward"',
-    );
-  }
-  return p as unknown as IntegrateMergePayload;
-}
-
-// ---------------------------------------------------------------------------
 // Task definition
 // ---------------------------------------------------------------------------
 
@@ -84,8 +45,14 @@ export const integrateMerge = task({
   run: async (rawPayload: unknown): Promise<IntegrateMergeOutput> => {
     metadata.set("phase", "validating");
 
-    // Validate payload; AbortTaskRunError on failure (never retried).
-    const payload = parsePayload(rawPayload);
+    // Validate payload with the contracts schema; AbortTaskRunError on failure.
+    const parseResult = IntegrateMergePayloadSchema.safeParse(rawPayload);
+    if (!parseResult.success) {
+      throw new AbortTaskRunError(
+        `integrate.merge: invalid payload: ${JSON.stringify(parseResult.error.flatten())}`,
+      );
+    }
+    const payload: IntegrateMergePayload = parseResult.data;
 
     // Ensure the coordinator repo exists before doing any git work.
     await stat(payload.repoPath).catch(() => {

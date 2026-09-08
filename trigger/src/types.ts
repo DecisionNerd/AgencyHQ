@@ -172,41 +172,45 @@ export type LeadPlanVariant = {
   /** Model variant (e.g. "low", "high"). Defaults to AGENCYHQ_LEAD_VARIANT env or "low". */
   variant?: string | undefined;
 };
-// Appended for the integrate.merge task (Packet 4.1.d, R-015, R-010).
-// Once @agencyhq/contracts publishes IntegrateMergePayloadSchema / IntegrateMergeOutputSchema and
-// TASK_IDS.integrateMerge these local types should be replaced by that import.
+// Appended for the integrate.merge task (Packet 4.2.c, R-015, R-010).
+// IntegrateMergePayload and IntegrateMergeOutput are now imported from
+// @agencyhq/contracts (wave 4.1 exports). Re-exported here so existing
+// callers that import from types.ts continue to compile unchanged.
+export type {
+  IntegrateMergeOutput,
+  IntegrateMergePayload,
+} from "@agencyhq/contracts";
 
-/** Payload for the `integrate.merge` task. */
-export type IntegrateMergePayload = {
-  attemptId: string;
-  generation: number;
-  contractId: string;
-  contractVersion: string;
-  projectId: string;
-  /** Absolute path to the coordinator-owned git clone used for all git operations. */
-  repoPath: string;
-  /** Remote name configured in repoPath (e.g. "origin"). */
-  remote: string;
-  /** Branch name on the remote to integrate into (e.g. "main"). */
-  targetRef: string;
-  /** The SHA the coordinator last observed as the remote's targetRef HEAD. */
-  expectedBaseRevision: string;
-  /** SHA of the attempt commit to integrate. Must exist in repoPath. */
-  attemptRevision: string;
-  /** Integration strategy: merge_commit always creates a merge commit; fast_forward fails if FF is not possible. */
-  strategy: "merge_commit" | "fast_forward";
-};
+// Appended for the verify.run manifest combined verification (Packet 4.2.c, R-006).
+// These fields extend the VerifyRunPayload on the wire; the contracts schema
+// is not edited — the coordinator includes them alongside the standard fields
+// and verify-run.ts extracts them after schema validation.
 
-/** Output of the `integrate.merge` task. */
-export type IntegrateMergeOutput = {
-  /** How the integration attempt resolved. */
-  outcome: "integrated" | "already_integrated" | "base_moved" | "conflict" | "push_rejected";
-  /** SHA of the resulting commit on the remote (present for integrated / already_integrated). */
-  resultingRevision?: string;
-  /** The remote targetRef SHA observed at the time of the fetch (or after the push on rejection). */
-  observedTargetRevision: string;
-  /** Git commands run with their exit codes. No secrets included. */
-  evidence: string[];
-  /** Files with unresolved merge conflicts (present when outcome is conflict). */
-  conflictingPaths?: string[];
+/**
+ * Coordinator-supplied extension fields for combined manifest verification.
+ *
+ * When a multi-repository WorkItem includes a revision manifest the coordinator
+ * enriches the verify.run payload with the sibling repos' absolute paths and
+ * the projectId of the project being verified. verify-run.ts extracts these
+ * from the raw (pre-parse) payload and passes them to verify-run-core.ts.
+ *
+ * Field `manifestRepoPaths` maps each sibling projectId to the absolute path
+ * of the coordinator-owned git clone for that repository. The current project
+ * is NOT included — its absence is what distinguishes it from siblings.
+ *
+ * Field `manifestProjectId` identifies which manifest entry belongs to the
+ * project under verification so that entry can be excluded from materialization.
+ */
+export type VerifyRunManifestExt = {
+  /**
+   * ProjectId of the project currently being verified.
+   * Used to identify and exclude the current entry from sibling materialization.
+   */
+  manifestProjectId?: string;
+  /**
+   * Absolute paths to coordinator-owned clones of sibling repositories, keyed
+   * by projectId. Only sibling projectIds appear here; the current project is
+   * absent. Coordinator-supplied; not part of the @agencyhq/contracts schema.
+   */
+  manifestRepoPaths?: Record<string, string>;
 };
