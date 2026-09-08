@@ -86,6 +86,14 @@ export type CommandsLike = {
     rank: number;
   }): Promise<unknown>;
   ackVisit(input: { commandId: string; at: string }): Promise<unknown>;
+  approve(input: {
+    commandId: string;
+    workItemId: string;
+    contractId: string;
+    contractVersion: number;
+    attemptRevision: string;
+    actor: string;
+  }): Promise<unknown>;
   lastAckAt(client: PoolClientLike): Promise<string | null>;
 };
 
@@ -538,6 +546,39 @@ export function createApp(deps: AppDeps): Hono {
         const at = typeof body.at === "string" ? body.at : clock();
         const result = await commands.ackVisit({ commandId, at });
         return c.json({ commandId, replayed: false, result }, 200);
+      }
+
+      if (kind === "approve") {
+        const workItemId = body.workItemId;
+        const contractId = body.contractId;
+        const contractVersion = body.contractVersion;
+        const attemptRevision = body.attemptRevision;
+        if (!workItemId || typeof workItemId !== "string") {
+          return c.json({ error: "workItemId required for approve" }, 400);
+        }
+        if (!contractId || typeof contractId !== "string") {
+          return c.json({ error: "contractId required for approve" }, 400);
+        }
+        if (typeof contractVersion !== "number") {
+          return c.json({ error: "contractVersion (number) required for approve" }, 400);
+        }
+        if (!attemptRevision || typeof attemptRevision !== "string") {
+          return c.json({ error: "attemptRevision required for approve" }, 400);
+        }
+        const approveActor = typeof body.actor === "string" ? body.actor : "human";
+        const result = await commands.approve({
+          commandId,
+          workItemId,
+          contractId,
+          contractVersion,
+          attemptRevision,
+          actor: approveActor,
+        });
+        const approveReplayed =
+          typeof result === "object" &&
+          result !== null &&
+          (result as Record<string, unknown>).replayed === true;
+        return c.json({ commandId, replayed: approveReplayed, result }, 200);
       }
     } else {
       // Fallback when commands are not wired (legacy / test mode)

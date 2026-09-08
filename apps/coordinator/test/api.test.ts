@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type {
+  CommandsLike,
   FlowLike,
   LedgerSnapshot,
   PoolLike,
@@ -505,6 +506,174 @@ describe("GET /api/work-items/:id (ledger detail)", () => {
     assert.deepEqual(body.contracts, []);
     assert.deepEqual(body.attempts, []);
     assert.deepEqual(body.decisions, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// approve command: API validation (test v from PACKET I1.c)
+// ---------------------------------------------------------------------------
+
+describe("POST /api/commands kind=approve — field validation", () => {
+  function makeApproveCommands(): CommandsLike {
+    return {
+      stop: async () => ({ ok: true }),
+      pause: async () => ({ ok: true }),
+      resume: async () => ({ ok: true }),
+      createWorkItem: async () => ({ ok: true, workItemId: "wi_fake" }),
+      ackVisit: async () => ({ ok: true, at: NOW }),
+      approve: async (input) => ({
+        ok: true as const,
+        decisionId: `dec-${input.commandId}`,
+        artifactRevision: input.attemptRevision,
+      }),
+      lastAckAt: async () => null,
+    };
+  }
+
+  it("returns 400 when workItemId is missing", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeApproveCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-approve-1",
+        kind: "approve",
+        contractId: "sc_abc",
+        contractVersion: 1,
+        attemptRevision: "rev1",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /workItemId/);
+  });
+
+  it("returns 400 when contractId is missing", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeApproveCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-approve-2",
+        kind: "approve",
+        workItemId: "wi_abc",
+        contractVersion: 1,
+        attemptRevision: "rev1",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /contractId/);
+  });
+
+  it("returns 400 when contractVersion is not a number", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeApproveCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-approve-3",
+        kind: "approve",
+        workItemId: "wi_abc",
+        contractId: "sc_abc",
+        contractVersion: "not-a-number",
+        attemptRevision: "rev1",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /contractVersion/);
+  });
+
+  it("returns 400 when attemptRevision is missing", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeApproveCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-approve-4",
+        kind: "approve",
+        workItemId: "wi_abc",
+        contractId: "sc_abc",
+        contractVersion: 1,
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /attemptRevision/);
+  });
+
+  it("returns 200 with result when all fields are valid", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeApproveCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-approve-5",
+        kind: "approve",
+        workItemId: "wi_abc",
+        contractId: "sc_abc",
+        contractVersion: 1,
+        attemptRevision: "cafebabe1234",
+        actor: "alice",
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      commandId: string;
+      replayed: boolean;
+      result: { ok: boolean; decisionId: string; artifactRevision: string };
+    };
+    assert.equal(body.commandId, "cmd-approve-5");
+    assert.equal(body.replayed, false);
+    assert.ok(body.result.ok);
+    assert.ok(body.result.decisionId);
+    assert.equal(body.result.artifactRevision, "cafebabe1234");
   });
 });
 
