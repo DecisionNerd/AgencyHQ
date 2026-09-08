@@ -47,8 +47,11 @@ approve/reject actions), `#/work-items/:id` (five state cards — contract,
 execution, verification, acceptance, integration — plus an evidence panel and
 operator actions), `#/projects/:id/authority` (JSON authority editor with
 version history and confirm dialog), `#/return` (return-after-interruption
-view). Every destructive action shows a `ConfirmDialog` naming the project,
-work item, and version. Bearer-auth token stored in
+view). Work-item actions (approve, reject, stop, invalidate, pause) each show
+a `ConfirmDialog` naming the project and work item; approve, reject, and
+invalidate also name the contract version. The authority editor's Save button
+shows a confirm naming the project and the proposed new authority version.
+Bearer-auth token stored in
 `localStorage["agencyhq.apiToken"]`; all `/api/*` calls include
 `Authorization: Bearer <token>`; a 401 response clears the token and shows a
 token-entry form. For live execution state it subscribes to Trigger runs by
@@ -65,6 +68,13 @@ This is the behavior observed and fixed during the Slice 5 browser journey
 (`apps/coordinator/src/views/pending.ts`, `isOpenPending`). A pending decision
 without an attempt id cannot be resolved by inference and stays open until a
 command updates it.
+
+**Decisions view fields.** Each entry exposes: `obstacle` (violation codes or
+decision kind); `recommendation` (the Lead proposal's `rationale` field when
+the plan observation carries one, otherwise `null` — no fallback text is
+generated); `impact` (work item, contract version, attempt); `noActionConsequence`
+(fixed text: `"stays pending; no dispatch"`); and available `actions`
+(`approve`/`reject` for accept decisions).
 
 ### Coordinator API (Slice 5)
 
@@ -83,13 +93,13 @@ All routes require `Authorization: Bearer <token>`.
 
 | `kind` | Effect |
 | --- | --- |
-| `reject` | Pending decision → `rejected`; work item lifecycle → `halted` |
-| `invalidate_acceptance` | Inserts new `invalidate` decision; work item → `reopened`; historical rows untouched |
+| `reject` | Appends a new `rejected` decision for the same attempt (pending row kept as history — R-017); persists supplied reason in `decisions.reason`; work item lifecycle → `halted` |
+| `invalidate_acceptance` | Inserts new `invalidate` decision referencing historical accept; persists supplied reason in `decisions.reason`; work item → `reopened`; historical rows untouched (R-017) |
 | `create_campaign` | Creates a campaign |
 | `assign_campaign` | Sets `campaign_id` on a work item |
-| `set_main_effort` | Sets `main_effort_work_item_id` on a campaign |
+| `set_main_effort` | Sets `main_effort_work_item_id` on a campaign; work item must belong to the campaign (`not_a_member` otherwise) |
 | `set_rank` | Optimistic CAS on work item `version`; returns `stale_version` on mismatch |
-| `update_authority` | Schema-validated; version must increase; appends to `authority_versions`; frozen contract bounds untouched |
+| `update_authority` | Schema-validated; integer-major version must increase; `SELECT FOR UPDATE` row lock + CAS on `authority_version`; backfills initial version history on first update; appends to `authority_versions`; inserts `authority_update` decision; frozen contract bounds untouched (R-018) |
 
 ### Coordinator
 

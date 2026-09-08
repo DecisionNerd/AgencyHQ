@@ -111,23 +111,31 @@ on it.
   without touching historical rows (R-017). `update_authority` validates with
   `AuthoritySchema`, requires strictly increasing version, appends to
   `authority_versions`, inserts an `authority_update` decision; frozen contract
-  bounds are never modified (R-018). `selectDispatch` is campaign-aware:
-  campaign members cluster at their campaign main effort's rank; items without a
-  `campaignId` keep the existing global order; no new skip reason introduced.
+  bounds are never modified (R-018). `selectDispatch` is implemented and
+  domain-tested (`dispatch.campaign.test.ts`: main effort first within a
+  campaign, remaining members by rank/createdAt/id, items without `campaignId`
+  unaffected); the coordinator dispatches per command (no batch scheduler);
+  batch scheduling that calls `selectDispatch` is Slice 6 scope (planned).
   Hash-router web app (`#/`, `#/decisions`, `#/work-items/:id`,
   `#/projects/:id/authority`, `#/return`) with bearer-auth token prompt on 401;
-  every destructive action shows a confirm dialog naming the project, work item,
-  and version. Playwright browser tests: 16 journeys on a fake-runtime seeded
-  coordinator (return after interruption, five work-item states, approve from
-  decisions page, reject to halted, authority invalid/valid edits, stop to
-  stopping/stopped); CI job `browser`. One live trial item: approve via the
-  operator UI on the real stack (merge boundary, `pending_human` at 174 s,
-  approve clicked, `integrate.merge` dispatched in one transaction, remote
-  `main` advanced from `b1f48d0` to `5cbff2c`, work item `completed/healthy`).
-  One defect found by screenshot (single work-item view missing integration and
-  manifest rows; page had no lifecycle/condition label); fixed in `6ab2f2f`.
-  1,175 unit tests, 230 integration tests (83 db + 147 coordinator), 16 browser
-  tests. Full record:
+  work-item actions (approve, reject, stop, invalidate) each show a confirm
+  dialog naming the project and work item; approve, reject, and invalidate also
+  name the contract version. Playwright browser tests: 17 journeys on a
+  fake-runtime seeded coordinator (return after interruption; four state-card
+  source/timestamp checks; six work-item states; approve from decisions and
+  work-item pages; reject to halted; authority invalid/valid edits; stop to
+  stopping — proving the deterministic half only, as the fake runtime does not
+  produce adapter evidence for the full stop cycle); CI job `browser`; browser
+  suite red at `be841ff`, fixed at `04c3893`, green in CI at `04c3893` per
+  PR #12. One live trial item: approve via the operator UI on the real stack
+  (merge boundary, `pending_human` at 174 s, approve clicked, `integrate.merge`
+  dispatched in one transaction, remote `main` advanced from `b1f48d0` to
+  `5cbff2c`, work item `completed/healthy`). One defect found by screenshot
+  (single work-item view missing integration and manifest rows; page had no
+  lifecycle/condition label); fixed in `6ab2f2f`. Rework commit `84cdb08`
+  (open-pending rule, persisted reasons, membership guard, authority CAS; see
+  trial record §Rework). 1,181 unit tests, 238 integration tests (83 db + 155
+  coordinator), 17 browser tests. Full record:
   [trials/2026-09-slice5.md](../engineering/trials/2026-09-slice5.md).
 
 ## Slice 6 — capacity (current)
