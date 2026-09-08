@@ -48,11 +48,13 @@ DATABASE_URL=postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test pnpm --fi
 
 ## Network isolation
 
-The coordinator binds to `AGENCYHQ_BIND_HOST` (default `127.0.0.1`). The
-HTTP API has no authentication and must not be exposed beyond the host;
-bearer auth is planned but not yet implemented. All coordinator-to-Trigger
-communication uses the Trigger secret key held only by the coordinator
-process.
+The coordinator binds to `AGENCYHQ_BIND_HOST` (default `127.0.0.1`). All
+`/api/*` routes except `/api/health` require an `Authorization: Bearer
+<token>` header matching `AGENCYHQ_API_TOKEN`. When `AGENCYHQ_API_TOKEN` is
+unset and the bind host is not loopback, the server fails closed at startup.
+Loopback without a token is allowed but logs a startup warning. All
+coordinator-to-Trigger communication uses the Trigger secret key held only
+by the coordinator process.
 
 ## Running
 
