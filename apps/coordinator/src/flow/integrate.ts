@@ -219,7 +219,10 @@ async function loadIntentByRunAndTask(
  */
 export function deriveTargetRef(_allowedRefs: unknown): string {
   // Currently only "main" is supported; extend this when other ref names arise.
-  return "refs/heads/main";
+  // Short form: the integrate.merge helpers prefix refs/heads/ themselves and
+  // manifests store the short name (observed 2026-09-08: the long form broke
+  // the push lease).
+  return "main";
 }
 
 /**

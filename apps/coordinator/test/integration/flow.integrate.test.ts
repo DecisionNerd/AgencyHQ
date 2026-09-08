@@ -39,7 +39,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const ATTEMPT_REVISION = "aabbccdd1234567890aabbccdd1234567890aabb";
 const BASE_REVISION = "0000000000000000000000000000000000000000";
 const INTEGRATED_REVISION = "1111111111111111111111111111111111111111";
-const _TARGET_REF = "refs/heads/main";
+const _TARGET_REF = "main";
 
 const FAKE_PROFILE_DIGEST = String(digestOf({ id: "default", version: "1.0.0" }));
 const FAKE_PROFILE_RESOLVER = async (_profileId: string) => ({
@@ -316,7 +316,7 @@ test("flow.integrate (1): merge happy path — accept, integrate, complete", asy
       assert.equal(wipRows.length, 1, "work_item_projects row created at plan time");
       const wipRow = wipRows[0] as Record<string, unknown>;
       assert.equal(wipRow.position, 0, "position = 0");
-      assert.equal(wipRow.target_ref, "refs/heads/main", "target_ref = refs/heads/main");
+      assert.equal(wipRow.target_ref, "main", "target_ref = refs/heads/main");
 
       // After onAcceptFinal: check integrations row and intent committed BEFORE trigger
       // (R-002: recorded before trigger)
@@ -340,7 +340,7 @@ test("flow.integrate (1): merge happy path — accept, integrate, complete", asy
       );
       assert.equal(integRows.length, 1, "integrations row inserted at accept time");
       const integRow = integRows[0] as Record<string, unknown>;
-      assert.equal(integRow.target_ref, "refs/heads/main", "target_ref matches");
+      assert.equal(integRow.target_ref, "main", "target_ref matches");
       assert.equal(integRow.outcome, null, "outcome null (pending)");
 
       // Verify: dispatch intent for integrate.merge exists

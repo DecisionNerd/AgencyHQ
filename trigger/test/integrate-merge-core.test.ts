@@ -533,3 +533,10 @@ test("IntegrateMergeOutputSchema: conflict outcome parses", async () => {
     await fixture.cleanup();
   }
 });
+
+test("normalizeTargetRef accepts both the short and the refs/heads form", async () => {
+  const { normalizeTargetRef } = await import("../src/tasks/integrate-merge-core.ts");
+  assert.equal(normalizeTargetRef("main"), "main");
+  assert.equal(normalizeTargetRef("refs/heads/main"), "main");
+  assert.equal(normalizeTargetRef("refs/heads/release/1.x"), "release/1.x");
+});

@@ -92,6 +92,13 @@ export async function runIntegrateMerge(
   deps: IntegrateMergeDeps,
   runDir: string,
 ): Promise<IntegrateMergeOutput> {
+  // Target refs may arrive as "main" or "refs/heads/main" (the coordinator
+  // froze the long form for single-repo contracts; manifests use the short
+  // form). Every helper below prefixes refs/heads/ itself, so normalize once.
+  // Observed 2026-09-08: the long form produced a lease on
+  // refs/heads/refs/heads/main and git rejected the push with "stale info".
+  payload = { ...payload, targetRef: normalizeTargetRef(payload.targetRef) };
+
   const evidence: string[] = [];
   const mergeWtPath = resolveMergeWorktreePath(runDir);
 
@@ -232,4 +239,9 @@ export async function runIntegrateMerge(
       .worktreeRemove({ repoPath: payload.repoPath, worktreePath: mergeWtPath, force: true })
       .catch(() => undefined);
   }
+}
+
+/** "refs/heads/main" and "main" both mean the branch main. */
+export function normalizeTargetRef(ref: string): string {
+  return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
 }
