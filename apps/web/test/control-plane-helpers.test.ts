@@ -183,7 +183,13 @@ test("buildDecisionRow: maps all fields and adds formattedAt", () => {
     workItemId: "wi-1",
     obstacle: "policy_violation",
     recommendation: "fix the issue",
-    impact: { workItemId: "wi-1", contractVersion: 2, attemptId: "att-1" },
+    impact: {
+      workItemId: "wi-1",
+      contractVersion: 2,
+      attemptId: "att-1",
+      contractId: "ct-1",
+      attemptRevision: "rev-abc",
+    },
     noActionConsequence: "stays pending; no dispatch",
     actions: ["approve", "reject"],
     at: "2026-09-07T10:00:00.000Z",
@@ -194,7 +200,13 @@ test("buildDecisionRow: maps all fields and adds formattedAt", () => {
   assert.equal(row.workItemId, "wi-1");
   assert.equal(row.obstacle, "policy_violation");
   assert.equal(row.recommendation, "fix the issue");
-  assert.deepEqual(row.impact, { workItemId: "wi-1", contractVersion: 2, attemptId: "att-1" });
+  assert.deepEqual(row.impact, {
+    workItemId: "wi-1",
+    contractVersion: 2,
+    attemptId: "att-1",
+    contractId: "ct-1",
+    attemptRevision: "rev-abc",
+  });
   assert.equal(row.noActionConsequence, "stays pending; no dispatch");
   assert.deepEqual(row.actions, ["approve", "reject"]);
   assert.equal(row.at, "2026-09-07T10:00:00.000Z");

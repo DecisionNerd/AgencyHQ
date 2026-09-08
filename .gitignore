@@ -148,3 +148,7 @@ vite.config.ts.timestamp-*
 # Claude Code worktrees
 .claude/worktrees/
 node_modules
+
+# Playwright
+playwright-report/
+test-results/

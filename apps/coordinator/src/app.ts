@@ -9,6 +9,7 @@
 import {
   claimCommand,
   completeCommand,
+  getWorkItem,
   listAttemptsByContract,
   listDecisionsByWorkItem,
   listFindingsByAttempt,
@@ -477,6 +478,130 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   // ------------------------------------------------------------------
+  // GET /api/work-items/:id/view
+  // Returns an Item-shaped payload for a single work item, built by
+  // running buildReturnView over a snapshot scoped to just this item.
+  // ------------------------------------------------------------------
+  app.get("/api/work-items/:id/view", async (c) => {
+    const id = c.req.param("id");
+    const client = await pool.connect();
+    try {
+      const pgClient = client as Parameters<typeof listStepContractsByWorkItem>[0];
+
+      const wiRow = await getWorkItem(pgClient, id);
+      if (!wiRow) {
+        return c.json({ error: "not found" }, 404);
+      }
+
+      const wi: WorkItemLike = {
+        id: wiRow.id,
+        intent: wiRow.intent,
+        rank: wiRow.rank,
+        mainEffort: wiRow.main_effort,
+        lifecycle: wiRow.lifecycle,
+        condition: wiRow.condition,
+        updatedAt: wiRow.updated_at.toISOString(),
+        boundary: wiRow.boundary as "artifact" | "merge" | "deploy",
+      };
+
+      const wiDecisions = await listDecisionsByWorkItem(pgClient, id);
+      const decisions: DecisionLike[] = wiDecisions.map((d) => ({
+        id: d.id,
+        workItemId: id,
+        kind: d.kind ?? "",
+        outcome: d.outcome ?? "",
+        at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
+      }));
+
+      const wiContracts = await listStepContractsByWorkItem(pgClient, id);
+      const contracts: ContractLike[] = wiContracts.map((c) => ({
+        id: c.id,
+        workItemId: id,
+        version: c.version,
+        status: c.status,
+        updatedAt: c.updated_at.toISOString(),
+      }));
+
+      const attempts: AttemptLike[] = [];
+      const results: ResultLike[] = [];
+      const reviews: ReviewLike[] = [];
+      const findings: FindingLike[] = [];
+
+      for (const contract of wiContracts) {
+        const contractAttempts = await listAttemptsByContract(pgClient, contract.id);
+        for (const a of contractAttempts) {
+          attempts.push({
+            id: a.id,
+            contractId: contract.id,
+            status: a.status,
+            checkpointCommit: a.checkpoint_commit,
+            updatedAt: a.updated_at.toISOString(),
+          });
+
+          const attemptResults = await listVerificationResultsByAttempt(pgClient, a.id);
+          for (const r of attemptResults) {
+            results.push({
+              id: r.id,
+              attemptId: a.id,
+              result: r.result,
+              updatedAt: r.updated_at.toISOString(),
+            });
+          }
+
+          const attemptReviews = await listReviewsByAttempt(pgClient, a.id);
+          for (const r of attemptReviews) {
+            reviews.push({
+              id: r.id,
+              attemptId: a.id,
+              updatedAt: r.updated_at.toISOString(),
+            });
+          }
+
+          const attemptFindings = await listFindingsByAttempt(pgClient, a.id);
+          for (const f of attemptFindings) {
+            const finding: FindingLike = {
+              id: f.id,
+              severity: f.severity ?? "",
+              kind: f.kind ?? "",
+            };
+            if (f.attempt_id !== null) finding.attemptId = f.attempt_id;
+            findings.push(finding);
+          }
+        }
+      }
+
+      const input: ReturnViewInput = {
+        now: new Date().toISOString(),
+        lastAckAt: null,
+        freshness: { lastPollAt: null },
+        freshnessStaleMs: config.freshnessStaleMs,
+        workItems: [wi],
+        contracts,
+        attempts,
+        decisions,
+        results,
+        reviews,
+        findings,
+      };
+
+      const view = buildReturnView(input);
+
+      // The item appears in exactly one of these sections
+      const item =
+        view.changedSinceLastVisit.find((i) => i.workItemId === id) ??
+        view.continuing.find((i) => i.workItemId === id);
+
+      if (!item) {
+        return c.json({ error: "item not renderable" }, 500);
+      }
+
+      return c.json(item);
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------
   // GET /api/work-items/:id/realtime-token
   // ------------------------------------------------------------------
   app.get("/api/work-items/:id/realtime-token", async (c) => {
@@ -623,7 +748,12 @@ export function createApp(deps: AppDeps): Hono {
         attemptId: string | null;
         rationale: string | null;
       }> = [];
-      const allAttempts: Array<{ id: string; contractId: string; status: string }> = [];
+      const allAttempts: Array<{
+        id: string;
+        contractId: string;
+        status: string;
+        artifactRevision: string | null;
+      }> = [];
       const allContracts: Array<{
         id: string;
         workItemId: string;
@@ -665,10 +795,20 @@ export function createApp(deps: AppDeps): Hono {
 
             const attempts = await listAttemptsByContract(pgClient, c.id);
             for (const a of attempts) {
+              // Load the latest artifact revision for this attempt so the
+              // decisions view can expose contractId + attemptRevision for approve.
+              const { rows: _artRows } = await client.query(
+                "SELECT revision FROM artifacts WHERE attempt_id = $1 ORDER BY created_at DESC LIMIT 1",
+                [a.id],
+              );
+              const artifactRevision =
+                (_artRows[0] as { revision?: string } | undefined)?.revision ?? null;
+
               allAttempts.push({
                 id: a.id,
                 contractId: c.id,
                 status: a.status,
+                artifactRevision,
               });
 
               const findings = await listFindingsByAttempt(pgClient, a.id);

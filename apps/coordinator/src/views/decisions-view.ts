@@ -29,6 +29,8 @@ export type AttemptInputLike = {
   contractId: string;
   status: string;
   checkpointCommit?: string | null;
+  /** Revision (git SHA) from the artifact row for this attempt, if present. */
+  artifactRevision?: string | null;
 };
 
 export type ContractInputLike = {
@@ -60,6 +62,10 @@ export type DecisionImpact = {
   workItemId: string | null;
   contractVersion: number | null;
   attemptId: string | null;
+  /** The step_contract id required by the approve command. */
+  contractId: string | null;
+  /** The artifact revision (git SHA) required by the approve command. */
+  attemptRevision: string | null;
 };
 
 export type DecisionEntry = {
@@ -150,6 +156,11 @@ export function buildDecisionsView(input: DecisionsViewInput): DecisionsView {
       actions.push("reject");
     }
 
+    // Resolve contractId and artifactRevision from the associated attempt
+    const attempt = d.attemptId ? attemptById.get(d.attemptId) : undefined;
+    const contractId: string | null = attempt?.contractId ?? null;
+    const attemptRevision: string | null = attempt?.artifactRevision ?? null;
+
     return {
       id: d.id,
       workItemId: d.workItemId,
@@ -159,6 +170,8 @@ export function buildDecisionsView(input: DecisionsViewInput): DecisionsView {
         workItemId: d.workItemId,
         contractVersion,
         attemptId: d.attemptId ?? null,
+        contractId,
+        attemptRevision,
       },
       noActionConsequence: "stays pending; no dispatch",
       actions,

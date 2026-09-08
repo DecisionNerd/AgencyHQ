@@ -170,6 +170,10 @@ export interface DecisionImpact {
   workItemId: string | null;
   contractVersion: number | null;
   attemptId: string | null;
+  /** The step_contract id required by the approve command. */
+  contractId: string | null;
+  /** The artifact revision (git SHA) required by the approve command. */
+  attemptRevision: string | null;
 }
 
 export interface DecisionEntry {
@@ -314,7 +318,7 @@ export async function fetchReturnView(since: string | null): Promise<ReturnView>
 }
 
 export async function fetchWorkItem(id: string): Promise<Item> {
-  const res = await fetch(`/api/work-items/${encodeURIComponent(id)}`, {
+  const res = await fetch(`/api/work-items/${encodeURIComponent(id)}/view`, {
     headers: buildAuthHeaders(getToken()),
   });
   if (res.status === 401) throw handle401(safeStorage);

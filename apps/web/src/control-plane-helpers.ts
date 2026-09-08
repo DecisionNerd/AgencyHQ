@@ -165,6 +165,8 @@ export interface DecisionRowInput {
     workItemId: string | null;
     contractVersion: number | null;
     attemptId: string | null;
+    contractId: string | null;
+    attemptRevision: string | null;
   };
   noActionConsequence: string;
   actions: string[];
@@ -180,6 +182,8 @@ export interface DecisionRow {
     workItemId: string | null;
     contractVersion: number | null;
     attemptId: string | null;
+    contractId: string | null;
+    attemptRevision: string | null;
   };
   noActionConsequence: string;
   actions: string[];

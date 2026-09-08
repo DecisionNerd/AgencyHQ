@@ -171,6 +171,9 @@ describe("buildDecisionsView", () => {
     assert.equal(d.obstacle, "accept");
     assert.ok(d.actions.includes("approve"));
     assert.ok(d.actions.includes("reject"));
+    // contractId and attemptRevision should be populated from the attempt
+    assert.equal(d.impact.contractId, "ct-1");
+    assert.equal(d.impact.attemptRevision, null); // no artifact in this test
   });
 
   it("uses finding kinds as obstacle when findings exist for the attempt", () => {
@@ -196,6 +199,36 @@ describe("buildDecisionsView", () => {
     const d = view.decisions[0];
     assert.ok(d);
     assert.equal(d.obstacle, "security_violation"); // deduplicated
+  });
+
+  it("exposes contractId and attemptRevision from attempt in impact", () => {
+    const view = buildDecisionsView({
+      decisions: [
+        {
+          id: "d-1",
+          workItemId: "wi-1",
+          kind: "accept",
+          outcome: "pending_human",
+          at: "2026-01-01T00:00:00Z",
+          attemptId: "att-1",
+        },
+      ],
+      attempts: [
+        {
+          id: "att-1",
+          contractId: "ct-1",
+          status: "completed",
+          artifactRevision: "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+        },
+      ],
+      contracts: [{ id: "ct-1", workItemId: "wi-1", version: 1, status: "active" }],
+      findings: [],
+    });
+
+    const d = view.decisions[0];
+    assert.ok(d);
+    assert.equal(d.impact.contractId, "ct-1");
+    assert.equal(d.impact.attemptRevision, "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000");
   });
 
   it("includes rationale as recommendation when provided", () => {
