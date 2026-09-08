@@ -87,6 +87,9 @@ describes: `maxDuration: 600`, a single-concurrency `worker` queue, and one
 attempt (`retry: { maxAttempts: 1 }`, contract failures do not retry). `run`
 resolves the attempt's worktree and run directory, fails fast with
 `AbortTaskRunError` if the worktree path already exists, `worktreeAdd`s it,
+resolves the model — `payload.model` takes priority, then
+`AGENCYHQ_OPENCODE_MODEL`; neither being set is a setup failure
+(`AbortTaskRunError`, not retried),
 writes the permission ruleset and scrubbed env, and `spawnOpenCode`s the
 prompt, publishing `phase` (`worktree_ready` → `opencode_running` →
 `diffing` → `committed`/`path_violation`/`opencode_error`) and, once known,
@@ -309,6 +312,10 @@ Inputs (`LeadAcceptPayload`): attemptId, generation, contractId, criteria,
 verification results, the review output, and model. After the session, the task
 post-validates that every cited `verification_result` ref exists in
 `payload.verificationResults` (unknown refs → `{ kind: "invalid_output" }`).
+
+A per-run working directory is created via `mkdtemp` (never the bare `/tmp`
+directory). On success the directory is removed; on failure it is retained for
+evidence so the caller can inspect the lead session artifacts.
 
 Output: `AcceptanceProposal` on success, or `{ kind: "invalid_output"; reason }` on failure.
 

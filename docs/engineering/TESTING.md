@@ -33,7 +33,7 @@ Trigger run is never acceptance.
 | R-011 | Given contract, execution, verification, and acceptance states differ, when the operator opens the WorkItem, then each is distinct with its source and timestamp. | `apps/coordinator/test/integration/return-view.test.ts`, `apps/web/test/view-helpers.test.ts`; browser test (journey deferred to Slice 5). |
 | R-012 | Given the workspace, when reviewed, then domain imports remain inward and the deployment shape matches ARCHITECTURE.md. | Dependency check; ADR review. |
 | R-013 | Given an executing attempt, when the operator stops it, then generation advances before `runs.cancel`, a checkpoint is committed, the process group is confirmed gone, the UI shows *stopping* until the run is final, and a late observation from the old generation is history-only. | `apps/coordinator/test/integration/flow.stop.test.ts`, `apps/coordinator/test/integration/stop.test.ts`; execution trial. |
-| R-014 | Given a worker report claiming success with a weakened check, when verification and review run, then the original criteria and profile govern and the claim is not accepted. | Adapter and domain tests; trial. |
+| R-014 | Given a worker report claiming success with a weakened check, when verification and review run, then the original criteria and profile govern and the claim is not accepted. | Adapter and domain tests; `apps/coordinator/test/integration/flow.false-success.test.ts` (`flow.false-success (f): weakened test — review blocks, no verifier_tampered, work item not completed` — weakened test detected by adversarial reviewer via `REVIEW_BLOCKING`; test source files are not protected paths and are not caught by verifier-tamper detection); trial. |
 | R-015 | Given a `merge` boundary, when integration fails or the target ref moved, then the WorkItem stays incomplete and integration is retried compare-and-set, never blindly. | Integration adapter test. |
 | R-016 | Given a contract requiring a boundary the active runtime profile declares advisory (filesystem isolation, resource limits, egress, hard spend on the host profile), when dispatch is requested, then it is rejected. | Domain test. |
 | R-017 | Given an unrelated Finding, when the Lead classifies it, then a backlog WorkItem is linked and the contract is unchanged. | Domain test. |
@@ -76,9 +76,10 @@ manifests, lock files, workspace file, tsconfig*, biome.json, .github/**,
 vitest/jest configs) produces a blocking `verifier_tampered` Finding. Test
 source files are not protected paths — weakened or removed tests are the
 adversarial reviewer's job, governed by the contract's `paths.allow`. The
-coordinator's `onVerifyFinal` loads those findings and passes them to
-`evaluateAcceptance`; any blocking integrity finding causes rejection with
-reason `VERIFIER_TAMPERED` independently of the review. Profile versions are
+coordinator's `onVerifyFinal` writes those findings to the `findings`
+table; `onAcceptFinal` loads them and passes them to `evaluateAcceptance`.
+Any blocking integrity finding causes rejection with reason
+`VERIFIER_TAMPERED` independently of the review. Profile versions are
 currently `"2"` after this protection was tightened. Profiles must be
 re-versioned when the protected-path set changes.
 
@@ -144,13 +145,28 @@ version set. Items 1–4 ran on 2026-09-07 with Trigger.dev 4.5.16, OpenCode
 2026-09-07 on the complete Slice 3 stack; items 1–3 PASS, 4a PASS (4b/4c not
 exercised live — covered by Slice 1 record and unit tests), item 5 PASS, item
 6 PARTIAL (worker resisted adversarial house rules; weakened-test path not
-exercised live — covered by deterministic tests), item 7 PASS. Full record:
+exercised live — test source files are not protected paths and are not caught
+by verifier-tamper detection; a weakened test is detected only by the
+adversarial reviewer; `flow.false-success (f): weakened test — review blocks,
+no verifier_tampered, work item not completed` is the deterministic gate
+confirming `REVIEW_BLOCKING` rejection), item 7 PASS. Full record:
 [trials/2026-09-slice3.md](trials/2026-09-slice3.md). **Note (F-13):** the
 fixture's `pnpm-typecheck@1` check runs `echo typecheck-skipped-in-fixture`;
 its pass is vacuous for this fixture and provides no type-safety evidence.
 Rework re-check on 2026-09-07 (code at `6529f7a`): worker ruleset from the
 contract, stop path, and full flow re-verified live — see the
 [rework section](trials/2026-09-slice3.md#rework-after-independent-review-1-2026-09-07).
+Rework-3 re-check on 2026-09-07: `readStopEvidence` parses adapter
+`step`/`checkpointCommit` fields (H-1); `onAcceptFinal` loads
+`integrityFindings` (H-3); `flow.false-success (f)` added as the
+deterministic weakened-test gate (H-2); `cancelSkipped` on already-final
+cancel (H-5); `protectedPathsSource` recorded by `verify.run` (H-6);
+`retry_dispatch` takes `intentId` (CR-1); `AGENCYHQ_BIND_HOST` default
+`127.0.0.1` (CR-3); `AGENCYHQ_UNCERTAIN_AFTER_MS` on both confirmation paths
+(CR-4); retry-on-budget records a Failure on the superseded attempt (CR-5);
+`lead.accept` per-run temp directory (CR-6); migration 0002 NOT NULL
+constraints (CR-7); model from payload or `AGENCYHQ_OPENCODE_MODEL`, no
+built-in default (CR-9); no live run after 16002f2.
 
 **Implemented test layers (Slice 3):** Architecture baseline + dependency rules (`tests/architecture-baseline.test.mjs`, `tests/dependency-rules.test.mjs`); domain unit and property tests (`packages/domain`); persistence integration tests against Postgres 17.6 (`packages/db`); adapter fakes and unit tests (`trigger/`, `apps/coordinator/`); verification package unit tests (`packages/verification`); web view-model unit tests (`apps/web/`); CI integration job. Execution trial items 1–7 recorded (2026-09-07). Operator behavior: view-model tests only; browser journey tests deferred to Slice 5.
 

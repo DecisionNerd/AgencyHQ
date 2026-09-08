@@ -19,9 +19,9 @@ The `BoundedRepairFlow` class drives the plan → admit → dispatch → verify 
 1. `plan(workItemId, commandId)` — dispatches `lead.plan` and records a `DispatchIntent` in the same transaction before triggering (R-002).
 2. `onLeadPlanOutput(intentId, output, commandId)` — validates the proposal via `checkProposal` (R-001) and `enforceable`, freezes a `StepContract`, creates an `Attempt`, and dispatches `worker.attempt`.
 3. `onWorkerFinal(obs, commandId)` — classifies the observation, inserts an `Artifact`, and dispatches `verify.run`. Handles auto-retry on timeout and quarantine on path violation.
-4. `onVerifyFinal(obs, commandId)` — stores `VerificationResult` rows, checks for verifier tampering, and dispatches `lead.review`.
+4. `onVerifyFinal(obs, commandId)` — stores `VerificationResult` rows, writes blocking `verifier_tampered` findings to the `findings` table, and dispatches `lead.review`.
 5. `onReviewFinal(obs, commandId)` — stores the `Review` row and dispatches `lead.accept`.
-6. `onAcceptFinal(obs, commandId)` — runs `evaluateAcceptance` (R-001, R-014); on success updates `WorkItem.lifecycle = completed`.
+6. `onAcceptFinal(obs, commandId)` — loads `integrityFindings` (blocking `verifier_tampered` rows for this attempt) and passes them to `evaluateAcceptance` (R-001, R-014); on success updates `WorkItem.lifecycle = completed`.
 
 ### Key invariants
 
@@ -31,7 +31,10 @@ The `BoundedRepairFlow` class drives the plan → admit → dispatch → verify 
 - **Idempotency**: all methods use `claimCommand` / `completeCommand` so re-delivery is safe.
 - **Dispatch options**: `runtime.trigger()` is called with `concurrencyKey` (repository id), `tags` (project, workItem, contract version, attempt), and `maxDurationSeconds` from the contract.
 - **Observation dedupe**: run observations are keyed by Trigger run id and attempt generation; a delivery for a revoked generation is stored as history-only (stale). Deterministic observation command ids are `cmd_obs_<runId>_<gen>`. An in-flight guard prevents concurrent poll deliveries for the same run.
-- **Stop path**: CANCELED/TIMED_OUT worker observations are always routed to stop confirmation — no such observation is skipped. If the attempt is `dispatched` or `running` at that point (externally cancelled or hard-timed-out), the reconciler calls `stopAttempt` with actor `"coordinator"` first, then `confirmStop`. Evidence priority: (1) run metadata (`survivors`, `checkpointCommit`), (2) `stop.ndjson` in the run directory, (3) pending. The checkpoint commit is recorded on the attempt row; the cancelled observation is stored as history-only (stale); no replacement attempt is dispatched from the stop path. If no evidence is available within `AGENCYHQ_UNCERTAIN_AFTER_MS` (default 120 000 ms) from the first final observation, the attempt becomes `uncertain` and the work item condition `uncertain`.
+- **Stop path**: CANCELED/TIMED_OUT worker observations are always routed to stop confirmation — no such observation is skipped. If the attempt is `dispatched` or `running` at that point (externally cancelled or hard-timed-out), the reconciler calls `stopAttempt` with actor `"coordinator"` first, then `confirmStop`. Evidence priority: (1) run metadata (`survivors`, `checkpointCommit`), (2) `stop.ndjson` in the run directory — `readStopEvidence` parses the adapter's `step` and `checkpointCommit` NDJSON fields (legacy `event`/`commit` keys also accepted), (3) pending. The checkpoint commit is recorded on the attempt row; the cancelled observation is stored as history-only (stale); no replacement attempt is dispatched from the stop path. `AGENCYHQ_UNCERTAIN_AFTER_MS` (default 120 000 ms) applies on both confirmation paths — via the reconciler calling `confirmStop` and via `onWorkerFinal` routing CANCELED/TIMED_OUT; the attempt becomes `uncertain` when the deadline passes with no evidence. Test coverage: `apps/coordinator/test/integration/flow.stop.test.ts` (including `flow.stop (CR-4)`) and `apps/coordinator/test/commands.unit.test.ts` (`readStopEvidence` unit tests).
+- **Cancel on already-final run**: if `runtime.cancel` throws because the run reached a final status before the cancel call, the command completes with `cancelSkipped: true`; generation was already revoked and the attempt proceeds through normal stop confirmation.
+- **Status guards**: completion, quarantine, and failure updates in `onWorkerFinal` are guarded by `WHERE status IN ('admitted','dispatched','running')`; a stop that lands between `applyObservation` and the update wins and the observation is skipped as stale (`flow.stop (CR-2)`).
+- **`retry_dispatch` command**: takes `intentId` in the request body (not `workItemId`); calls `flow.retryDispatch(intentId, commandId)` to re-trigger the already-recorded intent.
 - **Stop command replay**: a repeated stop command with the same command id returns `replayed: true`.
 
 ### Testing
@@ -41,6 +44,14 @@ Integration tests use `withTestSchema` (isolated Postgres schema per test) and `
 ```
 DATABASE_URL=postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test pnpm --filter @agencyhq/coordinator test:integration
 ```
+
+## Network isolation
+
+The coordinator binds to `AGENCYHQ_BIND_HOST` (default `127.0.0.1`). The
+HTTP API has no authentication and must not be exposed beyond the host;
+bearer auth is planned but not yet implemented. All coordinator-to-Trigger
+communication uses the Trigger secret key held only by the coordinator
+process.
 
 ## Running
 
