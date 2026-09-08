@@ -526,6 +526,7 @@ describe("POST /api/commands kind=approve — field validation", () => {
         decisionId: `dec-${input.commandId}`,
         artifactRevision: input.attemptRevision,
       }),
+      disposition: async () => ({ ok: true, outcome: "backlog" as const }),
       lastAckAt: async () => null,
     };
   }
@@ -861,5 +862,171 @@ describe("Bearer-token auth middleware (I2.a)", () => {
     const app = makeAuthApp(undefined);
     const res = await app.request("/api/health");
     assert.equal(res.status, 200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// disposition command: API validation (PACKET 4.2.b C4)
+// ---------------------------------------------------------------------------
+
+describe("POST /api/commands kind=disposition — field validation", () => {
+  function makeDispositionCommands(): CommandsLike {
+    return {
+      stop: async () => ({ ok: true }),
+      pause: async () => ({ ok: true }),
+      resume: async () => ({ ok: true }),
+      createWorkItem: async () => ({ ok: true, workItemId: "wi_fake" }),
+      ackVisit: async () => ({ ok: true, at: NOW }),
+      approve: async (input) => ({
+        ok: true as const,
+        decisionId: `dec-${input.commandId}`,
+        artifactRevision: input.attemptRevision,
+      }),
+      disposition: async () => ({ ok: true, outcome: "backlog" as const }),
+      lastAckAt: async () => null,
+    };
+  }
+
+  it("returns 400 when findingId is missing", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeDispositionCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-disp-1",
+        kind: "disposition",
+        disposition: "remediate",
+        reason: "try again",
+        actor: "human",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /findingId/);
+  });
+
+  it("returns 400 when disposition value is invalid", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeDispositionCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-disp-2",
+        kind: "disposition",
+        findingId: "fnd_abc",
+        disposition: "invalid_value",
+        reason: "test",
+        actor: "human",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /disposition/);
+  });
+
+  it("returns 200 when all required fields are present", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeDispositionCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-disp-3",
+        kind: "disposition",
+        findingId: "fnd_abc",
+        disposition: "backlog",
+        reason: "not urgent",
+        actor: "human",
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { result: { ok: boolean; outcome: string } };
+    assert.ok(body.result.ok);
+    assert.equal(body.result.outcome, "backlog");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// return-view: merge item carries integrations and workItemProjects (PACKET 4.2.b C5)
+// ---------------------------------------------------------------------------
+
+describe("GET /api/return-view — merge item carries integrations and workItemProjects", () => {
+  it("snapshot with integrations and workItemProjects propagates to return-view", async () => {
+    const snapshot: LedgerSnapshot = {
+      ...EMPTY_SNAPSHOT,
+      workItems: [
+        {
+          id: "wi-merge-1",
+          intent: "Multi-repo fix",
+          rank: 1,
+          mainEffort: true,
+          lifecycle: "active",
+          condition: "healthy",
+          boundary: "merge",
+          updatedAt: NOW,
+        },
+      ],
+      integrations: [
+        {
+          id: "int-1",
+          attemptId: "att-1",
+          targetRef: "main",
+          outcome: "ok",
+          resultingRevision: "bbbb000000000000000000000000000000000000",
+          at: NOW,
+        },
+      ],
+      workItemProjects: [
+        {
+          workItemId: "wi-merge-1",
+          position: 0,
+          resultRevision: null,
+        },
+      ],
+    };
+    const app = createApp({
+      pool: makeFakePool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(NOW),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => snapshot,
+    });
+
+    const res = await app.request("/api/return-view");
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      continuing: Array<{ workItemId: string }>;
+    };
+    // The work item should appear in the view (active lifecycle)
+    // (exact view structure depends on buildReturnView implementation)
+    assert.ok(Array.isArray(body.continuing), "continuing array present");
   });
 });

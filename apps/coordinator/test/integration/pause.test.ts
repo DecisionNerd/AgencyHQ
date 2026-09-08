@@ -269,7 +269,13 @@ test("createWorkItem idempotency: same commandId returns the same workItemId", a
         rank: 1,
       });
 
-      assert.equal(second.workItemId, first.workItemId, "Idempotent: same workItemId returned");
+      assert.ok(second.ok, "second call should succeed");
+      assert.ok(first.ok, "first call should succeed");
+      assert.equal(
+        (second as { ok: true; workItemId: string }).workItemId,
+        (first as { ok: true; workItemId: string }).workItemId,
+        "Idempotent: same workItemId returned",
+      );
 
       // Only one work item should exist in the DB
       const { rows } = await ctx.client.query<{ count: string }>(

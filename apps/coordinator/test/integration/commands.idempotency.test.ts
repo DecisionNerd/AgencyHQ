@@ -290,7 +290,12 @@ test("idempotency: createWorkItem same commandId → same workItemId", async (t)
         rank: 1,
       });
 
-      assert.equal(second.workItemId, first.workItemId);
+      assert.ok(second.ok, "second call should succeed");
+      assert.ok(first.ok, "first call should succeed");
+      assert.equal(
+        (second as { ok: true; workItemId: string }).workItemId,
+        (first as { ok: true; workItemId: string }).workItemId,
+      );
 
       const { rows } = await ctx.client.query<{ count: string }>(
         `SELECT count(*)::text AS count FROM work_items WHERE project_id = $1`,
