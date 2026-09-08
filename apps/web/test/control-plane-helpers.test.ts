@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { OpenPendingDecisionHelper } from "../src/control-plane-helpers.ts";
 import {
   buildApproveBody,
   buildDecisionRow,
@@ -17,6 +18,7 @@ import {
   formatTimestamp,
   lifecycleIcon,
   parseRoute,
+  pickOpenDecision,
 } from "../src/control-plane-helpers.ts";
 
 // ---- parseRoute ------------------------------------------------------------
@@ -419,4 +421,104 @@ test("confirmMessage: omits version suffix when contractVersion is undefined", (
   assert.ok(msg.includes("prj-3"), "should contain projectId");
   assert.ok(msg.includes("wi-3"), "should contain workItemId");
   assert.ok(!msg.includes("contract"), "should not mention contract when version is omitted");
+});
+
+test("confirmMessage: includes attempt id when provided", () => {
+  const msg = confirmMessage({
+    action: "approve",
+    projectId: "prj-1",
+    workItemId: "wi-1",
+    contractVersion: 3,
+    attemptId: "att-abc123",
+  });
+  assert.ok(msg.includes("att-abc123"), "should contain attemptId");
+  assert.ok(msg.includes("v3"), "should contain contract version");
+  assert.ok(msg.includes("prj-1"), "should contain projectId");
+  assert.ok(msg.includes("wi-1"), "should contain workItemId");
+});
+
+test("confirmMessage: omits attempt id when not provided", () => {
+  const msg = confirmMessage({
+    action: "approve",
+    projectId: "prj-1",
+    workItemId: "wi-1",
+    contractVersion: 2,
+  });
+  assert.ok(!msg.includes("attempt"), "should not mention attempt when not provided");
+});
+
+test("confirmMessage: includes consequence phrase when provided", () => {
+  const msg = confirmMessage({
+    action: "reject",
+    projectId: "prj-1",
+    workItemId: "wi-1",
+    consequence: "halts the work item; no further attempts",
+  });
+  assert.ok(msg.includes("halts the work item"), "should contain consequence phrase");
+  assert.ok(msg.includes("no further attempts"), "should contain full consequence");
+});
+
+test("confirmMessage: consequence appears on a new line", () => {
+  const msg = confirmMessage({
+    action: "stop",
+    projectId: "prj-1",
+    workItemId: "wi-1",
+    attemptId: "att-xyz",
+    consequence: "stops the running attempt; the checkpoint is kept",
+  });
+  assert.ok(msg.includes("\n"), "consequence should be on a new line");
+  assert.ok(msg.includes("stops the running attempt"), "should contain stop consequence");
+});
+
+test("confirmMessage: omits consequence when not provided", () => {
+  const msg = confirmMessage({
+    action: "pause",
+    projectId: "prj-1",
+    workItemId: "wi-1",
+  });
+  // No consequence → no newline in the message
+  assert.ok(!msg.includes("\n"), "no newline when consequence is omitted");
+});
+
+// ---- pickOpenDecision --------------------------------------------------------
+
+test("pickOpenDecision: returns null for undefined input", () => {
+  assert.equal(pickOpenDecision(undefined), null);
+});
+
+test("pickOpenDecision: returns null for null input", () => {
+  assert.equal(pickOpenDecision(null), null);
+});
+
+test("pickOpenDecision: returns null for empty array", () => {
+  assert.equal(pickOpenDecision([]), null);
+});
+
+test("pickOpenDecision: returns first element of a non-empty array", () => {
+  const decision: OpenPendingDecisionHelper = {
+    id: "dec-1",
+    kind: "accept",
+    attemptId: "att-1",
+    contractVersion: 3,
+    at: "2026-09-08T10:00:00.000Z",
+  };
+  assert.deepEqual(pickOpenDecision([decision]), decision);
+});
+
+test("pickOpenDecision: returns first of multiple decisions", () => {
+  const first: OpenPendingDecisionHelper = {
+    id: "dec-1",
+    kind: "accept",
+    attemptId: "att-1",
+    contractVersion: 3,
+    at: "2026-09-08T10:00:00.000Z",
+  };
+  const second: OpenPendingDecisionHelper = {
+    id: "dec-2",
+    kind: "review",
+    attemptId: null,
+    contractVersion: null,
+    at: "2026-09-08T11:00:00.000Z",
+  };
+  assert.deepEqual(pickOpenDecision([first, second]), first);
 });

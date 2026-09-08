@@ -129,22 +129,23 @@ test("work item page: blocked item shows remediate action", async ({ page }) => 
 });
 
 test("work item page: merge-boundary item has stop action available", async ({ page }) => {
+  // U-9: must assert action-stop is visible and the integration card shows its state.
+  // Navigating directly by id is faster and more deterministic than the overview search.
+  const ids = seedIds();
+  expect(ids.wiMerge, "seed must publish wiMerge").toBeTruthy();
+
   await injectToken(page);
-  await page.goto("/#/");
-  await expect(page.getByTestId("projects-section")).toBeVisible({ timeout: 10_000 });
-
-  const row = page
-    .locator(`[data-testid^="work-item-row-"]`)
-    .filter({ hasText: "wi-merge:" })
-    .first();
-  await expect(row).toBeVisible({ timeout: 5_000 });
-
-  const link = row.locator("a").first();
-  await link.click();
+  await page.goto(`/#/work-items/${encodeURIComponent(ids.wiMerge)}`);
 
   await expect(page.getByTestId("work-item-detail")).toBeVisible({ timeout: 10_000 });
-  // Merge-boundary running item shows the evidence panel
-  await expect(page.getByTestId("evidence-panel")).toBeVisible();
+
+  // Stop action must be visible for a running item that has an attempt
+  await expect(page.getByTestId("action-stop")).toBeVisible({ timeout: 5_000 });
+
+  // Integration card must show the seeded integration state (outcome = integrated)
+  const integrationCard = page.locator(".state-card").filter({ hasText: "Integration" });
+  await expect(integrationCard).toBeVisible({ timeout: 5_000 });
+  await expect(integrationCard).toContainText("Integrated");
 });
 
 test("work item page: merge-boundary item shows integration state and lifecycle", async ({

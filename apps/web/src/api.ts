@@ -79,6 +79,19 @@ export interface ManifestInfo {
   total: number;
 }
 
+/**
+ * An open pending decision returned by GET /api/work-items/:id/view.
+ * This is the only source of truth for whether Approve/Reject/Invalidate
+ * actions are live on the work item page.
+ */
+export interface OpenPendingDecision {
+  id: string;
+  kind: string;
+  attemptId: string | null;
+  contractVersion: number | null;
+  at: string;
+}
+
 export interface Item {
   workItemId: string;
   intent: string;
@@ -92,6 +105,11 @@ export interface Item {
   acceptance: State;
   integration: IntegrationInfo | null;
   manifest: ManifestInfo | null;
+  /**
+   * Source of truth for whether Approve/Reject/Invalidate actions are live.
+   * When absent (older server), treat as no open decisions.
+   */
+  openPendingDecisions?: OpenPendingDecision[];
 }
 
 export interface PendingDecision {
@@ -371,14 +389,15 @@ export async function fetchAuthority(projectId: string): Promise<AuthorityView> 
   return res.json() as Promise<AuthorityView>;
 }
 
+export type PutAuthorityResult =
+  | { commandId: string; result: { ok: true; version: number } }
+  | { commandId: string; result: { ok: false; reason: string; currentVersion: number } }
+  | { commandId: string; errors: Array<{ message: string; path?: string[] }> };
+
 export async function putAuthority(
   projectId: string,
-  body: Record<string, unknown>,
-): Promise<{
-  commandId: string;
-  result?: unknown;
-  errors?: Array<{ message: string; path?: string[] }>;
-}> {
+  body: { authority: Record<string, unknown>; expectedVersion: number },
+): Promise<PutAuthorityResult> {
   const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/authority`, {
     method: "PUT",
     headers: { "Content-Type": "application/json", ...buildAuthHeaders(getToken()) },
@@ -392,8 +411,15 @@ export async function putAuthority(
       errors: Array<{ message: string; path?: string[] }>;
     }>;
   }
+  // 409 carries version conflict details inline — return them rather than throwing
+  if (res.status === 409) {
+    return res.json() as Promise<{
+      commandId: string;
+      result: { ok: false; reason: string; currentVersion: number };
+    }>;
+  }
   if (!res.ok) throw new Error(`putAuthority: ${res.status} ${res.statusText}`);
-  return res.json() as Promise<{ commandId: string; result?: unknown }>;
+  return res.json() as Promise<{ commandId: string; result: { ok: true; version: number } }>;
 }
 
 /**

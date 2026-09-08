@@ -30,6 +30,12 @@ test("return view renders all sections", async ({ page }) => {
 });
 
 test("return view shows pending decisions section with seeded data", async ({ page }) => {
+  // U-9: must assert concrete content, not merely the absence of an alert.
+  // wiPending has a pending_human accept decision that no journey consumes,
+  // so it must appear in the Decisions pending section.
+  const ids = seedIds();
+  expect(ids.wiPending, "seed must publish wiPending").toBeTruthy();
+
   await page.goto("/#/return");
 
   // Wait for the view to render
@@ -37,10 +43,19 @@ test("return view shows pending decisions section with seeded data", async ({ pa
     timeout: 10_000,
   });
 
-  // The seeded data has two pending_human decisions (wiApprove, wiReject)
-  // They should appear in either the decisions or continuing section.
-  // We verify the page is not in an error state.
-  await expect(page.getByRole("alert")).not.toBeVisible();
+  // The decisions section must show at least one decision card (fails on empty page)
+  const decisionsSection = page
+    .locator("section")
+    .filter({ has: page.getByRole("heading", { name: /Decisions pending/i }) });
+  await expect(decisionsSection).toBeVisible({ timeout: 5_000 });
+
+  // At least one .decision-card must be visible (wiPending's decision is never consumed)
+  const decisionCards = decisionsSection.locator(".decision-card");
+  await expect(decisionCards.first()).toBeVisible({ timeout: 10_000 });
+
+  // The decision card for wiPending must mention its work item id
+  const cardWithWiPending = decisionCards.filter({ hasText: ids.wiPending });
+  await expect(cardWithWiPending).toBeVisible({ timeout: 5_000 });
 });
 
 test("return view: acknowledge visit button is present", async ({ page }) => {

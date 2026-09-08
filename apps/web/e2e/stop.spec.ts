@@ -47,6 +47,8 @@ test("work item page: stop action on running item shows confirm dialog and trans
   const message = await page.getByTestId("confirm-message").innerText();
   expect(message).toContain(ids.projectId);
   expect(message).toContain(ids.wiBlocked);
+  expect(message).toMatch(/stops the running attempt/i);
+  expect(message).toMatch(/attempt/i);
   await page.getByTestId("confirm-ok").click();
 
   // Dialog closes; no error.
