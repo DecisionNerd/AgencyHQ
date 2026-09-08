@@ -54,6 +54,7 @@ import {
 } from "@agencyhq/domain";
 
 import { generationOfIntent } from "./bounded-repair.ts";
+import { buildLeadPlanIntent } from "./payloads.ts";
 import type { FlowDeps, IsAncestorFn, LsRemoteFn } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
@@ -409,6 +410,27 @@ export async function onIntegrateFinal(
 
       await setResultRevision(client, contractRow.work_item_id, wipRow.position, resultingRevision);
 
+      // Defect 3: advance the project's stored base (allowed_refs) to the
+      // resulting revision.  Guarded: only update when the stored value equals
+      // the integration's expected base so stale / concurrent writes are ignored.
+      {
+        const allowedRefs = (projectRow.allowed_refs ?? {}) as Record<string, string>;
+        // Find the key in allowed_refs that corresponds to targetRef.
+        // allowed_refs may use either the full ref ("refs/heads/main") or the
+        // short name ("main") as the key; try both forms.
+        const shortRef = targetRef.replace(/^refs\/heads\//, "");
+        const advanceKey: string | null =
+          targetRef in allowedRefs ? targetRef : shortRef in allowedRefs ? shortRef : null;
+        if (advanceKey && allowedRefs[advanceKey] === integrationRow.expected_base_revision) {
+          await client.query(
+            `UPDATE projects
+             SET allowed_refs = jsonb_set(allowed_refs, $1::text[], $2::jsonb, false)
+             WHERE id = $3`,
+            [`{${advanceKey}}`, JSON.stringify(resultingRevision), contractRow.project_id],
+          );
+        }
+      }
+
       // Reload all entries; check if all resolved.
       const allEntries = await listWorkItemProjects(client, contractRow.work_item_id);
       const manifestEntries: ManifestEntry[] = allEntries.map((row) => ({
@@ -677,8 +699,21 @@ async function prepareNextEntryLeadPlan(
   const wiRow = wiRows[0] as WorkItemRow | undefined;
   if (!wiRow) throw new Error(`WorkItem ${contractRow.work_item_id} not found`);
 
-  // Refresh expected base revision for next entry from the ledger.
-  const nextBaseRevision = nextE.expectedBaseRevision;
+  // Defect 3: refresh base revision for next entry from the project's current
+  // allowed_refs (which may have been advanced by a concurrent integration of
+  // a sibling entry). Fall back to the ledger value if no valid SHA is found.
+  const nextBaseRevision = (() => {
+    const refs = (nextProject.allowed_refs ?? {}) as Record<string, string>;
+    const shortRef = (nextE.targetRef ?? "main").replace(/^refs\/heads\//, "");
+    const key =
+      nextE.targetRef && nextE.targetRef in refs
+        ? nextE.targetRef
+        : shortRef in refs
+          ? shortRef
+          : null;
+    const v = key ? refs[key] : undefined;
+    return typeof v === "string" && /^[0-9a-f]{40}$/.test(v) ? v : nextE.expectedBaseRevision;
+  })();
 
   // Build manifest with refreshed base revision for next entry.
   const updatedEntries = manifestEntries.map((e) => ({
@@ -693,6 +728,23 @@ async function prepareNextEntryLeadPlan(
   const intentId = ids.next("di") as DispatchIntentId;
   const idempotencyKey = `leadplan:${wiRow.id}:${String(intentId)}`;
 
+  // Defect 2: build operatorIntent through the shared helper so the Lead
+  // receives the boundary requirement text and the entry-context line.
+  const operatorIntent = buildLeadPlanIntent(wiRow.intent, {
+    boundary: "merge", // manifest work items always require merge boundary
+    manifestEntry: {
+      position: nextE.position,
+      totalEntries: manifestEntries.length,
+      projectId: nextE.projectId,
+      clonePath: nextProject.clone_path,
+      allEntries: manifestEntries.map((e) => ({
+        position: e.position,
+        projectId: e.projectId,
+        resultRevision: e.resultRevision,
+      })),
+    },
+  });
+
   const payload = LeadPlanPayloadSchema.parse({
     workItemId: wiRow.id,
     projectId: nextE.projectId,
@@ -703,7 +755,7 @@ async function prepareNextEntryLeadPlan(
     profileCatalog: Array.isArray(nextProject.profile_catalog)
       ? (nextProject.profile_catalog as string[])
       : ["default"],
-    operatorIntent: wiRow.intent,
+    operatorIntent,
     model: config.leadModel,
     manifest: contractManifest,
   });

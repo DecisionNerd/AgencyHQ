@@ -82,6 +82,7 @@ import {
 import type pg from "pg";
 
 import { deriveTargetRef } from "./integrate.ts";
+import { buildLeadPlanIntent } from "./payloads.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -747,6 +748,7 @@ export class BoundedRepairFlow {
       const wipRows = await listWorkItemProjects(client, workItemId);
       let targetProjectRow: ProjectRow;
       let manifestForPayload: { entries: ManifestEntry[]; digest: string } | undefined;
+      let planFirstEntry: ManifestEntry | null = null;
 
       if (wipRows.length > 0) {
         // Manifest item: build entries and target the first unresolved entry.
@@ -763,6 +765,7 @@ export class BoundedRepairFlow {
           await completeCommand(client, commandId, { skipped: "all_resolved" });
           return { intentId: "", runId: "" };
         }
+        planFirstEntry = firstEntry;
         targetProjectRow = await loadProject(pool, firstEntry.projectId);
         manifestForPayload = {
           entries: manifestEntries,
@@ -773,6 +776,25 @@ export class BoundedRepairFlow {
       }
 
       const baseRevision = await baseRevisionFromProject(targetProjectRow);
+
+      const operatorIntent = buildLeadPlanIntent(wiRow.intent, {
+        boundary: wiRow.boundary,
+        ...(manifestForPayload && planFirstEntry
+          ? {
+              manifestEntry: {
+                position: planFirstEntry.position,
+                totalEntries: manifestForPayload.entries.length,
+                projectId: targetProjectRow.id,
+                clonePath: targetProjectRow.clone_path,
+                allEntries: manifestForPayload.entries.map((e) => ({
+                  position: e.position,
+                  projectId: e.projectId,
+                  resultRevision: e.resultRevision,
+                })),
+              },
+            }
+          : {}),
+      });
 
       const payload = LeadPlanPayloadSchema.parse({
         workItemId: wiRow.id,
@@ -785,10 +807,7 @@ export class BoundedRepairFlow {
           ? (targetProjectRow.profile_catalog as string[])
           : [],
         ...(wiRow.defect ? { defect: wiRow.defect } : {}),
-        operatorIntent:
-          wiRow.boundary === "merge"
-            ? `${wiRow.intent}\n\nIntegration requirement: this work item completes at the merge boundary; propose boundary merge.`
-            : wiRow.intent,
+        operatorIntent,
         model: config.leadModel,
         ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
       });
@@ -847,6 +866,9 @@ export class BoundedRepairFlow {
   ): Promise<void> {
     const { pool, runtime, ids, config, profile, profileResolver } = this.deps;
 
+    // Captured early so the catch block can record a recovery decision (Defect 4).
+    let recoveryWorkItemId: string | null = null;
+
     const client = await pool.connect();
     try {
       const claim = await claimCommand(client, commandId, "onLeadPlanOutput");
@@ -856,14 +878,18 @@ export class BoundedRepairFlow {
 
       const workItemId = workItemIdFromPlanIntentKey(intentRow.idempotency_key);
       if (!workItemId) throw new Error(`Cannot recover workItemId from intent ${intentId}`);
+      recoveryWorkItemId = workItemId;
 
       const wiRow = await loadWorkItem(pool, workItemId);
 
       // For manifest work items, use the next unresolved entry's project.
+      // Hoist activeManifestEntry so we can store manifestPosition in contract inputs.
       const wipRows = await listWorkItemProjects(client, workItemId);
       let projectRow: ProjectRow;
       let activeEntryTargetRef: string | null = null;
       let manifestDigestValue: string | null = null;
+      let activeManifestEntry: ManifestEntry | null = null;
+      let allManifestEntries: ManifestEntry[] | null = null;
       if (wipRows.length > 0) {
         const manifestEntries: ManifestEntry[] = wipRows.map((row) => ({
           position: row.position,
@@ -872,7 +898,9 @@ export class BoundedRepairFlow {
           expectedBaseRevision: row.expected_base_revision,
           resultRevision: row.result_revision,
         }));
+        allManifestEntries = manifestEntries;
         const activeEntry = nextEntry(manifestEntries);
+        activeManifestEntry = activeEntry ?? null;
         projectRow = await loadProject(pool, activeEntry?.projectId ?? wiRow.project_id);
         activeEntryTargetRef = activeEntry?.targetRef ?? null;
         manifestDigestValue = String(contractManifestDigest(manifestEntries));
@@ -1031,14 +1059,26 @@ export class BoundedRepairFlow {
       const criteriaDigest = digestOf(criteriaDigestInput(proposal.criteria)) as Digest;
       const baseRevision = await baseRevisionFromProject(projectRow);
 
+      // R-015 / Defect 1: contract version must be unique per work item.
+      // Use max(version)+1 so multi-entry manifests each get a unique version.
+      const { rows: vRows } = await client.query<{ max_v: string | null }>(
+        `SELECT MAX(version)::text AS max_v FROM step_contracts WHERE work_item_id = $1`,
+        [workItemId],
+      );
+      const nextContractVersion = (Number(vRows[0]?.max_v ?? 0) || 0) + 1;
+
       const contractId = ids.next("sc") as StepContractId;
+
+      // For manifest work items, the contract belongs to the active entry's project,
+      // not the work item's primary project (which is always entry 0).
+      const contractProjectId = (activeManifestEntry?.projectId ?? wiRow.project_id) as ProjectId;
 
       const contract = freezeContract({
         proposal,
         decisionId,
         workItem: {
           id: wiRow.id as WorkItemId,
-          projectId: wiRow.project_id as ProjectId,
+          projectId: contractProjectId,
           intent: wiRow.intent,
           ...(wiRow.defect ? { defect: wiRow.defect } : {}),
         },
@@ -1048,7 +1088,7 @@ export class BoundedRepairFlow {
         criteriaDigest,
         requiredBoundaries: reqBoundaries,
         humanRequired: approvalCheck.required,
-        version: 1,
+        version: nextContractVersion,
         id: contractId,
       });
 
@@ -1112,7 +1152,13 @@ export class BoundedRepairFlow {
           String(contract.projectId),
           contract.version,
           contract.baseRevision,
-          JSON.stringify(contract.inputs),
+          // Defect 1: store manifest position in inputs so entries can be traced.
+          JSON.stringify({
+            ...contract.inputs,
+            ...(activeManifestEntry !== null
+              ? { manifestPosition: activeManifestEntry.position }
+              : {}),
+          }),
           JSON.stringify(contract.criteria),
           String(contract.criteriaDigest),
           contract.profileId,
@@ -1216,12 +1262,59 @@ export class BoundedRepairFlow {
         runId,
       });
     } catch (err) {
+      // Rollback any open transaction.
       try {
         await client.query("ROLLBACK");
       } catch {
         /* best-effort */
       }
-      throw err;
+
+      // Defect 4: record an execution failure + pending_human decision so the
+      // work item is not stranded. Use a fresh connection (main client's
+      // transaction was just rolled back; claimCommand auto-committed earlier).
+      if (recoveryWorkItemId) {
+        const recoveryClient = await pool.connect();
+        try {
+          await recoveryClient.query("BEGIN");
+          await recoveryClient.query(
+            `INSERT INTO failures (id, class, phase, run_id, cause, evidence)
+             VALUES ($1, 'execution', 'plan', NULL, $2, $3)`,
+            [
+              String(ids.next("fl")),
+              (err instanceof Error ? err.message : String(err)).slice(0, 500),
+              JSON.stringify({ intentId, error: String(err) }),
+            ],
+          );
+          await recoveryClient.query(
+            `INSERT INTO decisions (id, kind, actor, work_item_id, outcome, at)
+             VALUES ($1, 'plan', 'coordinator', $2, 'pending_human', $3)`,
+            [String(ids.next("dec")), recoveryWorkItemId, new Date()],
+          );
+          await recoveryClient.query(
+            "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
+            [intentId],
+          );
+          await recoveryClient.query("COMMIT");
+        } catch (recErr) {
+          console.error("[onLeadPlanOutput] recovery transaction failed", recErr);
+          try {
+            await recoveryClient.query("ROLLBACK");
+          } catch {
+            /* best-effort */
+          }
+        } finally {
+          recoveryClient.release();
+        }
+        // Complete the command so future retries see a result and do not re-run.
+        try {
+          await completeCommand(client, commandId, { error: String(err), recovered: true });
+        } catch {
+          /* best-effort */
+        }
+      }
+
+      // Do NOT re-throw: the handler must not strand the work item (Defect 4).
+      console.error("[onLeadPlanOutput] handler error (recovered)", err);
     } finally {
       client.release();
     }
