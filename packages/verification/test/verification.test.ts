@@ -115,6 +115,7 @@ test("CHECK_CATALOG: all expected ids are present", () => {
     "pnpm-check@1",
     "node-test@1",
     "git-diff-clean@1",
+    "manifest-consumer@1",
   ];
   for (const id of expected) {
     assert.ok(CHECK_CATALOG[id] !== undefined, `CHECK_CATALOG missing "${id}"`);
@@ -122,7 +123,7 @@ test("CHECK_CATALOG: all expected ids are present", () => {
 });
 
 test("PROFILE_CATALOG: all expected ids are present", () => {
-  const expected = ["node-pnpm-v1", "docs-check-v1", "minimal-v1"];
+  const expected = ["node-pnpm-v1", "docs-check-v1", "minimal-v1", "multi-repo-v1"];
   for (const id of expected) {
     assert.ok(PROFILE_CATALOG[id] !== undefined, `PROFILE_CATALOG missing "${id}"`);
   }
@@ -333,6 +334,157 @@ test("runProfile: minimal-v1 with an untracked file → fail", { timeout: 20_000
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// manifest-consumer@1 check tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a minimal pnpm project whose `pnpm test` passes without network access.
+ * Uses `node --version` as the test script (no node_modules required).
+ */
+function makeFixturePnpmProject(dir: string): void {
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "manifest-check-fixture",
+      version: "1.0.0",
+      scripts: { test: "node --version" },
+    }),
+  );
+  // Minimal pnpm lockfile so pnpm does not warn about missing lockfile.
+  writeFileSync(
+    join(dir, "pnpm-lock.yaml"),
+    "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n",
+  );
+}
+
+test("manifest-consumer@1: fails with manifest_missing when no AGENCYHQ_MANIFEST_N env var is set", {
+  timeout: 30_000,
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "agencyhq-manifest-missing-"));
+  try {
+    makeFixturePnpmProject(dir);
+
+    const def = CHECK_CATALOG["manifest-consumer@1"];
+    assert.ok(def, "manifest-consumer@1 must be in CHECK_CATALOG");
+
+    // Do not pass any AGENCYHQ_MANIFEST_N env vars — the test runner environment
+    // does not have them, so omitting opts.env is sufficient.
+    const result = await runCheck(def, { cwd: dir });
+
+    assert.notEqual(result.exitStatus, 0, "should not pass");
+    assert.equal(result.timedOut, false, "should not time out");
+    assert.ok(
+      result.stdoutTail.includes("manifest_missing"),
+      `stdout should contain "manifest_missing"; got: ${result.stdoutTail}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("manifest-consumer@1: fails when AGENCYHQ_MANIFEST_N path does not exist", {
+  timeout: 30_000,
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "agencyhq-manifest-badpath-"));
+  try {
+    makeFixturePnpmProject(dir);
+
+    const def = CHECK_CATALOG["manifest-consumer@1"];
+    assert.ok(def, "manifest-consumer@1 must be in CHECK_CATALOG");
+
+    const result = await runCheck(def, {
+      cwd: dir,
+      env: { AGENCYHQ_MANIFEST_0: "/nonexistent/path/agencyhq-manifest-test" },
+    });
+
+    assert.notEqual(result.exitStatus, 0, "should not pass");
+    assert.equal(result.timedOut, false, "should not time out");
+    assert.ok(
+      result.stdoutTail.includes("manifest_path_not_found"),
+      `stdout should contain "manifest_path_not_found"; got: ${result.stdoutTail}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("manifest-consumer@1: passes with valid manifest env and passing pnpm test", {
+  timeout: 60_000,
+}, async () => {
+  const manifestDir = mkdtempSync(join(tmpdir(), "agencyhq-manifest-dir-"));
+  const projectDir = mkdtempSync(join(tmpdir(), "agencyhq-manifest-proj-"));
+  try {
+    makeFixturePnpmProject(projectDir);
+
+    const def = CHECK_CATALOG["manifest-consumer@1"];
+    assert.ok(def, "manifest-consumer@1 must be in CHECK_CATALOG");
+
+    const result = await runCheck(def, {
+      cwd: projectDir,
+      env: {
+        AGENCYHQ_MANIFEST_0: manifestDir,
+        AGENCYHQ_MANIFEST_DIGEST: fakeDigest("manifest-digest"),
+      },
+    });
+
+    assert.equal(
+      result.exitStatus,
+      0,
+      `expected pass; exit=${result.exitStatus} stdout=${result.stdoutTail} stderr=${result.stderrTail}`,
+    );
+    assert.equal(result.timedOut, false, "should not time out");
+    // Manifest evidence must be present in stdoutTail.
+    assert.ok(
+      result.stdoutTail.includes("manifest_env:"),
+      `stdout should contain "manifest_env:"; got: ${result.stdoutTail}`,
+    );
+    assert.ok(
+      result.stdoutTail.includes(`position=0 path=${manifestDir}`),
+      `stdout should record position and path; got: ${result.stdoutTail}`,
+    );
+    assert.ok(
+      result.stdoutTail.includes("manifest_digest:"),
+      `stdout should record manifest_digest; got: ${result.stdoutTail}`,
+    );
+  } finally {
+    rmSync(manifestDir, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// multi-repo-v1 profile tests
+// ---------------------------------------------------------------------------
+
+test("multi-repo-v1: resolves from PROFILE_CATALOG", () => {
+  const profile = resolveProfile("multi-repo-v1");
+  assert.equal(profile.id, "multi-repo-v1");
+  assert.equal(profile.version, "1");
+  assert.deepEqual(profile.checks, ["pnpm-typecheck@1", "manifest-consumer@1"]);
+  assert.deepEqual(profile.protectedPaths, DEFAULT_PROTECTED_PATHS);
+});
+
+test("multi-repo-v1: profileDigest is stable", () => {
+  const profile = PROFILE_CATALOG["multi-repo-v1"];
+  assert.ok(profile, "multi-repo-v1 should exist");
+  const d1 = profileDigest(profile);
+  const d2 = profileDigest(profile);
+  assert.equal(d1, d2, "digest should be stable across calls");
+});
+
+test("multi-repo-v1: profileDigest differs from node-pnpm-v1", () => {
+  const multiRepo = PROFILE_CATALOG["multi-repo-v1"];
+  const nodePnpm = PROFILE_CATALOG["node-pnpm-v1"];
+  assert.ok(multiRepo, "multi-repo-v1 should exist");
+  assert.ok(nodePnpm, "node-pnpm-v1 should exist");
+  assert.notEqual(
+    profileDigest(multiRepo),
+    profileDigest(nodePnpm),
+    "multi-repo-v1 and node-pnpm-v1 must have distinct digests",
+  );
 });
 
 // ---------------------------------------------------------------------------
