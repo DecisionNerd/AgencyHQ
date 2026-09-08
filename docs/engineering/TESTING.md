@@ -162,11 +162,11 @@ Rework-3 re-check on 2026-09-07: `readStopEvidence` parses adapter
 deterministic weakened-test gate (H-2); `cancelSkipped` on already-final
 cancel (H-5); `protectedPathsSource` recorded by `verify.run` (H-6);
 `retry_dispatch` takes `intentId` (CR-1); `AGENCYHQ_BIND_HOST` default
-`127.0.0.1` (CR-3); `AGENCYHQ_UNCERTAIN_AFTER_MS` on both confirmation paths
-(CR-4); retry-on-budget records a Failure on the superseded attempt (CR-5);
+`127.0.0.1` (CR-3); retry-on-budget records a Failure on the superseded attempt (CR-5);
 `lead.accept` per-run temp directory (CR-6); migration 0002 NOT NULL
 constraints (CR-7); model from payload or `AGENCYHQ_OPENCODE_MODEL`, no
 built-in default (CR-9); no live run after 16002f2.
+Rework-4 re-check on 2026-09-08: `stale_status` guard and reconciler confirmation route for any final run status (COMPLETED included) confirmed correct; `flow.stop (CR-2)` test rewritten as `flow.stop (CR-2a)` (COMPLETED run race → stale_status; attempt stays stopping gen 2, no artifact, no verify trigger; uncertain after deadline) and `flow.stop (CR-2b)` (same, survivors=[] → stopped with metadata evidence); dead worker-final `stopping` branch removed; db insert types require the NOT NULL columns; no live run after 16002f2.
 
 **Implemented test layers (Slice 3):** Architecture baseline + dependency rules (`tests/architecture-baseline.test.mjs`, `tests/dependency-rules.test.mjs`); domain unit and property tests (`packages/domain`); persistence integration tests against Postgres 17.6 (`packages/db`); adapter fakes and unit tests (`trigger/`, `apps/coordinator/`); verification package unit tests (`packages/verification`); web view-model unit tests (`apps/web/`); CI integration job. Execution trial items 1–7 recorded (2026-09-07). Operator behavior: view-model tests only; browser journey tests deferred to Slice 5.
 

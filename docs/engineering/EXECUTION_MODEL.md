@@ -36,10 +36,13 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    A completed run with a valid commit id has its Artifact stored. Status
    updates (completion, quarantine, failure) are guarded by the attempt's
    expected prior status (`WHERE status IN ('admitted','dispatched','running')`);
-   a stop that lands between `applyObservation` and the update wins and the
-   observation is treated as stale. Duplicate deliveries are no-ops keyed by
-   run id and attempt generation; a delivery for a revoked generation is stored
-   as history-only (stale) and does not advance state.
+   a stop that lands between `applyObservation` and the update wins
+   (`stale_status`): the observation is skipped, the intent stays open, and
+   the reconciler routes the `stopping` attempt to confirmation at its next
+   poll — any final run status, COMPLETED included, triggers that route with
+   the same evidence order and deadline. Duplicate deliveries are no-ops keyed
+   by run id and attempt generation; a delivery for a revoked generation is
+   stored as history-only (stale) and does not advance state.
 6. **Verify.** `verify.run` is dispatched against the attempt revision with the
    approved profile; results are stored as VerificationResults.
 7. **Review.** `lead.review` is dispatched with the diff, criteria, and results;
@@ -107,12 +110,10 @@ Because workers cannot cause external effects (ADR-0007), replacement is short:
    attempt row. On the host profile, the Trigger API reports a final status
    before adapter cleanup completes (observed 22–38 ms after `runs.cancel` in
    the Slice 1 trial); `stop.ndjson` is the fallback evidence source for that
-   gap. `AGENCYHQ_UNCERTAIN_AFTER_MS` (default 120 000 ms) applies on both
-   confirmation paths: when the reconciler calls `confirmStop` and when
-   `onWorkerFinal` routes a CANCELED/TIMED_OUT observation; if the deadline
-   passes with no evidence, the attempt becomes `uncertain` and the work item
-   condition `uncertain`; no replacement runs on that repository while
-   uncertain. The adapter also applies a soft deadline (`maxDuration` minus 15 s,
+   gap. `AGENCYHQ_UNCERTAIN_AFTER_MS` (default 120 000 ms) applies on the
+   reconciler's confirmation route; if the deadline passes with no evidence,
+   the attempt becomes `uncertain` and the work item condition `uncertain`;
+   no replacement runs on that repository while uncertain. The adapter also applies a soft deadline (`maxDuration` minus 15 s,
    minimum 5 s) to stop the worker before the CLI delivers SIGTERM on
    `maxDuration`, returning outcome `timed_out` with the run COMPLETED; the
    hard `maxDuration` remains the backstop. See the

@@ -39,7 +39,7 @@ to columns that every coordinator insert site already supplies:
 `information_schema` check so the migration is idempotent. Migrations are
 append-only; applied files are never modified.
 
-Row schemas with inferred TypeScript types live in `src/rows.ts`. `mapRow` helpers parse jsonb columns (`authority`, `bounds`, `criteria`, `record`) through their contracts Zod schemas.
+Row schemas with inferred TypeScript types live in `src/rows.ts`. `mapRow` helpers parse jsonb columns (`authority`, `bounds`, `criteria`, `record`) through their contracts Zod schemas. Repository insert types (e.g. `FindingInsert`, `DecisionInsert`, `ReviewInsert`) require the columns marked NOT NULL in migration 0002 — `severity`, `kind`, `description` for findings; `kind`, `actor` for decisions; `reviewer_model`, `profile` for reviews; `class`, `phase`, `cause` for failures; `kind` for commands — as non-nullable fields; the coordinator always supplies them.
 
 ## Fencing and idempotency
 
