@@ -345,3 +345,114 @@ test("idempotency: ackVisit same commandId → same result", async (t) => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// S-7: createWorkItem resolves expectedBaseRevision from entry.targetRef
+// ---------------------------------------------------------------------------
+
+test("createWorkItem (S-7): manifest entry resolves expectedBaseRevision from entry.targetRef, not main", async (t) => {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(url, ctx.schema);
+    try {
+      const deps = makeDeps(pool);
+
+      // Project with two refs: main and release/v2
+      const mainSha = "aaaa000000000000000000000000000000000000";
+      const releaseSha = "bbbb000000000000000000000000000000000000";
+
+      const projectId = `proj-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO projects (id, authority, authority_version, allowed_refs)
+         VALUES ($1, '{}', '1', $2::jsonb)`,
+        [projectId, JSON.stringify({ main: mainSha, "release/v2": releaseSha })],
+      );
+
+      // Create a work item with a manifest entry targeting "release/v2"
+      const result = await createWorkItem(deps, {
+        commandId: `cmd-s7-${randomUUID()}`,
+        projectId,
+        intent: "S-7 test",
+        boundary: "merge",
+        rank: 1,
+        manifest: {
+          entries: [{ projectId, targetRef: "release/v2" }],
+        },
+      });
+
+      assert.ok(result.ok, `createWorkItem must succeed: ${JSON.stringify(result)}`);
+      const { workItemId } = result as { ok: true; workItemId: string };
+
+      // The work_item_projects row must have expected_base_revision = releaseSha, not mainSha
+      const { rows } = await ctx.client.query<{
+        expected_base_revision: string;
+        target_ref: string;
+      }>(
+        "SELECT expected_base_revision, target_ref FROM work_item_projects WHERE work_item_id = $1",
+        [workItemId],
+      );
+      assert.equal(rows.length, 1, "one work_item_projects row");
+      assert.equal(rows[0]!.target_ref, "release/v2", "target_ref = release/v2");
+      assert.equal(
+        rows[0]!.expected_base_revision,
+        releaseSha,
+        "expected_base_revision must come from allowed_refs['release/v2'], not allowed_refs['main']",
+      );
+      assert.notEqual(
+        rows[0]!.expected_base_revision,
+        mainSha,
+        "expected_base_revision must NOT be the main ref SHA",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("createWorkItem (S-7): targetRef with no stored revision → rejected", async (t) => {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(url, ctx.schema);
+    try {
+      const deps = makeDeps(pool);
+
+      const mainSha = "aaaa000000000000000000000000000000000000";
+      const projectId = `proj-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO projects (id, authority, authority_version, allowed_refs)
+         VALUES ($1, '{}', '1', $2::jsonb)`,
+        [projectId, JSON.stringify({ main: mainSha })],
+      );
+
+      // Attempt to create a work item targeting a ref not in allowed_refs
+      const result = await createWorkItem(deps, {
+        commandId: `cmd-s7-noref-${randomUUID()}`,
+        projectId,
+        intent: "S-7 missing ref test",
+        boundary: "merge",
+        rank: 1,
+        manifest: {
+          entries: [{ projectId, targetRef: "release/v3" }],
+        },
+      });
+
+      assert.ok(!result.ok, "createWorkItem must fail when targetRef not in allowed_refs");
+      assert.ok(
+        (result as { ok: false; reason: string }).reason.includes("release/v3"),
+        `error reason must mention the missing ref: ${JSON.stringify(result)}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});

@@ -1284,3 +1284,274 @@ test("approve(vii): replay of merge-boundary approve → no second integrate.mer
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// S-4 (approve path): R-002 ordering — integrations row and merge intent exist
+//     before trigger when approve drives finalizeAcceptedAttempt
+// ---------------------------------------------------------------------------
+
+test("approve(S-4): R-002 ordering — integrations row and merge intent committed before trigger in approve path", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_HR_AUTHORITY,
+      });
+      const fake = new FakeExecutionRuntime();
+
+      let orderingPassed = false;
+
+      // Wrap fake.trigger to assert ordering when integrate.merge is triggered
+      const baseRuntime = fake;
+      const instrumentedRuntime = {
+        trigger: async (args: Parameters<typeof fake.trigger>[0]) => {
+          if (args.task === TASK_IDS.integrateMerge) {
+            const { rows: intRows } = await pool.query(
+              "SELECT * FROM integrations WHERE attempt_id IN (SELECT id FROM attempts)",
+            );
+            assert.ok(
+              intRows.length >= 1,
+              "integrations row must exist BEFORE trigger (approve path)",
+            );
+            const { rows: intentRows } = await pool.query(
+              "SELECT * FROM dispatch_intents WHERE task = $1",
+              [TASK_IDS.integrateMerge],
+            );
+            assert.ok(
+              intentRows.length >= 1,
+              "integrate.merge intent must exist BEFORE trigger (approve path)",
+            );
+            orderingPassed = true;
+          }
+          return baseRuntime.trigger(args);
+        },
+        cancel: baseRuntime.cancel.bind(baseRuntime),
+        retrieve: baseRuntime.retrieve.bind(baseRuntime),
+        createPublicToken: baseRuntime.createPublicToken.bind(baseRuntime),
+      };
+
+      const deps: FlowDeps = {
+        pool,
+        runtime: instrumentedRuntime as FlowDeps["runtime"],
+        clock,
+        ids,
+        profile: {
+          id: "host",
+          enforcement: {
+            worktree: "before_action",
+            fs_isolation: "advisory",
+            cpu_memory: "advisory",
+            duration: "before_action",
+            capability: "before_action",
+            output_paths: "on_output",
+            push: "before_action",
+            integrate: "before_action",
+            termination: "trusted_observation",
+            egress_spend: "advisory",
+            nested_agents: "before_action",
+          },
+        },
+        config: {
+          worktreeBase: "/worktrees",
+          workerModel: "openai/gpt-5.6-terra",
+          leadModel: "openai/gpt-5.6-sol",
+          reviewerModel: "openai/gpt-5.6-sol",
+          verifierName: "agencyhq-verifier",
+        },
+        profileResolver: FAKE_PROFILE_RESOLVER,
+      };
+
+      const flow = new BoundedRepairFlow(deps);
+
+      const { acceptObs, acceptRunId, contractId, contractVersion, artifactRevision } =
+        await driveToAcceptFinalMerge(flow, fake, client, workItemId);
+
+      await client.query(
+        `INSERT INTO run_observations (run_id, generation, stale, payload, observed_at)
+         VALUES ($1, 1, false, $2::jsonb, now())`,
+        [acceptRunId, JSON.stringify(acceptObs)],
+      );
+
+      fake.script(TASK_IDS.integrateMerge, () => ({
+        status: "COMPLETED",
+        output: {
+          outcome: "integrated",
+          resultingRevision: INTEGRATED_REVISION,
+          observedTargetRevision: "0000000000000000000000000000000000000000",
+          evidence: [],
+        },
+      }));
+
+      await flow.onAcceptFinal(acceptObs, newId("cmd"));
+
+      const approveDeps: ApproveDeps = {
+        pool,
+        runtime: instrumentedRuntime as FlowDeps["runtime"],
+        clock,
+        config: { workerModel: "openai/gpt-5.6-terra", worktreeBase: "/worktrees" },
+      };
+
+      const result = await approveWorkItem(approveDeps, {
+        commandId: `cmd-approve-s4-ordering-${randomUUID()}`,
+        workItemId,
+        contractId,
+        contractVersion,
+        attemptRevision: artifactRevision,
+        actor: "alice",
+      });
+
+      assert.ok(result.ok, `approve must succeed: ${JSON.stringify(result)}`);
+      assert.ok(
+        orderingPassed,
+        "ordering check must have fired for integrate.merge trigger in approve path",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S-16: second approve with a fresh commandId → state_mismatch
+//        (pending decision already resolved; must not re-run finalizeAcceptedAttempt)
+// ---------------------------------------------------------------------------
+
+test("approve(S-16): second approve with fresh commandId → state_mismatch, one integrations row, one intent", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_HR_AUTHORITY,
+      });
+      const fake = new FakeExecutionRuntime();
+
+      const deps: FlowDeps = {
+        pool,
+        runtime: fake,
+        clock,
+        ids,
+        profile: {
+          id: "host",
+          enforcement: {
+            worktree: "before_action",
+            fs_isolation: "advisory",
+            cpu_memory: "advisory",
+            duration: "before_action",
+            capability: "before_action",
+            output_paths: "on_output",
+            push: "before_action",
+            integrate: "before_action",
+            termination: "trusted_observation",
+            egress_spend: "advisory",
+            nested_agents: "before_action",
+          },
+        },
+        config: {
+          worktreeBase: "/worktrees",
+          workerModel: "openai/gpt-5.6-terra",
+          leadModel: "openai/gpt-5.6-sol",
+          reviewerModel: "openai/gpt-5.6-sol",
+          verifierName: "agencyhq-verifier",
+        },
+        profileResolver: FAKE_PROFILE_RESOLVER,
+      };
+
+      const flow = new BoundedRepairFlow(deps);
+
+      const { acceptObs, acceptRunId, contractId, contractVersion, artifactRevision } =
+        await driveToAcceptFinalMerge(flow, fake, client, workItemId);
+
+      await client.query(
+        `INSERT INTO run_observations (run_id, generation, stale, payload, observed_at)
+         VALUES ($1, 1, false, $2::jsonb, now())`,
+        [acceptRunId, JSON.stringify(acceptObs)],
+      );
+
+      fake.script(TASK_IDS.integrateMerge, () => ({
+        status: "COMPLETED",
+        output: {
+          outcome: "integrated",
+          resultingRevision: INTEGRATED_REVISION,
+          observedTargetRevision: "0000000000000000000000000000000000000000",
+          evidence: [],
+        },
+      }));
+
+      await flow.onAcceptFinal(acceptObs, newId("cmd"));
+
+      const approveDeps: ApproveDeps = {
+        pool,
+        runtime: fake,
+        clock,
+        config: { workerModel: "openai/gpt-5.6-terra", worktreeBase: "/worktrees" },
+      };
+
+      const approveInput = {
+        workItemId,
+        contractId,
+        contractVersion,
+        attemptRevision: artifactRevision,
+        actor: "alice",
+      };
+
+      // First approve — must succeed
+      const first = await approveWorkItem(approveDeps, {
+        commandId: `cmd-approve-s16-first-${randomUUID()}`,
+        ...approveInput,
+      });
+      assert.ok(first.ok, `first approve must succeed: ${JSON.stringify(first)}`);
+
+      // Second approve with a DIFFERENT commandId — must return state_mismatch
+      const second = await approveWorkItem(approveDeps, {
+        commandId: `cmd-approve-s16-second-${randomUUID()}`,
+        ...approveInput,
+      });
+      assert.ok(!second.ok, "second approve must not be ok");
+      if (!second.ok) {
+        assert.equal(second.reason, "state_mismatch", "second approve reason = state_mismatch");
+      }
+
+      // Exactly one integrations row (finalizeAcceptedAttempt must not have run twice)
+      const { rows: integRows } = await client.query<{ id: string }>(
+        "SELECT id FROM integrations WHERE attempt_id IN (SELECT id FROM attempts)",
+      );
+      assert.equal(integRows.length, 1, "exactly one integrations row (no re-run)");
+
+      // Exactly one integrate.merge intent
+      const { rows: mergeIntents } = await client.query<{ id: string }>(
+        "SELECT id FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.integrateMerge],
+      );
+      assert.equal(mergeIntents.length, 1, "exactly one integrate.merge intent (no re-run)");
+
+      // Exactly one approved decision
+      const { rows: approvedDecisions } = await client.query<{ outcome: string }>(
+        "SELECT outcome FROM decisions WHERE kind = 'accept' AND outcome = 'approved' AND work_item_id = $1",
+        [workItemId],
+      );
+      assert.equal(approvedDecisions.length, 1, "exactly one approved decision");
+    } finally {
+      await pool.end();
+    }
+  });
+});
