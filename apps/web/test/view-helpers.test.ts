@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { Freshness, Item, State, Stop } from "../src/api.ts";
-import { formatState, isStale, orderItems, stopBadge } from "../src/view-helpers.ts";
+import type { Freshness, IntegrationInfo, Item, ManifestInfo, State, Stop } from "../src/api.ts";
+import {
+  formatState,
+  integrationCardModel,
+  isStale,
+  manifestLabel,
+  orderItems,
+  shortSha,
+  stopBadge,
+} from "../src/view-helpers.ts";
 
 // ---- formatState -----------------------------------------------------------
 
@@ -98,7 +106,11 @@ test("isStale: returns true when poll exceeded threshold", () => {
 
 // ---- orderItems ------------------------------------------------------------
 
-function makeItem(id: string): Item {
+function makeItem(
+  id: string,
+  integration: IntegrationInfo | null = null,
+  manifest: ManifestInfo | null = null,
+): Item {
   const s: State = { label: "ok", source: "ledger", at: null };
   return {
     workItemId: id,
@@ -107,6 +119,8 @@ function makeItem(id: string): Item {
     execution: s,
     verification: s,
     acceptance: s,
+    integration,
+    manifest,
   };
 }
 
@@ -140,4 +154,100 @@ test("orderItems: mainEffort not found returns original order", () => {
     result.map((i) => i.workItemId),
     ["a", "b"],
   );
+});
+
+// ---- shortSha --------------------------------------------------------------
+
+test("shortSha: returns first 7 characters of a full sha", () => {
+  assert.equal(shortSha("abcdef1234567890abcdef"), "abcdef1");
+});
+
+test("shortSha: returns null when sha is null", () => {
+  assert.equal(shortSha(null), null);
+});
+
+test("shortSha: returns null when sha is empty string", () => {
+  assert.equal(shortSha(""), null);
+});
+
+test("shortSha: returns full string when shorter than 7 chars", () => {
+  assert.equal(shortSha("abc"), "abc");
+});
+
+// ---- manifestLabel ---------------------------------------------------------
+
+test("manifestLabel: returns formatted string when manifest is present", () => {
+  const manifest: ManifestInfo = { resolved: 3, total: 5 };
+  assert.equal(manifestLabel(manifest), "Manifest 3/5");
+});
+
+test("manifestLabel: returns null when manifest is null", () => {
+  assert.equal(manifestLabel(null), null);
+});
+
+test("manifestLabel: works for zero resolved", () => {
+  assert.equal(manifestLabel({ resolved: 0, total: 4 }), "Manifest 0/4");
+});
+
+// ---- integrationCardModel --------------------------------------------------
+
+test("integrationCardModel: returns null when integration is null", () => {
+  const item = makeItem("x", null, null);
+  assert.equal(integrationCardModel(item), null);
+});
+
+test("integrationCardModel: pending state produces correct label and iconKey", () => {
+  const integration: IntegrationInfo = {
+    state: "pending",
+    outcome: null,
+    targetRef: null,
+    resultingRevision: null,
+    at: null,
+    source: "ledger",
+  };
+  const item = makeItem("p", integration);
+  const model = integrationCardModel(item);
+  assert.ok(model !== null);
+  assert.equal(model.label, "Pending integration");
+  assert.equal(model.iconKey, "pending");
+  assert.equal(model.shortRevision, null);
+});
+
+test("integrationCardModel: integrated state produces correct label and short sha", () => {
+  const integration: IntegrationInfo = {
+    state: "integrated",
+    outcome: "merged",
+    targetRef: "main",
+    resultingRevision: "abcdef1234567890",
+    at: "2026-09-07T11:00:00.000Z",
+    source: "ledger",
+  };
+  const item = makeItem("i", integration);
+  const model = integrationCardModel(item);
+  assert.ok(model !== null);
+  assert.equal(model.label, "Integrated");
+  assert.equal(model.iconKey, "integrated");
+  assert.equal(model.shortRevision, "abcdef1");
+  assert.equal(model.fullRevision, "abcdef1234567890");
+  assert.equal(model.outcome, "merged");
+  assert.equal(model.targetRef, "main");
+  assert.equal(model.source, "ledger");
+});
+
+test("integrationCardModel: failed state produces correct label", () => {
+  const integration: IntegrationInfo = {
+    state: "failed",
+    outcome: "conflict",
+    targetRef: "main",
+    resultingRevision: null,
+    at: "2026-09-07T12:00:00.000Z",
+    source: "ledger",
+  };
+  const item = makeItem("f", integration);
+  const model = integrationCardModel(item);
+  assert.ok(model !== null);
+  assert.equal(model.label, "Integration failed");
+  assert.equal(model.iconKey, "failed");
+  assert.equal(model.shortRevision, null);
+  assert.equal(model.outcome, "conflict");
 });

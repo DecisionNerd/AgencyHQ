@@ -65,6 +65,20 @@ export interface State {
   detail?: string;
 }
 
+export interface IntegrationInfo {
+  state: "pending" | "integrated" | "failed";
+  outcome: string | null;
+  targetRef: string | null;
+  resultingRevision: string | null;
+  at: string | null;
+  source: "ledger";
+}
+
+export interface ManifestInfo {
+  resolved: number;
+  total: number;
+}
+
 export interface Item {
   workItemId: string;
   intent: string;
@@ -72,6 +86,8 @@ export interface Item {
   execution: State;
   verification: State;
   acceptance: State;
+  integration: IntegrationInfo | null;
+  manifest: ManifestInfo | null;
 }
 
 export interface PendingDecision {
