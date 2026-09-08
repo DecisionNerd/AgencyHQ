@@ -58,7 +58,9 @@ export const WorkerAttemptOutputSchema = z.object({
     denials: z.array(
       z.object({
         tool: z.string(),
-        pattern: z.string().optional(),
+        // Optional in the adapter; the runtime serializes an absent value as
+        // null (observed 2026-09-08 on a tool denial without a command).
+        pattern: z.string().nullable().optional(),
         message: z.string(),
       }),
     ),

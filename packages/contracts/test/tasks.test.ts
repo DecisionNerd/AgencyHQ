@@ -370,3 +370,35 @@ test("TASK_IDS: contains all five task identifiers", () => {
   assert.equal(TASK_IDS.leadReview, "lead.review");
   assert.equal(TASK_IDS.leadAccept, "lead.accept");
 });
+
+test("WorkerAttemptOutputSchema accepts a denial whose pattern is null (runtime serialization of undefined)", () => {
+  const output = {
+    attemptId: "att_1",
+    sessionId: "ses_1",
+    report: {
+      attempted: "",
+      outputs: [],
+      checksRun: [],
+      unmetCriteria: [],
+      limitations: [],
+      findings: [],
+    },
+    outcome: "completed",
+    worktreePath: "/w",
+    runDir: "/r",
+    commitId: "0123456789abcdef0123456789abcdef01234567",
+    diffDigest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    changedPaths: ["src/a.ts"],
+    pathViolations: [],
+    checkpointCommit: null,
+    survivors: [],
+    opencode: {
+      sessionID: "ses_1",
+      exitCode: 0,
+      denials: [{ tool: "task", pattern: null, message: "denied" }],
+      errors: [],
+    },
+  };
+  const parsed = WorkerAttemptOutputSchema.safeParse(output);
+  assert.equal(parsed.success, true, JSON.stringify(parsed.error?.issues));
+});
