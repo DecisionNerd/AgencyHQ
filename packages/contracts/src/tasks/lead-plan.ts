@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { AuthorityNarrowingSchema, AuthoritySchema } from "../authority.ts";
 import { LeadPlanOutputSchema } from "../lead-proposal.ts";
+import { RevisionManifestSchema } from "../manifest.ts";
 
 export type { LeadPlanOutput } from "../lead-proposal.ts";
 export { LeadPlanOutputSchema };
@@ -28,5 +29,11 @@ export const LeadPlanPayloadSchema = z.object({
   /** Optional reproduction of a known defect. */
   defect: z.string().optional(),
   model: z.string().min(1),
+  /**
+   * Revision manifest for multi-repository WorkItems. The Lead uses this to
+   * understand scope and produce contracts that reference the correct target
+   * refs and base revisions.
+   */
+  manifest: RevisionManifestSchema.optional(),
 });
 export type LeadPlanPayload = z.infer<typeof LeadPlanPayloadSchema>;

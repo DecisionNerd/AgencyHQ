@@ -8,6 +8,9 @@ export { canonicalJson, digestOf, isDigest, sha256Hex } from "./digest.ts";
 // Lead proposal and plan output (wave 2.C/2.D).
 export type { LeadPlanOutput, LeadProposal } from "./lead-proposal.ts";
 export { LeadPlanOutputSchema, LeadProposalSchema } from "./lead-proposal.ts";
+// Revision manifest (wave 4.A)
+export type { ManifestEntry, RevisionManifest } from "./manifest.ts";
+export { ManifestEntrySchema, manifestDigest, RevisionManifestSchema } from "./manifest.ts";
 export type { PathPattern } from "./path-pattern.ts";
 export {
   denySetCovers,
@@ -18,7 +21,14 @@ export {
 } from "./path-pattern.ts";
 export * from "./runtime-profile.ts";
 export * from "./step-contract.ts"; // includes DigestStringSchema
-
+export type {
+  IntegrateMergeOutput,
+  IntegrateMergePayload,
+} from "./tasks/integrate-merge.ts";
+export {
+  IntegrateMergeOutputSchema,
+  IntegrateMergePayloadSchema,
+} from "./tasks/integrate-merge.ts";
 // Task schemas
 export type { AcceptanceProposal, LeadAcceptPayload } from "./tasks/lead-accept.ts";
 export { AcceptanceProposalSchema, LeadAcceptPayloadSchema } from "./tasks/lead-accept.ts";
@@ -44,6 +54,7 @@ export const TASK_IDS = {
   verifyRun: "verify.run",
   leadReview: "lead.review",
   leadAccept: "lead.accept",
+  integrateMerge: "integrate.merge",
 } as const;
 
 // JSON Schema export
