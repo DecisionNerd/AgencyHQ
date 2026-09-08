@@ -41,11 +41,12 @@ and the reason every other item was skipped.
 
 1. `lifecycle` must be `admitted`, `active`, or `reopened` — else `not_admitted`
 2. `condition` must be `healthy` — `blocked` → `blocked`, `uncertain` → `uncertain`
-3. The work item must not already have a running attempt — `already_active`
-4. The item's repository must not be listed as uncertain — `repository_uncertain`
-5. The item's repository must not already have an active attempt or an
+3. `hasOpenIntegrateIntent` must not be `true` — else `integration_pending` (integration is in flight; dispatching would race with the integrator)
+4. The work item must not already have a running attempt — `already_active`
+5. The item's repository must not be listed as uncertain — `repository_uncertain`
+6. The item's repository must not already have an active attempt or an
    earlier selection in this pass — `repository_busy`
-6. There must be remaining slot capacity — `no_slot`
+7. There must be remaining slot capacity — `no_slot`
 
 `mainEffort` is the id of the highest-ranked item passing rules 1–2, whether
 or not it was dispatched. It is stable when the top item is blocked by a busy
@@ -72,9 +73,11 @@ Each violation carries a `ViolationCode`, a dot-path, and a detail string. Codes
 
 ### `runtime.ts` — Dispatch enforceability
 
-`requiredBoundariesFor(bounds)` returns the `BoundaryKind[]` the runtime profile must enforce for a given contract. Always includes: `worktree`, `output_paths`, `push`, `termination`, `capability`, `duration`. Conditionally adds `fs_isolation` and `egress_spend` when external network tools are enabled or a spend ceiling exists.
+`requiredBoundariesFor(bounds)` returns the `BoundaryKind[]` the runtime profile must enforce for a given contract. Always includes: `worktree`, `output_paths`, `push`, `termination`, `capability`, `duration`. Conditionally adds `fs_isolation` and `egress_spend` when external network tools are enabled. Adds `integrate` when `bounds.boundary` is `"merge"` or `"deploy"` (R-015).
 
 `enforceable(profile, requiredBoundaries)` checks whether a runtime profile can enforce all required boundaries. Returns `ok: false` with an `advisory` list if any required boundary is marked advisory in the profile (R-016: the `HOST_PROFILE` marks `fs_isolation`, `cpu_memory`, and `egress_spend` as advisory — contracts requiring those must run in a container).
+
+`checkBoundarySupport(bounds)` checks whether the contract's completion boundary is currently implemented. Returns a `RuntimeViolation` with code `DEPLOY_NOT_SUPPORTED` when `bounds.boundary === "deploy"` (deploy is declared but not yet implemented), or `null` when the boundary is supported. This check is distinct from `requiredBoundariesFor`/`enforceable` — it is a categorical "not implemented" gate applied before dispatch.
 
 ## Modules
 
@@ -94,7 +97,13 @@ Each violation carries a `ViolationCode`, a dot-path, and a detail string. Codes
 - **`aggregates/failure.ts`** — `Failure` aggregate: classified failure with class, phase, cause, and evidence.
 - **`aggregates/verification-result.ts`** — Re-export of `VerificationResult` from `@agencyhq/contracts`.
 - **`transitions/attempt.ts`** — Pure attempt transitions: `markDispatched`, `observe`, `revoke`, `confirmStopped`, `markUncertain`. `ATTEMPT_TRANSITIONS` table drives all legal-transition checks. Returns `Result<{attempt, events}, TransitionError>`.
-- **`transitions/work-item.ts`** — Pure work-item transitions: `admit`, `activate`, `complete`, `halt`, `reopen`, `markCondition`. `WORK_ITEM_TRANSITIONS` table drives all legal-transition checks.
+- **`transitions/work-item.ts`** — Pure work-item transitions: `admit`, `activate`, `complete`, `halt`, `reopen`, `markCondition`. `WORK_ITEM_TRANSITIONS` table drives all legal-transition checks. `complete()` is boundary-aware: `"artifact"` requires an attempt revision; `"merge"` requires a fully-resolved `RevisionManifest` (all entries must have `resultRevision`) and returns the last entry's revision plus the manifest digest in the event; `"deploy"` always returns `Err(deploy_not_supported)`.
+
+## Integration (`src/integration/`)
+
+- **`manifest.ts`** — Revision manifest helpers for multi-repository work items. Exports `ManifestEntry` and `IntegrateOutcome` structural types (shape-compatible with the contracts package's `RevisionManifestSchema` / `IntegrateMergeOutputSchema`; local until those contracts land). `nextEntry(entries)` returns the unresolved entry with the lowest position; `allResolved(entries)` returns true when all entries have a non-null `resultRevision`; `manifestDigestInput(entries)` produces the canonical JSON string (position-sorted, without `resultRevision`) that both this package and the contracts package digest to fingerprint the manifest.
+- **`decide.ts`** — `decideIntegrationOutcome(input)` is a pure decision function. Input is `{ kind: "output", output }` (COMPLETED task) or `{ kind: "observed", observedTargetRevision, expectedBaseRevision, attemptRevision, containsAttempt }` (non-COMPLETED task, coordinator read the remote). Output is `{ decision: "completed", resultingRevision }`, `{ decision: "retry_cas" }`, or `{ decision: "escalate", reason }`. Property guarantee: `retry_cas` is never returned when `observedTargetRevision !== expectedBaseRevision`.
+- **`index.ts`** — Re-exports from `manifest.ts` and `decide.ts`.
 
 ## Evidence and findings
 

@@ -5,11 +5,31 @@
  * active runtime profile declares advisory.
  *
  * See: docs/engineering/ARCHITECTURE.md lines 105-127 (enforcement boundaries table)
- * See: docs/REQUIREMENTS.md R-016
+ * See: docs/REQUIREMENTS.md R-016, R-015
  */
 
 import type { BoundaryKind, ContractBounds, RuntimeProfile } from "@agencyhq/contracts";
 import { enforceableBoundaries } from "@agencyhq/contracts";
+
+// ---------------------------------------------------------------------------
+// RuntimeViolationCode table
+//
+// Violations produced by runtime boundary checks (distinct from authority
+// subset ViolationCodes in subset.ts).
+//
+// | Code                  | Condition                                      |
+// |-----------------------|------------------------------------------------|
+// | DEPLOY_NOT_SUPPORTED  | boundary = "deploy"; not yet implemented       |
+//
+// Keep this table exhaustive — add a row for every new code.
+// ---------------------------------------------------------------------------
+
+export type RuntimeViolationCode = "DEPLOY_NOT_SUPPORTED";
+
+export type RuntimeViolation = {
+  readonly code: RuntimeViolationCode;
+  readonly reason: string;
+};
 
 // ---------------------------------------------------------------------------
 // requiredBoundariesFor
@@ -32,7 +52,7 @@ import { enforceableBoundaries } from "@agencyhq/contracts";
 // | egress_spend    | conditional     | webfetch || websearch tool enabled           |
 // | cpu_memory      | no              | machine preset (not yet tracked)             |
 // | nested_agents   | no              | task tool (enforced via capability)          |
-// | integrate       | no              | boundary=merge/deploy (enforced separately)  |
+// | integrate       | conditional     | boundary = merge or deploy                   |
 //
 // Rationale for fs_isolation: when a worker can fetch external URLs or search
 // the web, filesystem isolation becomes a meaningful security boundary because
@@ -42,6 +62,10 @@ import { enforceableBoundaries } from "@agencyhq/contracts";
 // calls are possible, egress enforcement is needed to honour the ceiling.
 // Without external network (no webfetch/websearch) and a spend ceiling, the
 // estimate is advisory (no gateway exists on the host profile).
+//
+// Rationale for integrate: a merge or deploy boundary requires the runtime to
+// enforce the compare-and-set integration step; artifact boundaries do not
+// push to a shared ref and therefore do not need this boundary.
 // ---------------------------------------------------------------------------
 
 export function requiredBoundariesFor(bounds: ContractBounds): BoundaryKind[] {
@@ -67,7 +91,34 @@ export function requiredBoundariesFor(bounds: ContractBounds): BoundaryKind[] {
   // would make R-016 reject all host-profile dispatches. Enforcement of a
   // spend ceiling arrives with the container profile's model gateway.
 
+  if (bounds.boundary !== "artifact") {
+    required.push("integrate");
+  }
+
   return required;
+}
+
+// ---------------------------------------------------------------------------
+// checkBoundarySupport
+//
+// Checks whether the contract's completion boundary is supported for
+// execution.  Returns a RuntimeViolation when the boundary cannot be executed
+// (e.g. deploy is declared but not yet implemented), or null when the
+// boundary is supported.
+//
+// This is a separate gate from `requiredBoundariesFor` / `enforceable`
+// because it represents a categorical "not implemented" rather than an
+// advisory enforcement gap.
+// ---------------------------------------------------------------------------
+
+export function checkBoundarySupport(bounds: ContractBounds): RuntimeViolation | null {
+  if (bounds.boundary === "deploy") {
+    return {
+      code: "DEPLOY_NOT_SUPPORTED",
+      reason: "deploy boundary is not yet implemented; only artifact and merge are supported",
+    };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
