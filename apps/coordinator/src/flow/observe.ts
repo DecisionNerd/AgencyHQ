@@ -22,8 +22,9 @@ import { FINAL_RUN_STATUSES } from "@agencyhq/domain";
 
 import { confirmStop, readStopEvidence } from "../commands/confirm-stop.ts";
 import { stopAttempt } from "../commands/stop.ts";
-import type { BoundedRepairFlow } from "./bounded-repair.ts";
+import type { BoundedRepairFlow, LeadHandlerResult } from "./bounded-repair.ts";
 import { generationOfIntent as getIntentGen } from "./bounded-repair.ts";
+import { onIntegrateFinal } from "./integrate.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -154,6 +155,17 @@ export class Reconciler {
         const dispatchedGen = getIntentGen(intent);
         const commandId = `cmd_obs_${runId}_${dispatchedGen}` as CommandId;
 
+        // R-010: every final observation is recorded, not only worker runs.
+        // worker.attempt and integrate.merge record theirs inside their own
+        // transaction (their handlers act on the "applied" result), so only
+        // the Lead and verify runs are recorded here. Duplicates are no-ops.
+        // Observed 2026-09-08 (Slice 4 live session): the approve command
+        // reads the lead.accept proposal from run_observations, which was
+        // empty for every non-worker task.
+        if (intent.task !== TASK_IDS.workerAttempt && intent.task !== TASK_IDS.integrateMerge) {
+          await this.recordFinalObservation(obs, intent, dispatchedGen);
+        }
+
         try {
           if (intent.task === TASK_IDS.workerAttempt) {
             await this.flow.onWorkerFinal(obs, commandId);
@@ -176,9 +188,20 @@ export class Reconciler {
           } else if (intent.task === TASK_IDS.verifyRun) {
             await this.flow.onVerifyFinal(obs, commandId);
           } else if (intent.task === TASK_IDS.leadReview) {
-            await this.flow.onReviewFinal(obs, commandId);
+            const reviewResult: LeadHandlerResult = await this.flow.onReviewFinal(obs, commandId);
+            if (!reviewResult.ok) {
+              // Handler already recorded failure, closed intent as 'failed', and
+              // dispatched a retry or pending_human decision (R-004, R-007, R-010).
+              continue;
+            }
           } else if (intent.task === TASK_IDS.leadAccept) {
-            await this.flow.onAcceptFinal(obs, commandId);
+            const acceptResult: LeadHandlerResult = await this.flow.onAcceptFinal(obs, commandId);
+            if (!acceptResult.ok) {
+              // Same failure-path handling as leadReview above.
+              continue;
+            }
+          } else if (intent.task === TASK_IDS.integrateMerge) {
+            await onIntegrateFinal(obs, commandId, this.deps);
           } else if (intent.task === TASK_IDS.leadPlan) {
             const parsed =
               obs.status === "COMPLETED" && obs.output !== undefined && obs.output !== null
@@ -316,6 +339,31 @@ export class Reconciler {
       }
 
       return "done";
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Record a final observation for a task whose handler does not record it
+   * itself (lead.plan, verify.run, lead.review, lead.accept). Never throws:
+   * recording is history, routing must still happen. */
+  private async recordFinalObservation(
+    obs: RunObservation,
+    intent: Awaited<ReturnType<typeof listOpenDispatchIntents>>[number],
+    generation: number,
+  ): Promise<void> {
+    const client = await this.deps.pool.connect();
+    try {
+      await applyObservation(client, {
+        runId: obs.runId,
+        generation,
+        attemptId: intent.attempt_id ?? "",
+        status: obs.status,
+        payload: obs,
+        observedAt: new Date(obs.observedAt),
+      });
+    } catch (err) {
+      console.error("[reconciler] record observation failed", intent.id, err);
     } finally {
       client.release();
     }

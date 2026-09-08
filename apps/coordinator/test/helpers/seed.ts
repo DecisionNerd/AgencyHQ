@@ -2,6 +2,7 @@
  * Test helper: seed Project and WorkItem rows for integration tests.
  */
 
+import type { Authority } from "@agencyhq/contracts";
 import { HOST_TRIAL_AUTHORITY } from "@agencyhq/contracts";
 import { newId } from "@agencyhq/domain";
 
@@ -16,8 +17,11 @@ export interface SeedResult {
 }
 
 /**
- * Insert a Project (using HOST_TRIAL_AUTHORITY) and a WorkItem into the test schema.
+ * Insert a Project and a WorkItem into the test schema.
  * All IDs are freshly generated.
+ *
+ * Pass `authority` to override HOST_TRIAL_AUTHORITY (e.g. to allow "merge"
+ * boundary without requiring human approval, for integrate flow tests).
  */
 export async function seedProjectAndWorkItem(
   client: DbClient,
@@ -25,6 +29,7 @@ export async function seedProjectAndWorkItem(
     intent?: string;
     defect?: string;
     boundary?: "artifact" | "merge" | "deploy";
+    authority?: Authority;
   },
 ): Promise<SeedResult> {
   const projectId = newId("prj");
@@ -32,6 +37,7 @@ export async function seedProjectAndWorkItem(
 
   const intent = opts?.intent ?? "Fix the parser to handle edge cases correctly";
   const boundary = opts?.boundary ?? "artifact";
+  const authority = opts?.authority ?? HOST_TRIAL_AUTHORITY;
 
   await client.query(
     `INSERT INTO projects
@@ -40,7 +46,7 @@ export async function seedProjectAndWorkItem(
     [
       projectId,
       JSON.stringify({ main: "0000000000000000000000000000000000000000" }),
-      JSON.stringify(HOST_TRIAL_AUTHORITY),
+      JSON.stringify(authority),
     ],
   );
 

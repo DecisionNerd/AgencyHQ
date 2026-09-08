@@ -109,6 +109,17 @@ export const StepContractSchema = z.object({
   inputs: z.object({
     intent: z.string().min(1),
     defect: z.string().min(1).optional(),
+    /**
+     * Git ref to integrate into (e.g. "refs/heads/main").
+     * Required for merge and deploy boundary contracts; absent for
+     * artifact-only contracts.
+     */
+    targetRef: z.string().min(1).optional(),
+    /**
+     * Digest of the RevisionManifest for multi-repository WorkItems.
+     * Absent for single-repository contracts.
+     */
+    manifestDigest: DigestFieldSchema.optional(),
   }),
   /** At least one criterion required. */
   criteria: z.array(CriterionSchema).min(1),

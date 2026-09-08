@@ -7,6 +7,8 @@
  * pass-when predicate (defaults to exit status 0).
  */
 
+import { fileURLToPath } from "node:url";
+
 /** Minimal run summary passed to passWhen. */
 export interface RunSummary {
   exitStatus: number | null;
@@ -66,5 +68,19 @@ export const CHECK_CATALOG: Record<string, CheckDef> = {
     timeoutSeconds: 60,
     /** Pass iff stdout is empty (no untracked/modified files). */
     passWhen: (r) => r.stdoutTail.trim() === "",
+  },
+  "manifest-consumer@1": {
+    id: "manifest-consumer@1",
+    version: "1",
+    /**
+     * Runs the project's `pnpm test` after asserting that at least one
+     * AGENCYHQ_MANIFEST_<N> env var is set and points to an existing directory.
+     *
+     * A missing variable is a check failure (exit 1, reason "manifest_missing"),
+     * not a crash.  Positions and paths are recorded in stdout before pnpm test
+     * runs, so they appear in the VerificationResult.stdoutTail as evidence.
+     */
+    command: ["node", fileURLToPath(new URL("./manifest-consumer-cmd.mjs", import.meta.url))],
+    timeoutSeconds: 900,
   },
 };

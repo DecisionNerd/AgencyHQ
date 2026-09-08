@@ -75,6 +75,7 @@ model (ADR-0007): no Trigger SDK usage, node built-ins only.
   uses, and a text tail. See the file's header comment for the OpenCode
   CLI/config/permission facts this encodes and their source dates, and for
   what the required smoke run actually observed.
+- `manifest.ts`: pure helpers for combined verification across manifest entries. `siblingEntries(entries, projectId)` returns all entries except the one belonging to the given projectId. `manifestEnv(entries, paths, digest)` builds the environment variable map for checks: each sibling entry at position N produces `AGENCYHQ_MANIFEST_<N>` pointing to its materialized worktree path, plus `AGENCYHQ_MANIFEST_DIGEST` set to the manifest plan digest.
 
 `scripts/opencode-smoke.ts` exercises `opencode.ts` end to end against a
 disposable temp fixture repo and worktree: an allowed edit, three
@@ -256,9 +257,10 @@ Implements ADR-0007 item 5: verification runs as its own Trigger task in a separ
 `src/tasks/verify-run-core.ts` factors out every piece that does not need the Trigger SDK:
 
 - `VerificationRunner` interface: `runProfile(input) => Promise<VerificationResult[]>` plus optional `abort()`.
-- `VerifyRunDeps`: injected git ops, runner, optional fingerprint, and `now()`.
+- `VerifyRunDeps`: injected git ops, runner, optional fingerprint, `now()`, plus optional `manifestProjectId` (the projectId of the project currently under verification) and `manifestRepoPaths` (map from projectId to absolute path of coordinator-owned clones of sibling repositories). Both manifest fields are required when `payload.manifest` is present.
 - `resolveVerifyWorktreePath`: `<worktreeBase>/verify/<attemptId>-<generation>`.
-- `runVerification(payload, deps)`: creates the verify worktree at `attemptRevision`; reproduces `diffDigest` against `baseRevision` before any check runs; on mismatch returns one `result: "error"` per check with `stderrTail: "integrity_mismatch: expected <a> got <b>"` and does NOT call the runner; on match runs `detectVerifierTampering` on the changed paths (reporting `tamperedPaths` in output but not changing results), then calls `runner.runProfile`; always removes the verify worktree in `finally`; re-stamps `profileDigest`/`criteriaDigest` from the payload on every result (frozen digests, never recomputed from the worktree); parses every result with `VerificationResultSchema`.
+- `resolveManifestWorktreeDir`: `<worktreeBase>/manifest-<attemptId>-<generation>` — base directory for sibling worktrees materialized during combined verification.
+- `runVerification(payload, deps)`: creates the verify worktree at `attemptRevision`; reproduces `diffDigest` against `baseRevision` before any check runs; on mismatch returns one `result: "error"` per check with `stderrTail: "integrity_mismatch: expected <a> got <b>"` and does NOT call the runner; on match runs `detectVerifierTampering` on the changed paths (reporting `tamperedPaths` in output but not changing results). When `payload.manifest` is present and `deps.manifestProjectId`/`deps.manifestRepoPaths` are supplied, materializes each sibling entry as a detached worktree under `<manifestDir>/<position>` using `siblingEntries` and passes `manifestEnv` (`AGENCYHQ_MANIFEST_<N>` and `AGENCYHQ_MANIFEST_DIGEST`) into the check environment. All sibling worktrees are removed in `finally` before the main verify worktree. Each `VerificationResult` record receives the `manifest` field (plan digest and per-sibling revision info) when sibling repos were materialized. Then calls `runner.runProfile`; always removes the verify worktree in `finally`; re-stamps `profileDigest`/`criteriaDigest` from the payload on every result (frozen digests, never recomputed from the worktree); parses every result with `VerificationResultSchema`.
 
 Evidence integrity invariants enforced (TESTING.md §67-73): the worktree is at `attemptRevision`; the digests are frozen before the worker runs and copied from the payload unchanged; the worker's report of checks run is context, not evidence (the file never references `report` or `checksRun`); the verify worktree is disposed after the run.
 
@@ -413,6 +415,78 @@ This starts `trigger dev` connected to the Trigger.dev cloud (requires `.env` wi
 ```sh
 pnpm --filter @agencyhq/trigger test
 ```
+
+## `integrate.merge` task (`src/tasks/integrate-merge.ts`)
+
+Implements R-015 and R-010: integrates an attempt commit into the coordinator-owned
+clone and pushes to the remote. This is the **only** task that may push; adapter tasks
+commit locally only (ARCHITECTURE.md lines 85-110).
+
+- Task id: `integrate.merge`, `maxDuration: 300`, single-concurrency `integrate` queue,
+  `retry: { maxAttempts: 1 }` (effectively no retry on failure).
+- Validates the payload against `IntegrateMergePayloadSchema` from `@agencyhq/contracts`.
+  Throws `AbortTaskRunError` for missing `repoPath` or invalid payload — not retried.
+- Runs with the **host environment** (credential helper available for pushes), not the
+  scrubbed worker env.  `GIT_TERMINAL_PROMPT=0` is added to every git call.
+- Publishes phases `validating` → `setup` → `integrating` → `done` plus `outcome` to
+  run metadata.
+
+### Outcomes
+
+| Outcome | Meaning |
+|---|---|
+| `integrated` | Merge commit pushed; `resultingRevision` is the merge SHA. |
+| `already_integrated` | `attemptRevision` is already an ancestor of the remote ref. |
+| `base_moved` | Remote ref advanced past `expectedBaseRevision` before this run; nothing pushed. |
+| `conflict` | Merge produced content conflicts; `conflictingPaths` lists the affected files; nothing pushed. |
+| `push_rejected` | Force-with-lease rejected; evidence records the classified failure kind (`lease_broken`, `auth`, `network`, or `other`) and a scrubbed stderr excerpt; `observedTargetRevision` holds the current remote SHA re-read after rejection. |
+
+### Pure core (`src/tasks/integrate-merge-core.ts`)
+
+Factors out every piece that does not need the Trigger SDK — no Trigger SDK import,
+no direct child_process or fs calls:
+
+- `IntegrateMergeDeps`: injected interface for `fetchRef`, `lsRemote`, `isAncestor`,
+  `worktreeAdd`, `worktreeRemove`, `mergeInWorktree`, `pushForceWithLease`.
+- `resolveMergeWorktreePath(runDir)`: `<runDir>/merge-wt`.
+- `normalizeTargetRef(ref)`: strips a `refs/heads/` prefix from `ref` if present, so both `"main"` and `"refs/heads/main"` resolve to the same branch name. Applied to `payload.targetRef` at the start of `runIntegrateMerge` — the coordinator freezes the long form for single-repo contracts; manifests use the short form.
+- `runIntegrateMerge(payload, deps, runDir)`: normalizes `targetRef` via `normalizeTargetRef`, then implements the full algorithm; always removes the merge worktree in `finally`; builds an `evidence` array of git commands run with their exit codes and, on failures, scrubbed stderr excerpts (first 500 chars, credentials redacted). On `push_rejected`, classifies the failure kind (`lease_broken`, `auth`, `network`, or `other`) from git stderr and re-reads the remote ref for `observedTargetRevision`.
+
+### Git helpers (`src/lib/git.ts` — additive)
+
+`fetchRef`, `lsRemote`, `isAncestor`, `mergeInWorktree`, `pushForceWithLease` — all
+set `GIT_TERMINAL_PROMPT=0` on network-facing calls; never prompt for credentials.
+`pushForceWithLease` returns `{ ok: true }` on success or `{ ok: false, kind, stderr }`
+on failure (never throws for a non-zero exit); `kind` is one of `lease_broken`, `auth`,
+`network`, or `other`, classified from git's stderr; `stderr` is the first 500 characters
+with credentials scrubbed via `scrubCredentials`. `scrubCredentials` redacts
+`https://user:token@` patterns and `Authorization:` header values.
+
+### Invariants
+
+- Only `integrate.merge` pushes to a remote; all other tasks commit locally (grep
+  assertion in `test/push-boundary.test.ts`).
+- `integrate-merge-core.ts` contains no Trigger SDK import (C5).
+- The merge worktree is always removed in a `finally` block.
+- Evidence lists commands with exit codes and does not include credential strings.
+
+### Tests (`test/integrate-merge-core.test.ts`, `test/push-boundary.test.ts`)
+
+Tests per the packet spec:
+1. `merge_commit` happy path → `integrated`; remote advanced; merge commit has two parents.
+2. `fast_forward` happy path → `integrated`; remote advanced to attempt SHA directly.
+3. Base moved (concurrent push before run) → `base_moved`; nothing pushed.
+4. Content conflict → `conflict`; `conflictingPaths` includes the file; nothing pushed; worktree removed.
+5. Replay after success → `already_integrated`; remote unchanged.
+6. Lease rejection (remote advances between fetch and push, injected via deps) → `push_rejected`;
+   `observedTargetRevision` equals the new remote SHA.
+7. Grep assertion: no file in `trigger/src` except `integrate-merge*` and `lib/git.ts`
+   (and the known `lib/env.ts` dry-run check) contains `"push"`.
+
+`test/git.test.ts` additionally tests `pushForceWithLease` structured failures:
+stale lease → `kind=lease_broken`; unresolvable host → `kind=network` with stderr
+excerpt; `scrubCredentials` removes `https://user:token@` credentials and
+`Authorization:` header values.
 
 ### Tasks connected to the coordinator
 

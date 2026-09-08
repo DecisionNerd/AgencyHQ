@@ -12,10 +12,12 @@ import {
   listAttemptsByContract,
   listDecisionsByWorkItem,
   listFindingsByAttempt,
+  listIntegrationsByAttempt,
   listProjects,
   listReviewsByAttempt,
   listStepContractsByWorkItem,
   listVerificationResultsByAttempt,
+  listWorkItemProjects,
   listWorkItemsByProject,
 } from "@agencyhq/db";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -83,8 +85,16 @@ export type CommandsLike = {
     projectId: string;
     intent: string;
     defect?: string;
-    boundary: "artifact";
+    boundary: "artifact" | "merge";
     rank: number;
+    manifest?: { entries: Array<{ projectId: string; targetRef: string }> };
+  }): Promise<unknown>;
+  disposition(input: {
+    commandId: string;
+    findingId: string;
+    disposition: "remediate" | "scope_decision" | "block" | "backlog";
+    reason: string;
+    actor: string;
   }): Promise<unknown>;
   ackVisit(input: { commandId: string; at: string }): Promise<unknown>;
   approve(input: {
@@ -110,6 +120,8 @@ export type LedgerSnapshot = {
   results: ResultLike[];
   reviews: ReviewLike[];
   findings: FindingLike[];
+  integrations?: import("./views/return-view.ts").IntegrationLike[];
+  workItemProjects?: import("./views/return-view.ts").WorkItemProjectLike[];
 };
 
 /** Load all ledger rows needed for the return view. Injectable for testing. */
@@ -135,6 +147,8 @@ async function defaultLoadSnapshot(pool: PoolLike): Promise<LedgerSnapshot> {
     const results: ResultLike[] = [];
     const reviews: ReviewLike[] = [];
     const findings: FindingLike[] = [];
+    const integrations: import("./views/return-view.ts").IntegrationLike[] = [];
+    const workItemProjects: import("./views/return-view.ts").WorkItemProjectLike[] = [];
 
     for (const project of projects) {
       const projectWorkItems = await listWorkItemsByProject(pgClient, project.id);
@@ -147,6 +161,7 @@ async function defaultLoadSnapshot(pool: PoolLike): Promise<LedgerSnapshot> {
           lifecycle: wi.lifecycle,
           condition: wi.condition,
           updatedAt: wi.updated_at.toISOString(),
+          boundary: wi.boundary as "artifact" | "merge" | "deploy",
         });
 
         const wiDecisions = await listDecisionsByWorkItem(pgClient, wi.id);
@@ -212,12 +227,45 @@ async function defaultLoadSnapshot(pool: PoolLike): Promise<LedgerSnapshot> {
               }
               findings.push(finding);
             }
+
+            // Load integration events for merge-boundary attempts.
+            const attemptIntegrations = await listIntegrationsByAttempt(pgClient, a.id);
+            for (const integ of attemptIntegrations) {
+              integrations.push({
+                id: integ.id,
+                attemptId: a.id,
+                targetRef: integ.target_ref,
+                outcome: integ.outcome ?? null,
+                resultingRevision: integ.resulting_revision ?? null,
+                at: integ.at instanceof Date ? integ.at.toISOString() : String(integ.at),
+              });
+            }
           }
+        }
+
+        // Load work_item_projects for manifest tracking.
+        const wipRows = await listWorkItemProjects(pgClient, wi.id);
+        for (const wip of wipRows) {
+          workItemProjects.push({
+            workItemId: wi.id,
+            position: wip.position,
+            resultRevision: wip.result_revision ?? null,
+          });
         }
       }
     }
 
-    return { workItems, contracts, attempts, decisions, results, reviews, findings };
+    return {
+      workItems,
+      contracts,
+      attempts,
+      decisions,
+      results,
+      reviews,
+      findings,
+      integrations,
+      workItemProjects,
+    };
   } finally {
     client.release();
   }
@@ -534,15 +582,34 @@ export function createApp(deps: AppDeps): Hono {
           return c.json({ error: "intent required for create_work_item" }, 400);
         }
         const defectVal = typeof body.defect === "string" ? body.defect : undefined;
+        // Parse boundary: default to "artifact"; "merge" allowed when manifest supplied
+        const boundaryVal = body.boundary === "merge" ? ("merge" as const) : ("artifact" as const);
         const createInput: Parameters<typeof commands.createWorkItem>[0] = {
           commandId,
           projectId,
           intent,
-          boundary: "artifact",
+          boundary: boundaryVal,
           rank: typeof body.rank === "number" ? body.rank : 1,
         };
         if (defectVal !== undefined) {
           createInput.defect = defectVal;
+        }
+        // Attach manifest if provided
+        if (body.manifest && typeof body.manifest === "object") {
+          const manifestBody = body.manifest as { entries?: unknown[] };
+          if (Array.isArray(manifestBody.entries)) {
+            createInput.manifest = {
+              entries: manifestBody.entries
+                .filter(
+                  (e): e is { projectId: string; targetRef: string } =>
+                    typeof e === "object" &&
+                    e !== null &&
+                    typeof (e as Record<string, unknown>).projectId === "string" &&
+                    typeof (e as Record<string, unknown>).targetRef === "string",
+                )
+                .map((e) => ({ projectId: e.projectId, targetRef: e.targetRef })),
+            };
+          }
         }
         const result = await commands.createWorkItem(createInput);
         return c.json({ commandId, replayed: false, result }, 200);
@@ -585,6 +652,37 @@ export function createApp(deps: AppDeps): Hono {
           result !== null &&
           (result as Record<string, unknown>).replayed === true;
         return c.json({ commandId, replayed: approveReplayed, result }, 200);
+      }
+
+      if (kind === "disposition") {
+        const findingId = body.findingId;
+        const disposition = body.disposition;
+        if (!findingId || typeof findingId !== "string") {
+          return c.json({ error: "findingId required for disposition" }, 400);
+        }
+        if (
+          disposition !== "remediate" &&
+          disposition !== "scope_decision" &&
+          disposition !== "block" &&
+          disposition !== "backlog"
+        ) {
+          return c.json(
+            {
+              error: "disposition must be one of: remediate, scope_decision, block, backlog",
+            },
+            400,
+          );
+        }
+        const dispositionActor = typeof body.actor === "string" ? body.actor : "human";
+        const dispositionReason = typeof body.reason === "string" ? body.reason : "";
+        const result = await commands.disposition({
+          commandId,
+          findingId,
+          disposition,
+          reason: dispositionReason,
+          actor: dispositionActor,
+        });
+        return c.json({ commandId, replayed: false, result }, 200);
       }
     } else {
       // Fallback when commands are not wired (legacy / test mode)

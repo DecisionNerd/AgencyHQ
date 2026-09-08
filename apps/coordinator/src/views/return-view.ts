@@ -20,6 +20,8 @@ export type WorkItemLike = {
   lifecycle: string;
   condition: string;
   updatedAt: string; // ISO-8601
+  /** Completion boundary. Defaults to "artifact" when omitted. */
+  boundary?: "artifact" | "merge" | "deploy";
 };
 
 export type ContractLike = {
@@ -65,6 +67,30 @@ export type FindingLike = {
   attemptId?: string | null;
   severity: string;
   kind: string;
+  evidence?: string | null;
+};
+
+/**
+ * Integration event for a work item with boundary=merge.
+ * Mirrors the integrations table columns relevant to the view.
+ */
+export type IntegrationLike = {
+  id: string;
+  attemptId: string;
+  targetRef: string;
+  outcome: string | null;
+  resultingRevision: string | null;
+  at: string; // ISO-8601
+};
+
+/**
+ * A single project entry in the work item's manifest.
+ * Mirrors the work_item_projects table.
+ */
+export type WorkItemProjectLike = {
+  workItemId: string;
+  position: number;
+  resultRevision: string | null;
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +107,27 @@ export type State = {
   detail?: string;
 };
 
+/**
+ * Integration state for a work item with boundary=merge.
+ * - pending: integrations row without outcome, or no row yet after acceptance
+ * - integrated: outcome = "integrated" | "already_integrated"
+ * - failed: outcome = "base_moved" | "conflict" | "push_rejected"
+ */
+export type IntegrationView = {
+  state: "pending" | "integrated" | "failed";
+  outcome: string | null;
+  targetRef: string | null;
+  resultingRevision: string | null;
+  at: string | null; // integrations.at ISO
+  source: "ledger";
+};
+
+/** Manifest progress for a work item's project set. */
+export type ManifestView = {
+  resolved: number;
+  total: number;
+};
+
 export type Item = {
   workItemId: string;
   intent: string;
@@ -88,6 +135,10 @@ export type Item = {
   execution: State;
   verification: State;
   acceptance: State;
+  /** Present when boundary=merge; null when boundary=artifact. */
+  integration: IntegrationView | null;
+  /** Present when boundary=merge and rows exist; null otherwise. */
+  manifest: ManifestView | null;
 };
 
 export type StopEntry = {
@@ -136,6 +187,10 @@ export type ReturnViewInput = {
   results: ResultLike[];
   reviews: ReviewLike[];
   findings: FindingLike[];
+  /** Integration events for work items with boundary=merge. Omit or leave empty when not needed. */
+  integrations?: IntegrationLike[];
+  /** Project manifest rows for work items with boundary=merge. Omit or leave empty when not needed. */
+  workItemProjects?: WorkItemProjectLike[];
 };
 
 // ---------------------------------------------------------------------------
@@ -159,6 +214,10 @@ function after(a: string, b: string): boolean {
 // Stop statuses that map to a stop entry
 const STOP_STATUSES = new Set(["stopping", "stopped", "uncertain"]);
 
+// Integration outcomes that map to each state
+const INTEGRATED_OUTCOMES = new Set(["integrated", "already_integrated"]);
+const FAILED_OUTCOMES = new Set(["base_moved", "conflict", "push_rejected"]);
+
 // ---------------------------------------------------------------------------
 // buildReturnView
 // ---------------------------------------------------------------------------
@@ -175,6 +234,9 @@ export function buildReturnView(input: ReturnViewInput): ReturnView {
     decisions,
     results,
     reviews,
+    findings,
+    integrations = [],
+    workItemProjects = [],
   } = input;
 
   // Derive freshness stale flag
@@ -232,7 +294,49 @@ export function buildReturnView(input: ReturnViewInput): ReturnView {
     decisionsByWorkItem.set(d.workItemId, arr);
   }
 
-  // Collect pending decisions (outcome = "pending_human")
+  // Index integrations by attemptId → most recent integration
+  const integrationByAttempt = new Map<string, IntegrationLike>();
+  for (const integ of integrations) {
+    const existing = integrationByAttempt.get(integ.attemptId);
+    if (!existing || integ.at > existing.at) {
+      integrationByAttempt.set(integ.attemptId, integ);
+    }
+  }
+
+  // Index work item projects by workItemId
+  const workItemProjectsByWorkItem = new Map<string, WorkItemProjectLike[]>();
+  for (const wip of workItemProjects) {
+    const arr = workItemProjectsByWorkItem.get(wip.workItemId) ?? [];
+    arr.push(wip);
+    workItemProjectsByWorkItem.set(wip.workItemId, arr);
+  }
+
+  // Build attemptId → workItemId map (for finding → work item resolution)
+  const workItemIdByAttempt = new Map<string, string>();
+  for (const [workItemId, contract] of contractByWorkItem) {
+    for (const a of attemptsByContract.get(contract.id) ?? []) {
+      workItemIdByAttempt.set(a.id, workItemId);
+    }
+  }
+
+  // Index integration_conflict findings by workItemId → most recent finding
+  const integConflictFindingByWorkItem = new Map<string, FindingLike>();
+  for (const f of findings) {
+    if (f.kind === "integration_conflict" && f.attemptId) {
+      const workItemId = workItemIdByAttempt.get(f.attemptId);
+      if (workItemId) {
+        const existing = integConflictFindingByWorkItem.get(workItemId);
+        // Keep the most recent by updated_at (use id as tiebreak); findings lack a timestamp
+        // so we just keep the last one encountered per work item
+        if (!existing) {
+          integConflictFindingByWorkItem.set(workItemId, f);
+        }
+      }
+    }
+  }
+
+  // Collect pending decisions (outcome = "pending_human"), enriched with
+  // integration_conflict finding evidence when no explicit detail is set.
   const pendingDecisions: PendingDecision[] = [];
   for (const d of decisions) {
     if (d.outcome === "pending_human") {
@@ -245,6 +349,12 @@ export function buildReturnView(input: ReturnViewInput): ReturnView {
       };
       if (d.detail !== undefined) {
         pd.detail = d.detail;
+      } else {
+        // Enrich with integration_conflict finding evidence if available
+        const conflictFinding = integConflictFindingByWorkItem.get(d.workItemId);
+        if (conflictFinding?.evidence) {
+          pd.detail = conflictFinding.evidence;
+        }
       }
       pendingDecisions.push(pd);
     }
@@ -365,6 +475,62 @@ export function buildReturnView(input: ReturnViewInput): ReturnView {
       }
     }
 
+    // Integration view (boundary=merge only)
+    let integrationView: IntegrationView | null = null;
+    let manifestView: ManifestView | null = null;
+
+    if (wi.boundary === "merge") {
+      // Find the most recent integration row across all attempts for this work item
+      let latestInteg: IntegrationLike | null = null;
+      for (const a of contractAttempts) {
+        const integ = integrationByAttempt.get(a.id);
+        if (integ) {
+          if (!latestInteg || integ.at > latestInteg.at) {
+            latestInteg = integ;
+          }
+        }
+      }
+
+      if (latestInteg) {
+        let state: "pending" | "integrated" | "failed";
+        if (latestInteg.outcome === null) {
+          state = "pending";
+        } else if (INTEGRATED_OUTCOMES.has(latestInteg.outcome)) {
+          state = "integrated";
+        } else if (FAILED_OUTCOMES.has(latestInteg.outcome)) {
+          state = "failed";
+        } else {
+          state = "pending";
+        }
+
+        integrationView = {
+          state,
+          outcome: latestInteg.outcome,
+          targetRef: latestInteg.targetRef,
+          resultingRevision: latestInteg.resultingRevision,
+          at: latestInteg.at,
+          source: "ledger",
+        };
+      } else {
+        // No integration row yet: pending
+        integrationView = {
+          state: "pending",
+          outcome: null,
+          targetRef: null,
+          resultingRevision: null,
+          at: null,
+          source: "ledger",
+        };
+      }
+
+      // Manifest: work_item_projects rows
+      const wips = workItemProjectsByWorkItem.get(wi.id) ?? [];
+      if (wips.length > 0) {
+        const resolved = wips.filter((p) => p.resultRevision !== null).length;
+        manifestView = { resolved, total: wips.length };
+      }
+    }
+
     const item: Item = {
       workItemId: wi.id,
       intent: wi.intent,
@@ -372,6 +538,8 @@ export function buildReturnView(input: ReturnViewInput): ReturnView {
       execution: executionState,
       verification: verificationState,
       acceptance: acceptanceState,
+      integration: integrationView,
+      manifest: manifestView,
     };
 
     // Determine newest timestamp across this work item's data
@@ -385,6 +553,11 @@ export function buildReturnView(input: ReturnViewInput): ReturnView {
     ];
     const latestReviewForTs = latestAttempt ? reviewByAttempt.get(latestAttempt.id) : undefined;
     allTimestamps.push(latestReviewForTs?.updatedAt);
+
+    // Include integration.at in changed timestamp calculation
+    if (integrationView?.at) {
+      allTimestamps.push(integrationView.at);
+    }
 
     const newestAt = latest(allTimestamps);
 

@@ -9,11 +9,16 @@ import type { VerificationResult, VerifyRunPayload } from "@agencyhq/contracts";
 import { VerificationResultSchema, VerifyRunOutputSchema } from "@agencyhq/contracts";
 import { changedPaths, diffDigest, worktreeAdd, worktreeRemove } from "../src/lib/git.ts";
 import type {
+  ManifestRecord,
   RunProfileInput,
   VerificationRunner,
   VerifyRunDeps,
 } from "../src/tasks/verify-run-core.ts";
-import { resolveVerifyWorktreePath, runVerification } from "../src/tasks/verify-run-core.ts";
+import {
+  resolveManifestWorktreeDir,
+  resolveVerifyWorktreePath,
+  runVerification,
+} from "../src/tasks/verify-run-core.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -691,5 +696,280 @@ test("contract output shape parses with VerifyRunOutputSchema and retains integr
     );
   } finally {
     await cleanupFixture(fixture);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Packet 4.2.c: Combined manifest verification
+// ---------------------------------------------------------------------------
+
+/** Build a producer repo with a single commit (the "sibling" at position 0). */
+async function makeProducerRepo(): Promise<{ repoPath: string; revision: string }> {
+  const repoPath = await mkdtemp(join(tmpdir(), "agencyhq-manifest-producer-"));
+  await git(["init", "--initial-branch=main"], repoPath);
+  await writeFile(join(repoPath, "produced.txt"), "produced content\n");
+  await git(["add", "-A"], repoPath);
+  await git(
+    ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-m", "producer commit"],
+    repoPath,
+  );
+  const revision = (await git(["rev-parse", "HEAD"], repoPath)).trim();
+  return { repoPath, revision };
+}
+
+/** Build a RevisionManifest with producer (pos 0, resolved) + consumer (pos 1, pending). */
+async function makeManifest(
+  producerProjectId: string,
+  producerRevision: string,
+  consumerProjectId: string,
+  consumerBaseRevision: string,
+): Promise<{ manifest: NonNullable<VerifyRunPayload["manifest"]>; digest: string }> {
+  const { manifestDigest } = await import("@agencyhq/contracts");
+  const entries = [
+    {
+      position: 0,
+      projectId: producerProjectId,
+      targetRef: "refs/heads/main",
+      expectedBaseRevision: producerRevision,
+      resultRevision: producerRevision, // already resolved
+    },
+    {
+      position: 1,
+      projectId: consumerProjectId,
+      targetRef: "refs/heads/main",
+      expectedBaseRevision: consumerBaseRevision,
+      resultRevision: null, // pending (the one being verified)
+    },
+  ];
+  const digest = manifestDigest(entries);
+  return { manifest: { entries, digest }, digest };
+}
+
+// M-1: manifest present → sibling worktrees created + env vars passed to runner + output.manifest recorded
+test("manifest combined verification: sibling worktree materialized and env passed to runner", async () => {
+  const fixture = await makeFixture();
+  const producer = await makeProducerRepo();
+  try {
+    const consumerProjectId = "consumer-project";
+    const producerProjectId = "producer-project";
+    const { manifest } = await makeManifest(
+      producerProjectId,
+      producer.revision,
+      consumerProjectId,
+      fixture.baseRevision,
+    );
+
+    // A runner that records the env it was called with.
+    const envCalls: Record<string, string>[] = [];
+    const runner: VerificationRunner = {
+      runProfile: async (input: RunProfileInput): Promise<VerificationResult[]> => {
+        envCalls.push({ ...input.env });
+        const now = input.now();
+        return input.checks.map((check) => ({
+          verifier: { name: "fake-runner", version: "1.0.0" },
+          stepContractId: input.contractId,
+          attemptId: input.attemptId,
+          criteriaDigest: input.criteriaDigest,
+          profileDigest: input.profileDigest,
+          repository: input.repoPath,
+          baseRevision: input.baseRevision,
+          attemptRevision: input.attemptRevision,
+          diffDigest: input.diffDigest,
+          checkId: check.id,
+          environmentFingerprint: {},
+          startedAt: now,
+          endedAt: now,
+          exitStatus: 0,
+          stdoutTail: "ok",
+          stderrTail: "",
+          artifactDigests: [],
+          result: "pass" as const,
+        }));
+      },
+    };
+
+    const payload = makePayload(fixture, { manifest });
+    const deps: VerifyRunDeps = {
+      ...makeDeps(runner),
+      manifestProjectId: consumerProjectId,
+      manifestRepoPaths: { [producerProjectId]: producer.repoPath },
+    };
+
+    const output = await runVerification(payload, deps);
+
+    // Verify the runner received manifest env vars.
+    assert.equal(envCalls.length, 1, "runner must be called exactly once");
+    const runnerEnv = envCalls[0];
+    assert.ok(runnerEnv !== undefined, "runner env must be captured");
+    assert.ok(
+      "AGENCYHQ_MANIFEST_DIGEST" in runnerEnv,
+      "AGENCYHQ_MANIFEST_DIGEST must be in runner env",
+    );
+    assert.ok(
+      "AGENCYHQ_MANIFEST_0" in runnerEnv,
+      "AGENCYHQ_MANIFEST_0 must be in runner env for producer at position 0",
+    );
+    // AGENCYHQ_MANIFEST_1 is the consumer — not materialized (current project).
+    assert.ok(
+      !("AGENCYHQ_MANIFEST_1" in runnerEnv),
+      "AGENCYHQ_MANIFEST_1 must NOT be in env (consumer is the current project)",
+    );
+
+    // Verify output.manifest is recorded with digest and sibling info.
+    assert.ok(output.manifest !== undefined, "output.manifest must be present");
+    const manifestRec = output.manifest as ManifestRecord;
+    assert.equal(
+      manifestRec.digest,
+      payload.manifest?.digest,
+      "manifest.digest must match payload manifest digest",
+    );
+    assert.equal(
+      manifestRec.materializedSiblings.length,
+      1,
+      "exactly one sibling materialized (producer)",
+    );
+    const sibling = manifestRec.materializedSiblings[0];
+    assert.ok(sibling !== undefined);
+    assert.equal(sibling.position, 0, "sibling position must be 0");
+    assert.equal(sibling.projectId, producerProjectId);
+    assert.equal(sibling.revision, producer.revision);
+
+    // Results must still be returned (integrity path unchanged).
+    assert.ok(output.results.length > 0, "must have at least one result");
+    assert.ok(output.integrity.diffDigestMatches, "integrity check must pass");
+  } finally {
+    await cleanupFixture(fixture);
+    await rm(producer.repoPath, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+// M-2: manifest worktrees are removed in finally (cleanup after success)
+test("manifest combined verification: sibling worktrees removed after run", async () => {
+  const fixture = await makeFixture();
+  const producer = await makeProducerRepo();
+  try {
+    const consumerProjectId = "consumer-project";
+    const producerProjectId = "producer-project";
+    const { manifest } = await makeManifest(
+      producerProjectId,
+      producer.revision,
+      consumerProjectId,
+      fixture.baseRevision,
+    );
+
+    const { runner } = makeFakeRunner();
+    const payload = makePayload(fixture, { manifest });
+    const manifestDir = resolveManifestWorktreeDir({
+      worktreeBase: fixture.worktreeBase,
+      attemptId: payload.attemptId,
+      generation: payload.generation,
+    });
+    const siblingWtPath = `${manifestDir}/0`;
+
+    const deps: VerifyRunDeps = {
+      ...makeDeps(runner),
+      manifestProjectId: consumerProjectId,
+      manifestRepoPaths: { [producerProjectId]: producer.repoPath },
+    };
+
+    await runVerification(payload, deps);
+
+    // The sibling worktree must no longer exist.
+    const exists = await pathExists(siblingWtPath);
+    assert.equal(exists, false, "sibling worktree must be removed after runVerification");
+  } finally {
+    await cleanupFixture(fixture);
+    await rm(producer.repoPath, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+// M-3: no manifest → output.manifest absent; behavior unchanged
+test("manifest combined verification: no manifest → output.manifest absent and behavior unchanged", async () => {
+  const fixture = await makeFixture();
+  try {
+    const payload = makePayload(fixture);
+    const { runner, calls } = makeFakeRunner();
+    const deps = makeDeps(runner);
+
+    const output = await runVerification(payload, deps);
+
+    assert.equal(output.manifest, undefined, "output.manifest must be absent when no manifest");
+    assert.equal(calls.length, 1, "runner must still be called once");
+    assert.ok(output.results.length > 0, "results must still be returned");
+    assert.ok(output.integrity.diffDigestMatches, "integrity check must pass");
+    assert.equal(output.integrity.protectedPathsSource, "default");
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+// M-4: AGENCYHQ_MANIFEST_0 path has the sibling repo's files during check execution
+test("manifest combined verification: AGENCYHQ_MANIFEST_0 points to worktree with sibling content", async () => {
+  const fixture = await makeFixture();
+  const producer = await makeProducerRepo();
+  try {
+    const consumerProjectId = "consumer-project";
+    const producerProjectId = "producer-project";
+    const { manifest } = await makeManifest(
+      producerProjectId,
+      producer.revision,
+      consumerProjectId,
+      fixture.baseRevision,
+    );
+
+    // A runner that checks if produced.txt exists at AGENCYHQ_MANIFEST_0.
+    let foundProducedFile = false;
+    const runner: VerificationRunner = {
+      runProfile: async (input: RunProfileInput): Promise<VerificationResult[]> => {
+        const manifestWt = input.env.AGENCYHQ_MANIFEST_0;
+        if (manifestWt !== undefined) {
+          try {
+            await stat(join(manifestWt, "produced.txt"));
+            foundProducedFile = true;
+          } catch {
+            foundProducedFile = false;
+          }
+        }
+        const now = input.now();
+        return input.checks.map((check) => ({
+          verifier: { name: "fake-runner", version: "1.0.0" },
+          stepContractId: input.contractId,
+          attemptId: input.attemptId,
+          criteriaDigest: input.criteriaDigest,
+          profileDigest: input.profileDigest,
+          repository: input.repoPath,
+          baseRevision: input.baseRevision,
+          attemptRevision: input.attemptRevision,
+          diffDigest: input.diffDigest,
+          checkId: check.id,
+          environmentFingerprint: {},
+          startedAt: now,
+          endedAt: now,
+          exitStatus: 0,
+          stdoutTail: "ok",
+          stderrTail: "",
+          artifactDigests: [],
+          result: "pass" as const,
+        }));
+      },
+    };
+
+    const payload = makePayload(fixture, { manifest });
+    const deps: VerifyRunDeps = {
+      ...makeDeps(runner),
+      manifestProjectId: consumerProjectId,
+      manifestRepoPaths: { [producerProjectId]: producer.repoPath },
+    };
+
+    await runVerification(payload, deps);
+
+    assert.equal(
+      foundProducedFile,
+      true,
+      "produced.txt must be accessible at AGENCYHQ_MANIFEST_0 during check execution",
+    );
+  } finally {
+    await cleanupFixture(fixture);
+    await rm(producer.repoPath, { recursive: true, force: true }).catch(() => undefined);
   }
 });

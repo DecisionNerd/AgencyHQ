@@ -2,7 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Freshness, Item, PendingDecision, ReturnView, State, Stop } from "./api.js";
 import { fetchReturnView, postCommand, setToken, UnauthorizedError } from "./api.js";
 import { ExecutionState } from "./ExecutionState.js";
-import { isStale, orderItems, stopBadge } from "./view-helpers.js";
+import {
+  integrationCardModel,
+  isStale,
+  manifestLabel,
+  orderItems,
+  stopBadge,
+} from "./view-helpers.js";
 
 const ACK_KEY = "agencyhq.lastAckAt";
 const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
@@ -22,6 +28,41 @@ function StateCard({ dim, state }: { dim: string; state: State }) {
   );
 }
 
+const INTEGRATION_ICONS: Record<"pending" | "integrated" | "failed", string> = {
+  pending: "⏳", // ⏳ hourglass
+  integrated: "✓", // ✓ check mark
+  failed: "✗", // ✗ ballot x
+};
+
+function IntegrationCard({ item }: { item: Item }) {
+  const model = integrationCardModel(item);
+  if (!model) return null;
+
+  const icon = INTEGRATION_ICONS[model.iconKey];
+  const ts = model.at ? new Date(model.at).toLocaleString() : "no timestamp";
+  const mLabel = manifestLabel(item.manifest);
+
+  return (
+    <div className="state-card">
+      <div className="state-card-label">Integration</div>
+      <div className="state-card-value">
+        <span aria-hidden="true">{icon}</span> {model.label}
+      </div>
+      {model.outcome && <div className="state-card-detail">Outcome: {model.outcome}</div>}
+      {model.targetRef && <div className="state-card-detail">Target: {model.targetRef}</div>}
+      {model.shortRevision && (
+        <div className="state-card-detail">
+          Revision: <span title={model.fullRevision ?? undefined}>{model.shortRevision}</span>
+        </div>
+      )}
+      <div className="state-card-meta">
+        {model.source} · {ts}
+      </div>
+      {mLabel && <div className="state-card-detail">{mLabel}</div>}
+    </div>
+  );
+}
+
 function ItemCard({ item, isMain }: { item: Item; isMain: boolean }) {
   return (
     <div className={`item-card${isMain ? " main-effort" : ""}`}>
@@ -35,6 +76,7 @@ function ItemCard({ item, isMain }: { item: Item; isMain: boolean }) {
         <StateCard dim="Execution" state={item.execution} />
         <StateCard dim="Verification" state={item.verification} />
         <StateCard dim="Acceptance" state={item.acceptance} />
+        <IntegrationCard item={item} />
       </div>
       {item.execution.source !== "ledger" && (
         <ExecutionState workItemId={item.workItemId} ledgerExecution={item.execution} />

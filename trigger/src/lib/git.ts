@@ -147,6 +147,177 @@ export async function diffDigest(args: { worktreePath: string; baseRev: string }
   return `sha256:${hash.digest("hex")}`;
 }
 
+// ---------------------------------------------------------------------------
+// Credential scrubbing and push-failure classification
+// ---------------------------------------------------------------------------
+
+/** Remove embedded credentials from a git error string before storing it in evidence. */
+export function scrubCredentials(s: string): string {
+  return s
+    .replace(/https?:\/\/[^:@\s/]+:[^@\s/]+@/gi, "https://[REDACTED]@")
+    .replace(/(Authorization:\s*)[^\r\n]+/gi, "$1[REDACTED]");
+}
+
+type PushFailureKind = "lease_broken" | "auth" | "network" | "other";
+
+function classifyPushStderr(stderr: string): PushFailureKind {
+  if (/stale info/i.test(stderr)) return "lease_broken";
+  if (/Authentication failed|could not read Username|Permission to .* denied|\b403\b/i.test(stderr))
+    return "auth";
+  if (/Could not resolve host|Connection refused|timed out|unable to access/i.test(stderr))
+    return "network";
+  return "other";
+}
+
+// ---------------------------------------------------------------------------
+// integrate.merge helpers — additive, no Trigger SDK usage.
+// Every function sets GIT_TERMINAL_PROMPT=0 on network-facing calls so the
+// git process never blocks waiting for credentials.
+// ---------------------------------------------------------------------------
+
+/** Fetch a single ref from a remote and return the observed SHA (FETCH_HEAD). */
+export async function fetchRef(args: {
+  repoPath: string;
+  remote: string;
+  ref: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<string> {
+  const env: NodeJS.ProcessEnv = { ...(args.env ?? process.env), GIT_TERMINAL_PROMPT: "0" };
+  await git(["fetch", args.remote, args.ref], { cwd: args.repoPath, env });
+  const { stdout } = await git(["rev-parse", "FETCH_HEAD"], { cwd: args.repoPath });
+  return stdout.trim();
+}
+
+/** Query a remote ref via ls-remote. Returns the SHA or null when not found. */
+export async function lsRemote(args: {
+  repoPath: string;
+  remote: string;
+  ref: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<string | null> {
+  const env: NodeJS.ProcessEnv = { ...(args.env ?? process.env), GIT_TERMINAL_PROMPT: "0" };
+  const { stdout } = await git(["ls-remote", args.remote, `refs/heads/${args.ref}`], {
+    cwd: args.repoPath,
+    env,
+  });
+  const line = stdout.trim().split("\n")[0] ?? "";
+  if (!line) return null;
+  const sha = line.split(/\s+/)[0]?.trim() ?? "";
+  return sha.length > 0 ? sha : null;
+}
+
+/** Return true if ancestorRev is an ancestor (or equal to) descendantRev. */
+export async function isAncestor(args: {
+  repoPath: string;
+  ancestorRev: string;
+  descendantRev: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<boolean> {
+  const opts: GitOptions = { cwd: args.repoPath };
+  if (args.env) opts.env = { ...args.env, GIT_TERMINAL_PROMPT: "0" };
+  try {
+    await git(["merge-base", "--is-ancestor", args.ancestorRev, args.descendantRev], opts);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Merge sha into the worktree using the given strategy.
+ * Returns { ok: true, mergeSha } on success.
+ * Returns { ok: false, conflictingPaths } on conflict (merge_commit) or
+ * non-fast-forward failure (fast_forward).
+ * The caller is responsible for removing the worktree on failure.
+ */
+export async function mergeInWorktree(args: {
+  worktreePath: string;
+  sha: string;
+  strategy: "merge_commit" | "fast_forward";
+  env?: NodeJS.ProcessEnv;
+}): Promise<{ ok: boolean; mergeSha?: string; conflictingPaths?: string[] }> {
+  const opts: GitOptions = { cwd: args.worktreePath };
+  if (args.env) opts.env = args.env;
+
+  const mergeArgs: string[] =
+    args.strategy === "merge_commit"
+      ? [
+          "-c",
+          "user.name=agencyhq",
+          "-c",
+          "user.email=agencyhq@localhost",
+          "merge",
+          "--no-ff",
+          args.sha,
+        ]
+      : ["merge", "--ff-only", args.sha];
+
+  try {
+    await git(mergeArgs, opts);
+    const { stdout } = await git(["rev-parse", "HEAD"], opts);
+    return { ok: true, mergeSha: stdout.trim() };
+  } catch {
+    // For merge_commit, conflicts leave unmerged files; collect them.
+    // For fast_forward, --ff-only failure also ends up here with no unmerged files.
+    try {
+      const { stdout: conflictOut } = await git(["diff", "--name-only", "--diff-filter=U"], opts);
+      const conflictingPaths = conflictOut
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+      return { ok: false, conflictingPaths };
+    } catch {
+      return { ok: false, conflictingPaths: [] };
+    }
+  }
+}
+
+/** Structured result for pushForceWithLease. */
+export type PushResult =
+  | { ok: true }
+  | { ok: false; kind: "lease_broken" | "auth" | "network" | "other"; stderr: string };
+
+/**
+ * Push sha to refs/heads/targetRef on remote using --force-with-lease
+ * guarded by expectedBaseSha.
+ *
+ * Returns { ok: true } on success.
+ * Returns { ok: false, kind, stderr } on any non-zero git exit — never throws.
+ * The kind classifies the failure: lease_broken (stale lease), auth (credential
+ * error), network (host unreachable / timeout), or other.
+ * stderr is the first 500 characters of git's stderr with credentials scrubbed.
+ *
+ * Setup errors (e.g. missing repoPath) still throw.
+ */
+export async function pushForceWithLease(args: {
+  repoPath: string;
+  remote: string;
+  sha: string;
+  targetRef: string;
+  expectedBaseSha: string;
+  env?: NodeJS.ProcessEnv;
+}): Promise<PushResult> {
+  const env: NodeJS.ProcessEnv = { ...(args.env ?? process.env), GIT_TERMINAL_PROMPT: "0" };
+  try {
+    await git(
+      [
+        "push",
+        args.remote,
+        `${args.sha}:refs/heads/${args.targetRef}`,
+        `--force-with-lease=refs/heads/${args.targetRef}:${args.expectedBaseSha}`,
+      ],
+      { cwd: args.repoPath, env },
+    );
+    return { ok: true };
+  } catch (err: unknown) {
+    const execError = err as { stderr?: string };
+    const rawStderr = execError.stderr ?? "";
+    const kind = classifyPushStderr(rawStderr);
+    const stderr = scrubCredentials(rawStderr).slice(0, 500);
+    return { ok: false, kind, stderr };
+  }
+}
+
 export async function revertPaths(args: {
   worktreePath: string;
   paths: string[];

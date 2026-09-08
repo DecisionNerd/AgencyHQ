@@ -172,3 +172,45 @@ export type LeadPlanVariant = {
   /** Model variant (e.g. "low", "high"). Defaults to AGENCYHQ_LEAD_VARIANT env or "low". */
   variant?: string | undefined;
 };
+// Appended for the integrate.merge task (Packet 4.2.c, R-015, R-010).
+// IntegrateMergePayload and IntegrateMergeOutput are now imported from
+// @agencyhq/contracts (wave 4.1 exports). Re-exported here so existing
+// callers that import from types.ts continue to compile unchanged.
+export type {
+  IntegrateMergeOutput,
+  IntegrateMergePayload,
+} from "@agencyhq/contracts";
+
+// Appended for the verify.run manifest combined verification (Packet 4.2.c, R-006).
+// These fields extend the VerifyRunPayload on the wire; the contracts schema
+// is not edited — the coordinator includes them alongside the standard fields
+// and verify-run.ts extracts them after schema validation.
+
+/**
+ * Coordinator-supplied extension fields for combined manifest verification.
+ *
+ * When a multi-repository WorkItem includes a revision manifest the coordinator
+ * enriches the verify.run payload with the sibling repos' absolute paths and
+ * the projectId of the project being verified. verify-run.ts extracts these
+ * from the raw (pre-parse) payload and passes them to verify-run-core.ts.
+ *
+ * Field `manifestRepoPaths` maps each sibling projectId to the absolute path
+ * of the coordinator-owned git clone for that repository. The current project
+ * is NOT included — its absence is what distinguishes it from siblings.
+ *
+ * Field `manifestProjectId` identifies which manifest entry belongs to the
+ * project under verification so that entry can be excluded from materialization.
+ */
+export type VerifyRunManifestExt = {
+  /**
+   * ProjectId of the project currently being verified.
+   * Used to identify and exclude the current entry from sibling materialization.
+   */
+  manifestProjectId?: string;
+  /**
+   * Absolute paths to coordinator-owned clones of sibling repositories, keyed
+   * by projectId. Only sibling projectIds appear here; the current project is
+   * absent. Coordinator-supplied; not part of the @agencyhq/contracts schema.
+   */
+  manifestRepoPaths?: Record<string, string>;
+};

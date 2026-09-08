@@ -240,5 +240,72 @@ export function leadAcceptPayload(
   return LeadAcceptPayloadSchema.parse(payload);
 }
 
+// ---------------------------------------------------------------------------
+// buildLeadPlanIntent
+// ---------------------------------------------------------------------------
+
+/**
+ * Describes one entry's position in a multi-repository manifest.
+ * Used to produce an entry-scoped operatorIntent for lead.plan payloads.
+ */
+export interface ManifestEntryContext {
+  /** Zero-based position of this entry in the manifest. */
+  position: number;
+  /** Total number of entries in the manifest. */
+  totalEntries: number;
+  /** Project ID for this entry. */
+  projectId: string;
+  /** Local clone path for this entry's project, or null if unknown. */
+  clonePath: string | null;
+  /** All entries (including this one) — used to describe siblings. */
+  allEntries: ReadonlyArray<{
+    position: number;
+    projectId: string;
+    resultRevision: string | null;
+  }>;
+}
+
+/**
+ * Build the operatorIntent string for a lead.plan payload.
+ *
+ * For merge-boundary work items, appends the boundary requirement so the Lead
+ * knows to propose `boundary: "merge"` (R-015 / R-018).
+ *
+ * For manifest work items, prepends an entry-context line naming the entry's
+ * project and its role, plus a summary of sibling entries.
+ *
+ * This function is the single source of truth for operatorIntent construction —
+ * both the initial plan() dispatch and the next-entry lead.plan dispatch in
+ * integrate.ts must call it so the Lead always receives the same framing.
+ */
+export function buildLeadPlanIntent(
+  baseIntent: string,
+  opts: {
+    boundary: "artifact" | "merge" | "deploy";
+    manifestEntry?: ManifestEntryContext;
+  },
+): string {
+  let intent = baseIntent;
+
+  if (opts.manifestEntry) {
+    const { position, totalEntries, projectId, clonePath, allEntries } = opts.manifestEntry;
+    const pathSuffix = clonePath ? ` (${clonePath})` : "";
+    const siblings = allEntries
+      .filter((e) => e.position !== position)
+      .map((e) => `${e.position} = ${e.projectId} at ${e.resultRevision ?? "pending"}`)
+      .join(", ");
+    const entryLine =
+      `Manifest entry ${position} of ${totalEntries}: project ${projectId}${pathSuffix}` +
+      (siblings ? `; sibling entries: ${siblings}` : "");
+    intent = `${intent}\n\n${entryLine}`;
+  }
+
+  if (opts.boundary === "merge") {
+    intent = `${intent}\n\nIntegration requirement: this work item completes at the merge boundary; propose boundary merge.`;
+  }
+
+  return intent;
+}
+
 // Re-export for convenience
 export { criteriaDigestInput, digestOf };

@@ -91,6 +91,8 @@ export const StepContractRowSchema = z
     human_required: z.boolean(),
     status: z.string(),
     superseded_by: NullableText,
+    target_ref: NullableText.default(null),
+    manifest_digest: NullableText.default(null),
   })
   .merge(Timestamps);
 
@@ -328,3 +330,41 @@ export const RunObservationRowSchema = z.object({
 });
 
 export type RunObservationRow = z.infer<typeof RunObservationRowSchema>;
+
+// ---------------------------------------------------------------------------
+// work_item_projects
+// ---------------------------------------------------------------------------
+
+export const WorkItemProjectRowSchema = z
+  .object({
+    work_item_id: z.string(),
+    project_id: z.string(),
+    position: z.number().int(),
+    target_ref: z.string(),
+    expected_base_revision: z.string(),
+    result_revision: NullableText,
+  })
+  .merge(Timestamps);
+
+export type WorkItemProjectRow = z.infer<typeof WorkItemProjectRowSchema>;
+
+// ---------------------------------------------------------------------------
+// integrations
+// ---------------------------------------------------------------------------
+
+export const IntegrationRowSchema = z
+  .object({
+    id: z.string(),
+    attempt_id: z.string(),
+    contract_id: z.string(),
+    contract_version: z.number().int(),
+    target_ref: z.string(),
+    expected_base_revision: z.string(),
+    resulting_revision: NullableText,
+    outcome: NullableText,
+    run_id: NullableText,
+    at: z.date(),
+  })
+  .merge(Timestamps);
+
+export type IntegrationRow = z.infer<typeof IntegrationRowSchema>;

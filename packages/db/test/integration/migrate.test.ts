@@ -24,6 +24,8 @@ test("migrations apply into a fresh schema", async (t) => {
       "commands",
       "run_observations",
       "schema_migrations",
+      "work_item_projects",
+      "integrations",
     ];
 
     const { rows } = await client.query<{ table_name: string }>(

@@ -1,7 +1,7 @@
 # Initial process catalog
 
 One process exists and it is code, not data. A ProcessDefinition type is
-introduced when the second process shows what varies.
+extracted when a second catalog entry needs a different step/gate sequence.
 
 ## Selection
 

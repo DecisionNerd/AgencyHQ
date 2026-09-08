@@ -1,6 +1,6 @@
 // Pure view helpers — no DOM, no React. Fully unit-testable with node:test.
 
-import type { Freshness, Item, State, Stop } from "./api.js";
+import type { Freshness, IntegrationInfo, Item, ManifestInfo, State, Stop } from "./api.js";
 
 /** Format a State into a human-readable string: "label (source, timestamp)". */
 export function formatState(state: State): string {
@@ -23,6 +23,55 @@ export function isStale(freshness: Freshness, now: Date, thresholdMs: number): b
   if (!freshness.lastPollAt) return true;
   const pollTime = new Date(freshness.lastPollAt).getTime();
   return now.getTime() - pollTime > thresholdMs;
+}
+
+/** Truncate a full SHA to 7 characters, or return null when sha is null/empty. */
+export function shortSha(sha: string | null): string | null {
+  if (!sha) return null;
+  return sha.slice(0, 7);
+}
+
+/** Format a manifest as "Manifest n/m", or null when manifest is null. */
+export function manifestLabel(manifest: ManifestInfo | null): string | null {
+  if (!manifest) return null;
+  return `Manifest ${manifest.resolved}/${manifest.total}`;
+}
+
+export interface IntegrationCardModel {
+  label: string;
+  iconKey: "pending" | "integrated" | "failed";
+  outcome: string | null;
+  targetRef: string | null;
+  shortRevision: string | null;
+  fullRevision: string | null;
+  at: string | null;
+  source: string;
+}
+
+const INTEGRATION_LABELS: Record<IntegrationInfo["state"], string> = {
+  pending: "Pending integration",
+  integrated: "Integrated",
+  failed: "Integration failed",
+};
+
+/**
+ * Build a model for the integration state card, or null when integration is absent.
+ * Suitable for rendering without DOM or React dependency.
+ */
+export function integrationCardModel(item: Item): IntegrationCardModel | null {
+  const { integration } = item;
+  if (!integration) return null;
+
+  return {
+    label: INTEGRATION_LABELS[integration.state],
+    iconKey: integration.state,
+    outcome: integration.outcome,
+    targetRef: integration.targetRef,
+    shortRevision: shortSha(integration.resultingRevision),
+    fullRevision: integration.resultingRevision,
+    at: integration.at,
+    source: integration.source,
+  };
 }
 
 /**

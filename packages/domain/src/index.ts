@@ -15,6 +15,9 @@ export * from "./aggregates/verification-result.ts";
 export * from "./aggregates/work-item.ts";
 // Authority subset check, human approval, runtime enforceability (wave 2.F)
 export * from "./authority/index.ts";
+// Runtime violation types (new in slice 4)
+export type { RuntimeViolation, RuntimeViolationCode } from "./authority/runtime.ts";
+export { checkBoundarySupport } from "./authority/runtime.ts";
 // Dispatch selection (wave 2.I)
 export * from "./dispatch/index.ts";
 // Evidence matching, acceptance rule, verifier integrity, dispositions (wave 2.H)
@@ -32,6 +35,8 @@ export { CLASSIFICATION_TABLE, classifyObservation } from "./failure/classify.ts
 export * from "./findings/index.ts";
 // Primitives and ports (wave 2.E)
 export * from "./ids.ts";
+// Integration module — revision manifests and outcome decisions (slice 4)
+export * from "./integration/index.ts";
 export * from "./ports.ts";
 export * from "./result.ts";
 // Transitions (wave 2.E): namespaced because attempt and work-item share
