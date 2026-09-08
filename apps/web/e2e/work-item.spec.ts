@@ -60,7 +60,7 @@ test("work item page: pending_human accept state shows approve action", async ({
   await row.locator("a").first().click();
 
   await expect(page.getByTestId("work-item-detail")).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByTestId("work-item-lifecycle")).toContainText("active");
+  await expect(page.getByTestId("work-item-lifecycle")).toContainText("running");
   // Approve action should be visible for pending_human items
   await expect(page.getByTestId("action-approve")).toBeVisible();
 });

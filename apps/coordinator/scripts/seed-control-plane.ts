@@ -238,6 +238,8 @@ async function runSeed(dbUrl: string): Promise<void> {
         "wiApprove",
         "wiReject",
         "wiPending",
+        "wiApprove2",
+        "wiReject2",
         "wiCompleted",
         "wiAdmitted",
         "wiBlocked",
@@ -342,6 +344,23 @@ async function runSeed(dbUrl: string): Promise<void> {
       rank: 3,
       mainEffort: false,
       intent: "wi-pending: Add retry to the fetch helper",
+    });
+
+    // One pending item per mutating journey, so each journey targets its own
+    // decision by id and the outcome does not depend on execution order.
+    const wiApprove2 = await seedPendingHumanItem(client, {
+      projectId,
+      campaignId,
+      rank: 4,
+      mainEffort: false,
+      intent: "wi-approve2: Normalize line endings in the importer",
+    });
+    const wiReject2 = await seedPendingHumanItem(client, {
+      projectId,
+      campaignId,
+      rank: 5,
+      mainEffort: false,
+      intent: "wi-reject2: Rename the legacy config loader",
     });
 
     // Set campaign main effort
@@ -635,6 +654,8 @@ async function runSeed(dbUrl: string): Promise<void> {
       wiApprove,
       wiReject,
       wiPending,
+      wiApprove2,
+      wiReject2,
       wiCompleted: wiCompletedId,
       wiAdmitted: wiAdmittedId,
       wiBlocked: wiBlockedId,
@@ -644,13 +665,18 @@ async function runSeed(dbUrl: string): Promise<void> {
     // Commit the transaction — all data is consistent.
     await client.query("COMMIT");
 
-    const decApprove = await pendingAcceptDecisionId(client, wiApprove);
-    const decPending = await pendingAcceptDecisionId(client, wiPending);
-    publishSeedIds({
-      ...output,
-      ...(decApprove ? { decApprove } : {}),
-      ...(decPending ? { decPending } : {}),
-    });
+    const decisionIds: Record<string, string> = {};
+    for (const [key, wi] of [
+      ["decApprove", wiApprove],
+      ["decPending", wiPending],
+      ["decApprove2", wiApprove2],
+      ["decReject", wiReject],
+      ["decReject2", wiReject2],
+    ] as const) {
+      const dec = await pendingAcceptDecisionId(client, wi);
+      if (dec) decisionIds[key] = dec;
+    }
+    publishSeedIds({ ...output, ...decisionIds });
   } catch (err) {
     // Rollback on any error to leave no partial data.
     try {
@@ -853,6 +879,8 @@ function intentToTag(intent: string): string | null {
   if (intent.startsWith("wi-approve:")) return "wiApprove";
   if (intent.startsWith("wi-reject:")) return "wiReject";
   if (intent.startsWith("wi-pending:")) return "wiPending";
+  if (intent.startsWith("wi-approve2:")) return "wiApprove2";
+  if (intent.startsWith("wi-reject2:")) return "wiReject2";
   if (intent.startsWith("wi-completed:")) return "wiCompleted";
   if (intent.startsWith("wi-admitted:")) return "wiAdmitted";
   if (intent.startsWith("wi-blocked:")) return "wiBlocked";

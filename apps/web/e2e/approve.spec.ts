@@ -38,51 +38,27 @@ test("decisions page: approve pending_human decision removes it from the list", 
 });
 
 test("work item page: approve via confirm dialog updates the item", async ({ page }) => {
-  await page.goto("/#/decisions");
-  await expect(page.getByTestId("decisions-list")).toBeVisible({ timeout: 10_000 });
+  const ids = seedIds();
+  expect(ids.wiApprove2, "seed must publish wiApprove2").toBeTruthy();
 
-  // Get a decision with a workItemId link
-  const decisionEntry = page.locator(`[data-testid^="decision-entry-"]`).first();
-  await expect(decisionEntry).toBeVisible({ timeout: 5_000 });
-
-  // Extract the work item id from the impact section and navigate directly
-  // by clicking the work item link in the nav or going to overview
-  // Instead: go to the work item page for a seeded pending item via the overview
-  await page.goto("/#/");
-  await expect(page.getByTestId("projects-section")).toBeVisible({ timeout: 10_000 });
-
-  const pendingCell = page
-    .locator(`[data-testid^="pending-decisions-"]`)
-    .filter({ hasNotText: "0" })
-    .first();
-
-  // If no pending cells visible (approve test ran first and cleared one),
-  // just skip this part gracefully — the primary approve test covers it.
-  const count = await pendingCell.count();
-  if (count === 0) {
-    return;
-  }
-
-  const row = pendingCell.locator("xpath=ancestor::tr");
-  const link = row.locator("a").first();
-  await link.click();
-
+  await page.goto(`/#/work-items/${ids.wiApprove2}`);
   await expect(page.getByTestId("work-item-detail")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByTestId("work-item-lifecycle")).not.toContainText("completed");
 
-  // Only proceed if the approve button exists (item is pending_human)
-  const approveBtn = page.getByTestId("action-approve");
-  const approveBtnCount = await approveBtn.count();
-  if (approveBtnCount === 0) return;
+  await page.getByTestId("action-approve").click();
 
-  await approveBtn.click();
-
-  // Confirm dialog should appear
-  await expect(page.getByTestId("confirm-dialog")).toBeVisible({ timeout: 5_000 });
+  // The confirmation names the project, the work item and the contract version.
+  const dialog = page.getByTestId("confirm-dialog");
+  await expect(dialog).toBeVisible({ timeout: 5_000 });
+  const message = await page.getByTestId("confirm-message").innerText();
+  expect(message).toContain(ids.wiApprove2);
+  expect(message).toMatch(/contract v?\d+/i);
   await page.getByTestId("confirm-ok").click();
-
-  // Dialog closes
-  await expect(page.getByTestId("confirm-dialog")).not.toBeVisible({ timeout: 10_000 });
-
-  // No error
+  await expect(dialog).not.toBeVisible({ timeout: 10_000 });
   await expect(page.getByTestId("work-item-action-error")).not.toBeVisible();
+
+  // The page reloads the item: acceptance approved, lifecycle completed.
+  await expect(page.getByTestId("work-item-lifecycle")).toContainText("completed", {
+    timeout: 15_000,
+  });
 });
