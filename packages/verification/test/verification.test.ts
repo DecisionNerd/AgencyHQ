@@ -116,6 +116,7 @@ test("CHECK_CATALOG: all expected ids are present", () => {
     "node-test@1",
     "git-diff-clean@1",
     "manifest-consumer@1",
+    "pnpm-install@1",
   ];
   for (const id of expected) {
     assert.ok(CHECK_CATALOG[id] !== undefined, `CHECK_CATALOG missing "${id}"`);
@@ -123,7 +124,14 @@ test("CHECK_CATALOG: all expected ids are present", () => {
 });
 
 test("PROFILE_CATALOG: all expected ids are present", () => {
-  const expected = ["node-pnpm-v1", "docs-check-v1", "minimal-v1", "multi-repo-v1"];
+  const expected = [
+    "node-pnpm-v1",
+    "docs-check-v1",
+    "minimal-v1",
+    "multi-repo-v1",
+    "node-pnpm-v2",
+    "multi-repo-v2",
+  ];
   for (const id of expected) {
     assert.ok(PROFILE_CATALOG[id] !== undefined, `PROFILE_CATALOG missing "${id}"`);
   }
@@ -176,7 +184,10 @@ test("runCheck: timeout kills process group and sets timedOut", { timeout: 15_00
     version: "1",
     // Spawn a shell that starts a background sleep and a foreground sleep.
     // If the process group is killed, both sleeps should die.
-    command: ["sh", "-c", "sleep 30 & sleep 30"],
+    // The unusual duration is a marker: pgrep below must not match unrelated
+    // "sleep 30" processes on the host (observed 2026-09-08: a shell snapshot
+    // and a monitor loop both matched).
+    command: ["sh", "-c", "sleep 30.31337 & sleep 30.31337"],
     timeoutSeconds: 1,
   };
   const result = await runCheck(def, { cwd: tmpdir() });
@@ -186,12 +197,12 @@ test("runCheck: timeout kills process group and sets timedOut", { timeout: 15_00
   await new Promise((r) => setTimeout(r, 500));
 
   // Verify no `sleep 30` remains.
-  const pgrep = spawnSync("pgrep", ["-f", "sleep 30"]);
+  const pgrep = spawnSync("pgrep", ["-f", "sleep 30.31337"]);
   // pgrep exits 1 when no processes match.
   assert.equal(
     pgrep.status,
     1,
-    `Expected no 'sleep 30' processes to survive, got: ${pgrep.stdout.toString()}`,
+    `Expected no 'sleep 30.31337' processes to survive, got: ${pgrep.stdout.toString()}`,
   );
 });
 
@@ -485,6 +496,167 @@ test("multi-repo-v1: profileDigest differs from node-pnpm-v1", () => {
     profileDigest(nodePnpm),
     "multi-repo-v1 and node-pnpm-v1 must have distinct digests",
   );
+});
+
+// ---------------------------------------------------------------------------
+// pnpm-install@1 check tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect pnpm availability once; skip pnpm-install@1 tests loudly if missing.
+ */
+function pnpmAvailable(): boolean {
+  const r = spawnSync("pnpm", ["--version"], { stdio: "pipe" });
+  return r.status === 0;
+}
+
+test("pnpm-install@1: check definition is well-formed", () => {
+  const def = CHECK_CATALOG["pnpm-install@1"];
+  assert.ok(def, "pnpm-install@1 must be in CHECK_CATALOG");
+  assert.equal(def.id, "pnpm-install@1");
+  assert.equal(def.version, "1");
+  assert.deepEqual(def.command, ["pnpm", "install", "--frozen-lockfile"]);
+  assert.equal(def.timeoutSeconds, 600);
+  // No custom passWhen: exit 0 = pass, non-zero = fail (--frozen-lockfile exits 1 on stale lockfile).
+  assert.equal(def.passWhen, undefined, "pnpm-install@1 must not have a custom passWhen");
+});
+
+test("pnpm-install@1: passes on a valid project with a matching lockfile", {
+  timeout: 120_000,
+}, async () => {
+  if (!pnpmAvailable()) {
+    // Skip loudly rather than faking a pass.
+    console.log("SKIP: pnpm not available in test environment; skipping pnpm-install@1 live test");
+    return;
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), "agencyhq-install-pass-"));
+  try {
+    // A package.json with no dependencies and a minimal lockfile that matches it.
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "install-fixture", version: "1.0.0" }),
+    );
+    writeFileSync(
+      join(dir, "pnpm-lock.yaml"),
+      "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n",
+    );
+
+    const def = CHECK_CATALOG["pnpm-install@1"];
+    assert.ok(def);
+    const result = await runCheck(def, { cwd: dir });
+
+    assert.equal(
+      result.exitStatus,
+      0,
+      `expected exit 0; got ${result.exitStatus}; stderr: ${result.stderrTail}`,
+    );
+    assert.equal(result.timedOut, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pnpm-install@1: fails when lockfile is out of date with package.json", {
+  timeout: 120_000,
+}, async () => {
+  if (!pnpmAvailable()) {
+    console.log("SKIP: pnpm not available in test environment; skipping pnpm-install@1 live test");
+    return;
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), "agencyhq-install-fail-"));
+  try {
+    // package.json lists a dependency that is absent from the lockfile.
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({
+        name: "install-fixture-stale",
+        version: "1.0.0",
+        dependencies: { "is-odd": "^3.0.1" },
+      }),
+    );
+    // Minimal lockfile with no packages section — does not satisfy the dependency above.
+    writeFileSync(
+      join(dir, "pnpm-lock.yaml"),
+      "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n",
+    );
+
+    const def = CHECK_CATALOG["pnpm-install@1"];
+    assert.ok(def);
+    const result = await runCheck(def, { cwd: dir });
+
+    assert.notEqual(
+      result.exitStatus,
+      0,
+      `expected non-zero exit (stale lockfile); got ${result.exitStatus}`,
+    );
+    assert.equal(result.timedOut, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// node-pnpm-v2 and multi-repo-v2 profile tests
+// ---------------------------------------------------------------------------
+
+test("node-pnpm-v2: resolves from PROFILE_CATALOG with expected checks", () => {
+  const profile = resolveProfile("node-pnpm-v2");
+  assert.equal(profile.id, "node-pnpm-v2");
+  assert.deepEqual(
+    profile.checks,
+    ["pnpm-install@1", "pnpm-typecheck@1", "pnpm-test@1"],
+    "checks must be ordered: install, typecheck, test",
+  );
+  assert.deepEqual(profile.protectedPaths, DEFAULT_PROTECTED_PATHS);
+});
+
+test("multi-repo-v2: resolves from PROFILE_CATALOG with expected checks", () => {
+  const profile = resolveProfile("multi-repo-v2");
+  assert.equal(profile.id, "multi-repo-v2");
+  assert.deepEqual(
+    profile.checks,
+    ["pnpm-install@1", "pnpm-typecheck@1", "manifest-consumer@1"],
+    "checks must be ordered: install, typecheck, manifest-consumer",
+  );
+  assert.deepEqual(profile.protectedPaths, DEFAULT_PROTECTED_PATHS);
+});
+
+test("node-pnpm-v2: profileDigest differs from node-pnpm-v1", () => {
+  const v1 = PROFILE_CATALOG["node-pnpm-v1"];
+  const v2 = PROFILE_CATALOG["node-pnpm-v2"];
+  assert.ok(v1, "node-pnpm-v1 must exist");
+  assert.ok(v2, "node-pnpm-v2 must exist");
+  assert.notEqual(
+    profileDigest(v1),
+    profileDigest(v2),
+    "node-pnpm-v2 digest must differ from node-pnpm-v1",
+  );
+});
+
+test("multi-repo-v2: profileDigest differs from multi-repo-v1", () => {
+  const v1 = PROFILE_CATALOG["multi-repo-v1"];
+  const v2 = PROFILE_CATALOG["multi-repo-v2"];
+  assert.ok(v1, "multi-repo-v1 must exist");
+  assert.ok(v2, "multi-repo-v2 must exist");
+  assert.notEqual(
+    profileDigest(v1),
+    profileDigest(v2),
+    "multi-repo-v2 digest must differ from multi-repo-v1",
+  );
+});
+
+test("node-pnpm-v2: profileDigest is stable", () => {
+  const profile = PROFILE_CATALOG["node-pnpm-v2"];
+  assert.ok(profile, "node-pnpm-v2 must exist");
+  assert.equal(profileDigest(profile), profileDigest(profile), "digest must be stable");
+});
+
+test("multi-repo-v2: profileDigest is stable", () => {
+  const profile = PROFILE_CATALOG["multi-repo-v2"];
+  assert.ok(profile, "multi-repo-v2 must exist");
+  assert.equal(profileDigest(profile), profileDigest(profile), "digest must be stable");
 });
 
 // ---------------------------------------------------------------------------

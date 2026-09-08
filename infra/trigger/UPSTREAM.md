@@ -84,6 +84,55 @@ later), and all other image tag variables (`POSTGRES_IMAGE_TAG`,
 `REDIS_IMAGE_TAG`, `ELECTRIC_IMAGE_TAG`, `CLICKHOUSE_IMAGE_TAG`,
 `REGISTRY_IMAGE_TAG`, `BUSYBOX_IMAGE_TAG`) — is unchanged from upstream.
 
+## Worker stack (docker-compose.worker.yml) — every edit vs upstream
+
+Source: https://raw.githubusercontent.com/triggerdotdev/trigger.dev/v4.5.16/hosting/docker/worker/docker-compose.yml
+(read 2026-09-08; a verbatim copy was also saved locally for reference)
+
+This file was not included in the initial vendoring (Slice 1/host profile only).
+It was added in Slice 6 as the container profile scaffold.
+
+Edits vs upstream:
+
+1. **`supervisor` image default `latest` → `${TRIGGER_IMAGE_TAG:-v4.5.16}`**.
+   Reason: (b) no bare `latest` default; pins the same Trigger.dev release
+   AgencyHQ is qualifying for the container profile. `TRIGGER_IMAGE_TAG` is
+   already set in `.env.example`, so the compose default is a belt-and-braces
+   fallback matching the webapp file's pattern.
+
+2. **`docker-proxy` image default `latest` → `${DOCKER_PROXY_IMAGE_TAG:-v0.5.0}`**.
+   Reason: (b) no bare `latest` default. `DOCKER_PROXY_IMAGE_TAG=v0.5.0`
+   chosen from the Docker Hub tags API on 2026-09-08 (upstream uses `latest`;
+   v0.5.0 is the most recent release tag at that date, 2026-07-27).
+
+3. **`DOCKER_REGISTRY_URL` default `localhost:5000` → `localhost:5001`**.
+   Reason: matches the webapp file's `DEPLOY_REGISTRY_HOST` default and the
+   registry's publish port (macOS AirPlay Receiver holds 5000 on this host —
+   same as webapp-file edit #1 in UPSTREAM.md § docker-compose.yml).
+
+4. **Header comment added** with the upstream URL, date read, and a statement
+   that the trigger worker stack has not yet been exercised
+   (pending: Slice 6 container spike).
+
+5. **Inline comments added** to satisfy the supervisor-word rule: every trigger
+   worker stack line that contains `supervisor` now also contains trigger,
+   container, or worker stack on the same line. The comments read
+   "trigger.dev worker stack container", "trigger worker stack", or
+   "worker stack internal routing domain" depending on context.
+
+Everything else — service definitions, healthchecks, `depends_on` edges,
+`ENFORCE_MACHINE_PRESETS`, `DEBUG`, `DOCKER_RUNNER_NETWORKS`, the bootstrap
+token path (`file:///home/node/shared/worker_token`), `shared` volume,
+and trigger worker-stack named networks (`docker-proxy` and `supervisor`) and
+all other upstream environment variables — is unchanged from upstream.
+
+Note: the `shared` volume and the named networks are declared in both this
+file and `docker-compose.yml`. Docker Compose merges them — so the trigger
+worker stack networks (`docker-proxy`, `supervisor`, `webapp`) and the `shared`
+volume are shared with the webapp stack, letting the trigger worker stack
+container (supervisor) read the bootstrap token at
+`/home/node/shared/worker_token` that the webapp writes on startup.
+
 ## .env.example — every edit vs upstream
 
 Unlike the compose file, this file's edits were not restricted to a minimal

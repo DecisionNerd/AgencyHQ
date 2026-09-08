@@ -11,6 +11,10 @@
  * (e) Wake-up: fake subscribe emits → pollOnce runs once; observation goes
  *     through applyObservation, no duplicate rows.
  * (f) API tests: GET /api/metrics/lead, GET /api/capacity, set_capacity replay.
+ * (h) skip_reason cleared on dispatch: intent skipped repository_busy on pass 1, dispatched on
+ *     pass 2 → skip_reason IS NULL and status='triggered' (R-010).
+ * (g) Halted/completed items do not hold the repository — their dispatched attempt
+ *     is excluded from activeAttempts so the project does not appear in busyRepos.
  */
 
 import assert from "node:assert/strict";
@@ -390,6 +394,103 @@ test("scheduling(b): two items on same project → second gets repository_busy s
       const second = (rows as { status: string; skip_reason: string | null }[])[0]!;
       assert.equal(second.status, "queued", "second worker stays queued (repo busy)");
       assert.equal(second.skip_reason, "repository_busy", "skip_reason is repository_busy");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (g) Halted work item does not block repository — dispatched attempt excluded
+// ---------------------------------------------------------------------------
+
+test("scheduling(g): halted work item does not hold the repository — second item on same project is dispatched", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Seed two work items on the SAME project.
+      const { workItemId: wi1, projectId } = await seedProjectAndWorkItem(client);
+      const wi2 = newId("wi");
+      await client.query(
+        `INSERT INTO work_items
+           (id, project_id, rank, intent, defect, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 2, 'Fix another issue', NULL, 'artifact', 'proposed', 'healthy', false, 1)`,
+        [wi2, projectId],
+      );
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      // Workers stay executing so wi1's attempt stays dispatched.
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
+
+      // Admit wi1 — dispatched immediately (slot free).
+      const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Halt wi1: simulates the Lead-failure → pending_human → reject path.
+      // The attempt is left in status='dispatched' (bounded-repair sets it there
+      // on verify/review/accept runs and reject never updates it).
+      await client.query(
+        "UPDATE work_items SET lifecycle = 'halted', version = version + 1, updated_at = now() WHERE id = $1",
+        [wi1],
+      );
+
+      // Admit wi2 (same project) — slot occupied by wi1's attempt (status='dispatched');
+      // workerSlots=1 and activeCount=1 >= 1 → wi2's worker intent is queued.
+      const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      // Verify wi2's worker intent is queued before calling scheduleOnce.
+      const { rows: preRows } = await client.query(
+        `SELECT di.status FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      assert.equal(
+        (preRows as { status: string }[])[0]?.status,
+        "queued",
+        "wi2 queued before scheduler",
+      );
+
+      // Run scheduler: wi1 is halted, so its dispatched attempt must be excluded
+      // from activeAttempts — the project must NOT appear in busyRepos → wi2 dispatched.
+      // The mirror case (wi1 active with dispatched attempt → repository_busy for wi2)
+      // is covered by scheduling(b).
+      await reconciler.scheduleOnce();
+
+      const { rows } = await client.query(
+        `SELECT di.status, di.skip_reason
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      const second = (rows as { status: string; skip_reason: string | null }[])[0]!;
+      assert.equal(
+        second.status,
+        "triggered",
+        `halted wi1 must not block repo — wi2 should be triggered, got: ${second.status} (skip_reason: ${second.skip_reason})`,
+      );
     } finally {
       await pool.end();
     }
@@ -1003,6 +1104,107 @@ test("scheduling(f): GET /api/capacity returns correct effective and concurrency
         row!.concurrency !== null && row!.concurrency > 0,
         "concurrency is positive number for limited",
       );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (g) skip_reason cleared on dispatch (R-010)
+// ---------------------------------------------------------------------------
+
+test("scheduling(h): intent skipped repository_busy on pass 1, dispatched on pass 2 → skip_reason IS NULL and status='triggered'", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Two work items on the SAME project so wi2 gets repository_busy on pass 1.
+      const { workItemId: wi1, projectId } = await seedProjectAndWorkItem(client);
+      const wi2 = newId("wi");
+      await client.query(
+        `INSERT INTO work_items
+           (id, project_id, rank, intent, defect, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 2, 'Fix another issue', NULL, 'artifact', 'proposed', 'healthy', false, 1)`,
+        [wi2, projectId],
+      );
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      // Workers stay executing so wi1 holds the slot and the project.
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // slots=1: wi1 occupies the slot; wi2 queued with repository_busy.
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
+
+      // Admit wi1 → dispatched immediately.
+      const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Admit wi2 (same project) → queued (no slot + repository_busy).
+      const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      // Pass 1: scheduleOnce records repository_busy for wi2.
+      await reconciler.scheduleOnce();
+
+      // Verify wi2 has skip_reason=repository_busy and status=queued after pass 1.
+      const { rows: pass1Rows } = await client.query(
+        `SELECT di.status, di.skip_reason
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      const pass1 = (pass1Rows as { status: string; skip_reason: string | null }[])[0]!;
+      assert.equal(pass1.status, "queued", "wi2 queued after pass 1");
+      assert.equal(
+        pass1.skip_reason,
+        "repository_busy",
+        "skip_reason=repository_busy after pass 1",
+      );
+
+      // Free the slot: mark wi1's attempt completed so wi2 can be dispatched.
+      await client.query(
+        `UPDATE attempts SET status = 'completed', updated_at = now()
+         WHERE id IN (
+           SELECT a.id FROM attempts a
+           JOIN step_contracts sc ON sc.id = a.contract_id
+           WHERE sc.work_item_id = $1
+         )`,
+        [wi1],
+      );
+
+      // Pass 2: scheduleOnce dispatches wi2.
+      await reconciler.scheduleOnce();
+
+      // After pass 2: skip_reason must be NULL and status must be 'triggered'.
+      const { rows: pass2Rows } = await client.query(
+        `SELECT di.status, di.skip_reason
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      const pass2 = (pass2Rows as { status: string; skip_reason: string | null }[])[0]!;
+      assert.equal(pass2.status, "triggered", "wi2 dispatched on pass 2 (status=triggered)");
+      assert.equal(pass2.skip_reason, null, "skip_reason cleared to NULL after dispatch (R-010)");
     } finally {
       await pool.end();
     }

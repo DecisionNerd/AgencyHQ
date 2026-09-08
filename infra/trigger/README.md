@@ -14,7 +14,8 @@ gets created once an operator runs the commands below.
 | File | Purpose |
 | --- | --- |
 | `docker-compose.yml` | The webapp stack: `webapp`, `postgres`, `redis`, `electric`, `clickhouse`, `registry`, `minio`, and the `s2`/`s2-init` pair (self-hosted Realtime streams v2). Vendored from upstream Trigger.dev v4.5.16 with a small set of edits — see `UPSTREAM.md`. |
-| `.env.example` | Every environment variable the compose file reads, with pinned image-tag defaults and blank secrets. Copy this to `.env` before starting anything. |
+| `docker-compose.worker.yml` | The trigger worker stack overlay (container profile): `supervisor` and `docker-proxy`. Used as an overlay with `docker-compose.yml` — see "Worker stack (container profile)" below. Vendored from upstream Trigger.dev v4.5.16 with a small set of edits — see `UPSTREAM.md`. |
+| `.env.example` | Every environment variable the compose files read, with pinned image-tag defaults and blank secrets. Copy this to `.env` before starting anything. |
 | `scripts/gen-env.sh` | Creates `.env` from `.env.example` if missing, and fills every blank secret with `openssl rand -hex 16`. Safe to re-run: it never overwrites a secret that already has a value. |
 | `scripts/bootstrap.sh` | Signs into the running dashboard (dev-mode magic link), finds or creates an org and project, mints a Personal Access Token, and writes `trigger/.env` — see "Bootstrap" below. |
 | `UPSTREAM.md` | Upstream source URLs, the date they were read, and every edit made vs. the vendored files, with a reason for each. |
@@ -149,6 +150,97 @@ pnpm dlx trigger.dev@4.5.16 login -a http://localhost:8030 --profile agencyhq-lo
   slice of the Docker Desktop VM's memory allocation to start reliably;
   under-provisioning the VM (Settings → Resources) is a common cause of a
   `clickhouse` container that restarts on startup.
+
+## Worker stack (container profile)
+
+The worker stack is the trigger worker stack for the container profile
+([ADR-0005](../../docs/engineering/adrs/0005-trigger-as-execution-runtime.md)):
+each task run executes in its own Docker container managed by the trigger.dev
+supervisor, using a task image built with `trigger deploy`.
+
+### Services
+
+| Service | Image | Purpose |
+| --- | --- | --- |
+| `supervisor` | `ghcr.io/triggerdotdev/supervisor:${TRIGGER_IMAGE_TAG}` | Trigger.dev worker stack container: dequeues runs from the webapp and launches task containers via the Docker socket proxy. |
+| `docker-proxy` | `tecnativa/docker-socket-proxy:${DOCKER_PROXY_IMAGE_TAG}` | Exposes a filtered Docker API over TCP so the trigger worker stack container can manage task containers without direct socket access. |
+
+### Starting the worker stack
+
+Run the webapp stack first (see "Operator procedure" above), then add the
+trigger worker stack container as an overlay:
+
+```sh
+docker compose \
+  -f infra/trigger/docker-compose.yml \
+  -f infra/trigger/docker-compose.worker.yml \
+  --env-file infra/trigger/.env \
+  up -d supervisor docker-proxy  # trigger worker stack services only
+```
+
+The `supervisor` and `docker-proxy` services above refer to the trigger worker
+stack services defined in `docker-compose.worker.yml`.
+
+### Worker token
+
+The webapp bootstraps a worker group on startup and writes the token to the
+shared volume at `/home/node/shared/worker_token`. The trigger worker stack
+container reads it via:
+
+```
+TRIGGER_WORKER_TOKEN=file:///home/node/shared/worker_token
+```
+
+To use a token created manually in the Trigger dashboard (Trigger → Worker
+groups) instead, set `TRIGGER_WORKER_TOKEN` in `.env` (see `.env.example`
+for the commented line).
+
+### Registry login
+
+Before deploying a task image, log in to the bundled registry:
+
+```sh
+docker login localhost:5001 -u registry-user
+```
+
+Enter the value of `DOCKER_REGISTRY_PASSWORD` from `.env` when prompted. Never
+print the password value directly.
+
+### Deploying task images
+
+Run from `trigger/`:
+
+```sh
+pnpm exec trigger deploy \
+  --local-build \
+  --skip-promotion \
+  --profile agencyhq-local \
+  --log-level info
+```
+
+Pass `--dry-run` to build the image locally without pushing or deploying —
+useful to confirm the image builds before connecting to a live instance.
+
+Non-interactive authentication uses `TRIGGER_ACCESS_TOKEN` and `TRIGGER_API_URL`
+(https://trigger.dev/docs/cli-deploy, read 2026-09-08).
+
+### macOS / Docker Desktop open questions (not yet observed)
+
+- **Docker socket bind mount**: `docker-proxy` bind-mounts
+  `/var/run/docker.sock`, which on Docker Desktop for macOS is a symlink
+  rather than a raw Unix socket. Whether this bind mount works transparently
+  for the trigger worker stack container has not been tested.
+- **Registry access from containers**: whether task containers spawned by the
+  trigger worker stack container can pull from `localhost:5001` (a host-side
+  port) without additional Docker Desktop networking configuration is not yet
+  known.
+
+### Pinned versions (worker stack)
+
+| Component | Version | Status |
+| --- | --- | --- |
+| `ghcr.io/triggerdotdev/supervisor` | `v4.5.16` (via `TRIGGER_IMAGE_TAG`) | pending: Slice 6 container spike |
+| `tecnativa/docker-socket-proxy` | `v0.5.0` (via `DOCKER_PROXY_IMAGE_TAG`) | pending: Slice 6 container spike |
 
 ## Pinned versions
 

@@ -65,11 +65,60 @@ export const PROFILE_CATALOG: Record<string, VerificationProfile> = {
    * worktrees so the check environment can assert cross-repo consistency.
    *
    * R-006, R-014.
+   *
+   * FROZEN: v1 digests are recorded in StepContracts already dispatched.
+   * Add pnpm-install@1 to multi-repo-v2 instead.
    */
   "multi-repo-v1": {
     id: "multi-repo-v1",
     version: "1",
     checks: ["pnpm-typecheck@1", "manifest-consumer@1"],
+    protectedPaths: DEFAULT_PROTECTED_PATHS,
+  },
+  // ---------------------------------------------------------------------------
+  // v2 profiles — introduced 2026-09-08
+  //
+  // v1 profiles are frozen: existing StepContracts reference their digests and
+  // must continue to resolve without change.  v2 adds pnpm-install@1 as the
+  // first check so that fresh git worktrees (which have no node_modules) always
+  // install dependencies explicitly before typecheck or test runs.  Without this
+  // explicit install, the verification task relied on pnpm's implicit
+  // auto-install, which is unreliable inside the task process and caused live
+  // failures with TS2688 ("Cannot find type definition file for 'node'").
+  // ---------------------------------------------------------------------------
+
+  /**
+   * node-pnpm-v2: standard Node/pnpm profile with explicit dependency install.
+   *
+   * Checks (in order):
+   * 1. pnpm-install@1  — installs from lockfile; fails if lockfile is stale.
+   * 2. pnpm-typecheck@1 — TypeScript type check.
+   * 3. pnpm-test@1     — unit test suite.
+   *
+   * Supersedes node-pnpm-v1.  Use for new StepContracts on Node/pnpm repos.
+   */
+  "node-pnpm-v2": {
+    id: "node-pnpm-v2",
+    version: "1",
+    checks: ["pnpm-install@1", "pnpm-typecheck@1", "pnpm-test@1"],
+    protectedPaths: DEFAULT_PROTECTED_PATHS,
+  },
+
+  /**
+   * multi-repo-v2: multi-repository profile with explicit dependency install.
+   *
+   * Checks (in order):
+   * 1. pnpm-install@1      — installs from lockfile; fails if lockfile is stale.
+   * 2. pnpm-typecheck@1    — TypeScript type check.
+   * 3. manifest-consumer@1 — asserts manifest env vars and runs pnpm test.
+   *
+   * Supersedes multi-repo-v1.  Use for new StepContracts when the coordinator
+   * has assembled a manifest of sibling worktrees.  R-006, R-014.
+   */
+  "multi-repo-v2": {
+    id: "multi-repo-v2",
+    version: "1",
+    checks: ["pnpm-install@1", "pnpm-typecheck@1", "manifest-consumer@1"],
     protectedPaths: DEFAULT_PROTECTED_PATHS,
   },
 };

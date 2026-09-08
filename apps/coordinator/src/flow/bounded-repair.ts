@@ -2735,7 +2735,7 @@ export class BoundedRepairFlow {
     });
 
     await pool.query(
-      "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+      "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, skip_reason = NULL, updated_at = now() WHERE id = $1",
       [intentId, runId],
     );
     await pool.query(

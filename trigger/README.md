@@ -29,6 +29,55 @@ Node's built-in TypeScript type stripping.
 See `.env.example` for the environment variables these scripts and
 `trigger dev` expect.
 
+## Container profile (deploy build)
+
+The container profile runs each task in its own Docker container managed by the
+trigger.dev worker stack (supervisor + docker-proxy). Task images are built with
+`trigger deploy` using the build extensions declared in `trigger.config.ts`.
+
+### Deploy build configuration
+
+`trigger.config.ts` declares two build extensions that run only during
+`trigger deploy` — they have no effect on `trigger dev`:
+
+- **`aptGet({ packages: ["git"] })`** — installs the `git` binary inside the
+  task image via apt-get. Required because `worker.attempt` calls `git
+  worktree add`, `git diff`, and `git commit` inside the container.
+- **`additionalPackages({ packages: ["opencode-ai@1.18.29"] })`** — installs
+  the `opencode` CLI from npm at the pinned version (1.18.29, matching the host
+  OpenCode version qualified by the Slice 1 trial). Required because
+  `worker.attempt` calls `spawnOpenCode` to run the agent.
+
+Both extensions are `BuildExtension` types from `@trigger.dev/build/extensions/core`
+(verified from the installed .d.ts and https://trigger.dev/docs/config/extensions/aptGet,
+read 2026-09-08). The JSDoc for `additionalPackages` states "when deploying".
+
+### Environment the deployed tasks expect
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AGENCYHQ_OPENCODE_BIN` | `opencode` (on PATH) | Path to the `opencode` binary inside the container; defaults to the `opencode` installed by `additionalPackages`. |
+| `AGENCYHQ_WORKTREE_BASE` | (required) | Base directory for worktrees and run directories inside the container. |
+| `TRIGGER_PROJECT_REF` | (required) | Trigger project reference, set via Trigger environment variables in the dashboard. |
+
+Provider credentials (API keys for model providers) must be supplied as Trigger
+environment variables in the dashboard — they are never baked into the image.
+The container profile uses API-key providers only; subscription-based logins
+from `~/.local/share/opencode/auth.json` are host-bound and not available
+inside task containers.
+
+### Not yet observed
+
+The following have not been exercised in a live run (pending: Slice 6 container spike):
+
+- Task image build (`trigger deploy --local-build` against the bundled registry).
+- Trigger worker stack container (supervisor) dequeuing and running `spike-echo`
+  in a container.
+- `worker.attempt` executing inside a container (worktree-add, opencode run,
+  diff, commit sequence).
+- Push token handling (generation-bound token issuance for container profile
+  attempts).
+
 ## Libraries
 
 `src/lib/**` holds pure adapter functions for the `worker.attempt` effect

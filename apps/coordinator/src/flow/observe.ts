@@ -290,6 +290,11 @@ export class Reconciler {
       if (queuedIntents.length === 0) return;
 
       // 2. Load active attempts (dispatched|running|stopping) for slot + repo counting.
+      //    Exclude attempts whose work item lifecycle is terminal or halted: attempt
+      //    status is reused across verify/review/accept runs and can be left non-terminal
+      //    when an item is halted (e.g. Lead-failure → pending_human → reject path leaves
+      //    the attempt in 'dispatched' while the work item moves to 'halted').
+      //    Without this exclusion, halted items hold busyRepos forever (repository_busy).
       const { rows: activeRows } = await client.query<{
         work_item_id: string;
         project_id: string;
@@ -299,7 +304,9 @@ export class Reconciler {
         `SELECT a.status, sc.work_item_id, sc.project_id, sc.bounds
          FROM attempts a
          JOIN step_contracts sc ON sc.id = a.contract_id
-         WHERE a.status IN ('dispatched', 'running', 'stopping')`,
+         JOIN work_items wi ON wi.id = sc.work_item_id
+         WHERE a.status IN ('dispatched', 'running', 'stopping')
+           AND wi.lifecycle NOT IN ('halted', 'completed', 'done')`,
       );
 
       // 3. Load current provider capacity.
@@ -523,7 +530,9 @@ export class Reconciler {
 
     // Subscribe and call pollOnce on each observation.
     // The in-flight guard in pollOnce prevents concurrent polls.
+    console.log(`[reconciler] realtime wake-up subscribed to ${tags.length} project tag(s)`);
     await this.deps.runtime.subscribe({ tags, signal }, (_obs: RunObservation) => {
+      console.log(`[reconciler] realtime wake-up: run ${_obs.runId} ${_obs.status} -> pollOnce`);
       // Wake-up hint: kick off a poll. The observation itself is NOT applied
       // here — it goes through the normal applyObservation path (R-010).
       void this.pollOnce();
