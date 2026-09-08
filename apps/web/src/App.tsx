@@ -35,6 +35,7 @@ import {
   buildResumeBody,
   buildStopBody,
   conditionIcon,
+  confirmMessage,
   formatAuthorityErrors,
   formatTimestamp,
   lifecycleIcon,
@@ -578,13 +579,24 @@ function DecisionsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized:
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionInFlight, setActionInFlight] = useState<string | null>(null);
   const [rejectReasons, setRejectReasons] = useState<Record<string, string>>({});
+  const [confirm, setConfirm] = useState<{ message: string; onConfirm: () => void } | null>(null);
+  // workItemId → projectId, built from the overview on each load.
+  const [workItemProjectMap, setWorkItemProjectMap] = useState<Record<string, string>>({});
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    fetchDecisions()
-      .then((data) => {
-        setView(data);
+    Promise.all([fetchDecisions(), fetchOverview()])
+      .then(([decisionsData, overviewData]) => {
+        setView(decisionsData);
+        // Build a workItemId → projectId map so confirm messages can name the project.
+        const map: Record<string, string> = {};
+        for (const proj of overviewData.projects) {
+          for (const wi of proj.workItems) {
+            map[wi.id] = proj.id;
+          }
+        }
+        setWorkItemProjectMap(map);
         setLoading(false);
       })
       .catch((err: unknown) => {
@@ -601,21 +613,15 @@ function DecisionsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized:
     load();
   }, [load]);
 
-  const handleApprove = async (entry: DecisionEntry) => {
-    const { impact } = entry;
-    if (!impact.workItemId) return;
-    setActionInFlight(`approve-${entry.id}`);
+  const confirmThen = (message: string, fn: () => void) => {
+    setConfirm({ message, onConfirm: fn });
+  };
+
+  const runAction = async (key: string, body: Record<string, unknown>) => {
+    setActionInFlight(key);
     setActionError(null);
     try {
-      await postCommand(
-        buildApproveBody({
-          commandId: crypto.randomUUID(),
-          workItemId: impact.workItemId,
-          contractId: impact.contractId ?? "",
-          contractVersion: impact.contractVersion ?? 0,
-          attemptRevision: impact.attemptRevision ?? "",
-        }),
-      );
+      await postCommand(body);
       load();
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
@@ -624,26 +630,55 @@ function DecisionsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized:
     }
   };
 
-  const handleReject = async (entry: DecisionEntry) => {
-    if (!entry.workItemId) return;
+  const handleApprove = (entry: DecisionEntry) => {
+    const { impact } = entry;
+    if (!impact.workItemId) return;
+    const wid = impact.workItemId;
+    const pid = workItemProjectMap[wid] ?? "unknown";
+    confirmThen(
+      confirmMessage({
+        action: "approve",
+        projectId: pid,
+        workItemId: wid,
+        contractVersion: impact.contractVersion,
+      }),
+      () =>
+        runAction(
+          `approve-${entry.id}`,
+          buildApproveBody({
+            commandId: crypto.randomUUID(),
+            workItemId: wid,
+            contractId: impact.contractId ?? "",
+            contractVersion: impact.contractVersion ?? 0,
+            attemptRevision: impact.attemptRevision ?? "",
+          }),
+        ),
+    );
+  };
+
+  const handleReject = (entry: DecisionEntry) => {
+    const wid = entry.workItemId ?? entry.impact.workItemId;
+    if (!wid) return;
+    const pid = workItemProjectMap[wid] ?? "unknown";
     const reason = rejectReasons[entry.id] ?? "operator rejected";
-    setActionInFlight(`reject-${entry.id}`);
-    setActionError(null);
-    try {
-      await postCommand(
-        buildRejectBody({
-          commandId: crypto.randomUUID(),
-          workItemId: entry.workItemId,
-          decisionId: entry.id,
-          reason,
-        }),
-      );
-      load();
-    } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setActionInFlight(null);
-    }
+    confirmThen(
+      confirmMessage({
+        action: "reject",
+        projectId: pid,
+        workItemId: wid,
+        contractVersion: entry.impact.contractVersion,
+      }),
+      () =>
+        runAction(
+          `reject-${entry.id}`,
+          buildRejectBody({
+            commandId: crypto.randomUUID(),
+            workItemId: wid,
+            decisionId: entry.id,
+            reason,
+          }),
+        ),
+    );
   };
 
   return (
@@ -655,6 +690,18 @@ function DecisionsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized:
           Refresh
         </button>
       </div>
+
+      {confirm && (
+        <ConfirmDialog
+          message={confirm.message}
+          onConfirm={() => {
+            const fn = confirm.onConfirm;
+            setConfirm(null);
+            fn();
+          }}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
 
       {error && (
         <div className="error-box" role="alert">
@@ -1000,14 +1047,23 @@ function WorkItemPage({
   } | null>(null);
   const [invalidateReason, setInvalidateReason] = useState("");
   const [rejectReason, setRejectReason] = useState("");
+  // Resolved from the overview on each load — used in confirm messages.
+  const [projectId, setProjectId] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    Promise.all([fetchWorkItem(workItemId), fetchEvidence(workItemId)])
-      .then(([itemData, evidenceData]) => {
+    Promise.all([fetchWorkItem(workItemId), fetchEvidence(workItemId), fetchOverview()])
+      .then(([itemData, evidenceData, overviewData]) => {
         setItem(itemData);
         setEvidence(evidenceData);
+        // Find the project that owns this work item.
+        for (const proj of overviewData.projects) {
+          if (proj.workItems.some((wi) => wi.id === workItemId)) {
+            setProjectId(proj.id);
+            break;
+          }
+        }
         setLoading(false);
       })
       .catch((err: unknown) => {
@@ -1137,11 +1193,12 @@ function WorkItemPage({
                       (a) => a.attemptId === pendingDecision.attemptId,
                     );
                     confirmThen(
-                      `Approve decision for work item ${item.workItemId}` +
-                        (pendingDecision.contractVersion != null
-                          ? ` (contract v${pendingDecision.contractVersion})`
-                          : "") +
-                        "?",
+                      confirmMessage({
+                        action: "approve",
+                        projectId: projectId ?? "unknown",
+                        workItemId: item.workItemId,
+                        contractVersion: pendingDecision.contractVersion,
+                      }),
                       () =>
                         runAction(
                           "approve",
@@ -1177,16 +1234,23 @@ function WorkItemPage({
                   disabled={actionInFlight !== null || !pendingDecision}
                   onClick={() => {
                     if (!pendingDecision) return;
-                    confirmThen(`Reject decision for work item ${item.workItemId}?`, () =>
-                      runAction(
-                        "reject",
-                        buildRejectBody({
-                          commandId: crypto.randomUUID(),
-                          workItemId: item.workItemId,
-                          decisionId: pendingDecision.id,
-                          reason: rejectReason || "operator rejected",
-                        }),
-                      ),
+                    confirmThen(
+                      confirmMessage({
+                        action: "reject",
+                        projectId: projectId ?? "unknown",
+                        workItemId: item.workItemId,
+                        contractVersion: pendingDecision.contractVersion,
+                      }),
+                      () =>
+                        runAction(
+                          "reject",
+                          buildRejectBody({
+                            commandId: crypto.randomUUID(),
+                            workItemId: item.workItemId,
+                            decisionId: pendingDecision.id,
+                            reason: rejectReason || "operator rejected",
+                          }),
+                        ),
                     );
                   }}
                 >
@@ -1203,7 +1267,11 @@ function WorkItemPage({
                   disabled={actionInFlight !== null}
                   onClick={() =>
                     confirmThen(
-                      `Stop attempt ${latestAttempt.id} for work item ${item.workItemId}?`,
+                      confirmMessage({
+                        action: "stop",
+                        projectId: projectId ?? "unknown",
+                        workItemId: item.workItemId,
+                      }),
                       () =>
                         runAction(
                           "stop",
@@ -1226,15 +1294,21 @@ function WorkItemPage({
                 data-testid="action-pause"
                 disabled={actionInFlight !== null}
                 onClick={() =>
-                  confirmThen(`Pause work item ${item.workItemId}?`, () =>
-                    runAction(
-                      "pause",
-                      buildPauseBody({
-                        commandId: crypto.randomUUID(),
-                        workItemId: item.workItemId,
-                        reason: "operator requested",
-                      }),
-                    ),
+                  confirmThen(
+                    confirmMessage({
+                      action: "pause",
+                      projectId: projectId ?? "unknown",
+                      workItemId: item.workItemId,
+                    }),
+                    () =>
+                      runAction(
+                        "pause",
+                        buildPauseBody({
+                          commandId: crypto.randomUUID(),
+                          workItemId: item.workItemId,
+                          reason: "operator requested",
+                        }),
+                      ),
                   )
                 }
               >
@@ -1272,7 +1346,11 @@ function WorkItemPage({
                     const firstFinding = evidence.findings[0];
                     if (!firstFinding) return;
                     confirmThen(
-                      `Remediate finding ${firstFinding.id} for work item ${item.workItemId}?`,
+                      confirmMessage({
+                        action: "remediate",
+                        projectId: projectId ?? "unknown",
+                        workItemId: item.workItemId,
+                      }),
                       () =>
                         runAction(
                           "remediate",
@@ -1306,9 +1384,12 @@ function WorkItemPage({
                     disabled={actionInFlight !== null}
                     onClick={() =>
                       confirmThen(
-                        `Invalidate acceptance for work item ${item.workItemId}` +
-                          ` (attempt ${latestAttempt.id})` +
-                          `${pendingDecision?.contractVersion != null ? `, contract v${pendingDecision.contractVersion}` : ""}?`,
+                        confirmMessage({
+                          action: "invalidate",
+                          projectId: projectId ?? "unknown",
+                          workItemId: item.workItemId,
+                          contractVersion: pendingDecision?.contractVersion,
+                        }),
                         () =>
                           runAction(
                             "invalidate",

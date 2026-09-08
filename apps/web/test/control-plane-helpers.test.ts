@@ -12,6 +12,7 @@ import {
   buildResumeBody,
   buildStopBody,
   conditionIcon,
+  confirmMessage,
   formatAuthorityErrors,
   formatTimestamp,
   lifecycleIcon,
@@ -370,4 +371,52 @@ test("formatAuthorityErrors: joins multiple errors with newline", () => {
 test("formatAuthorityErrors: deep path is joined with dots", () => {
   const result = formatAuthorityErrors([{ message: "too short", path: ["a", "b", "c"] }]);
   assert.equal(result, "a.b.c: too short");
+});
+
+// ---- confirmMessage ---------------------------------------------------------
+
+test("confirmMessage: contains project id, work item id, and capitalised action", () => {
+  const msg = confirmMessage({
+    action: "approve",
+    projectId: "prj-abc",
+    workItemId: "wi-xyz",
+  });
+  assert.ok(msg.includes("prj-abc"), "should contain projectId");
+  assert.ok(msg.includes("wi-xyz"), "should contain workItemId");
+  assert.ok(msg.startsWith("Approve"), "should capitalise action");
+});
+
+test("confirmMessage: appends contract version when provided", () => {
+  const msg = confirmMessage({
+    action: "approve",
+    projectId: "prj-1",
+    workItemId: "wi-1",
+    contractVersion: 3,
+  });
+  assert.ok(msg.includes("prj-1"), "should contain projectId");
+  assert.ok(msg.includes("wi-1"), "should contain workItemId");
+  assert.ok(msg.includes("v3"), "should contain 'v3'");
+});
+
+test("confirmMessage: omits version suffix when contractVersion is null", () => {
+  const msg = confirmMessage({
+    action: "reject",
+    projectId: "prj-2",
+    workItemId: "wi-2",
+    contractVersion: null,
+  });
+  assert.ok(msg.includes("prj-2"), "should contain projectId");
+  assert.ok(msg.includes("wi-2"), "should contain workItemId");
+  assert.ok(!msg.includes("contract"), "should not mention contract when version is null");
+});
+
+test("confirmMessage: omits version suffix when contractVersion is undefined", () => {
+  const msg = confirmMessage({
+    action: "stop",
+    projectId: "prj-3",
+    workItemId: "wi-3",
+  });
+  assert.ok(msg.includes("prj-3"), "should contain projectId");
+  assert.ok(msg.includes("wi-3"), "should contain workItemId");
+  assert.ok(!msg.includes("contract"), "should not mention contract when version is omitted");
 });

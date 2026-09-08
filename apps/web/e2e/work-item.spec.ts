@@ -24,7 +24,10 @@ test.beforeEach(async ({ page }) => {
  * Navigate to the overview, find a work item row whose intent column matches
  * the given text, click its link, and return the page.
  */
-async function openWorkItemByIntent(page: ReturnType<typeof page.constructor>, intentText: string) {
+async function _openWorkItemByIntent(
+  page: ReturnType<typeof page.constructor>,
+  intentText: string,
+) {
   await page.goto("/#/");
   await expect(page.getByTestId("projects-section")).toBeVisible({ timeout: 10_000 });
 

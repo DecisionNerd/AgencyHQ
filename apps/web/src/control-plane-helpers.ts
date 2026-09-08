@@ -340,6 +340,35 @@ export function buildInvalidateAcceptanceBody(
 }
 
 // ---------------------------------------------------------------------------
+// Confirmation message builder
+// ---------------------------------------------------------------------------
+
+export interface ConfirmMessageParams {
+  /** The action name, e.g. "approve", "reject", "stop". Capitalised automatically. */
+  action: string;
+  /** The project id owning the work item. */
+  projectId: string;
+  /** The work item id being acted upon. */
+  workItemId: string;
+  /** The contract version, if available. Rendered as "contract v<n>". */
+  contractVersion?: number | null | undefined;
+}
+
+/**
+ * Build the text shown in the ConfirmDialog for every destructive action.
+ * The returned string always names the action, the project and the work item;
+ * and appends the contract version when provided.
+ *
+ * Unit-tested in control-plane-helpers.test.ts.
+ */
+export function confirmMessage(params: ConfirmMessageParams): string {
+  const { action, projectId, workItemId, contractVersion } = params;
+  const head = `${action.charAt(0).toUpperCase()}${action.slice(1)} work item ${workItemId} · project ${projectId}`;
+  const versionSuffix = contractVersion != null ? ` · contract v${contractVersion}` : "";
+  return `${head}${versionSuffix}?`;
+}
+
+// ---------------------------------------------------------------------------
 // Authority error formatting
 // ---------------------------------------------------------------------------
 
