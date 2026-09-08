@@ -62,12 +62,66 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    `contractVersion`, `attemptRevision`) writes an `approvals` row and
    re-runs acceptance via `evaluateAcceptanceForAttempt`; the command is
    idempotent by `commandId`. `APPROVAL_VERSION_MISMATCH` leaves the item
-   `pending_human`. Covered by `flow.parking (b)`
+   `pending_human`. The `approve` command goes through the same
+   post-acceptance path as `onAcceptFinal`: for a `merge` boundary it commits
+   the approval decision, an `integrations` row, and a `dispatch_intents` row
+   in one transaction and then triggers `integrate.merge`; the work item stays
+   active until integration completes. Covered by `flow.parking (b)`
    (`apps/coordinator/test/integration/flow.parking.test.ts`) and
-   `apps/coordinator/test/integration/approve.test.ts`.
-9. **Integrate** (merge or deploy boundaries only). `integrate.merge` runs with
-   an operation-scoped credential, serialized per repository, idempotent by
-   attempt and target revision.
+   `apps/coordinator/test/integration/approve.test.ts` (cases including
+   merge-boundary items v–vii). Invalid structured output from `lead.review`
+   or `lead.accept` is recorded as a failure and one retry attempt (`:r1`) is
+   dispatched; if the retry also fails with invalid output the work item is
+   escalated to `pending_human`. Covered by
+   `apps/coordinator/test/integration/flow.lead-failure.test.ts`.
+   The work item's requested boundary constrains the Lead: a Lead proposal with
+   a boundary narrower than the operator's requested boundary is rejected with
+   `BOUNDARY_BELOW_REQUESTED` and the item remains `pending_human`. Covered by
+   `apps/coordinator/test/integration/flow.boundary.test.ts`.
+9. **Integrate** (`merge` boundary only; `deploy` boundary is not yet
+   implemented — `DEPLOY_NOT_SUPPORTED` is returned at dispatch). On acceptance
+   the coordinator commits an `integrations` row and a `dispatch_intents` row
+   in the same transaction as the acceptance decision, then triggers
+   `integrate.merge`. The task: fetches the target ref to read the current
+   remote revision; checks ancestry; merges the attempt commit in a temporary
+   worktree; pushes with `--force-with-lease` using the expected base as the
+   lease. Outcomes: `integrated` (success — `projects.allowed_refs.<ref>` is
+   advanced to the resulting revision in the ledger); `already_integrated`
+   (idempotent replay); `base_moved` / `conflict` / `push_rejected` (all park
+   the work item as `pending_human` with an `integration_conflict:blocking`
+   finding). A non-COMPLETED `integrate.merge` run causes the coordinator to
+   call `git ls-remote` and run `decideIntegrationOutcome` with the observed
+   remote revision; up to `AGENCYHQ_INTEGRATE_RETRIES` retries are attempted
+   before escalating to `pending_human`. Push rejection reason is classified
+   from stderr: `lease_broken`, `auth`, `network`, or `other`; credentials are
+   scrubbed from the evidence. Covered by
+   `apps/coordinator/test/integration/flow.integrate.test.ts`,
+   `trigger/test/integrate-merge-core.test.ts`, `trigger/test/git.test.ts`, and
+   `trigger/test/push-boundary.test.ts`.
+
+   **Revision manifests.** A multi-repository work item carries a
+   `RevisionManifest` (table `work_item_projects`) with one entry per
+   repository. Entries are ordered by position (0..n-1). Each entry records the
+   project id, target ref, expected base revision, and (after integration) the
+   resulting revision. The manifest digest is computed from entries excluding
+   `resultRevision`; it is stable throughout the work item's lifetime. After
+   each entry integrates, the coordinator plans the next entry's `lead.plan`
+   (refreshing the base from the ledger's current `projects.allowed_refs` value,
+   not from a stale fixture). When all entries have a non-null `resultRevision`
+   the manifest is resolved and the work item completes. For combined
+   verification, `verify.run` materializes sibling worktrees and injects
+   `AGENCYHQ_MANIFEST_<N>` environment variables so checks like
+   `manifest-consumer@1` can read peer repositories at their committed
+   revisions.
+
+   Every run observation is recorded for the current task, regardless of
+   outcome, so the coordinator and operator can reconstruct the full execution
+   history (R-010). The `disposition` command (`POST /api/commands` with
+   `kind: "disposition"`) resolves an open Finding: `remediate` creates a new
+   Attempt under the same contract if budget allows (budget exhausted →
+   `pending_human` decision); `scope_decision`, `block`, and `backlog` each
+   record a `pending_human` or backlog decision without mutating the contract.
+   Covered by `apps/coordinator/test/integration/flow.remediate.test.ts`.
 
 Lead and human decisions happen between runs. No run waits on a human; a
 waiting self-hosted run holds its process or container and a concurrency slot.

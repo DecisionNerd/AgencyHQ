@@ -72,15 +72,29 @@ on it.
   or `AGENCYHQ_OPENCODE_MODEL` (issue #7); `lead.plan` runs tagged `project:`
   and `workItem:` (issue #8 part 1).
 
-## Slice 4 — integration boundaries and multiple repositories (current)
+## Slice 4 — integration boundaries and multiple repositories
 
 - `integrate.merge` with compare-and-set and per-repository serialization;
   `merge` boundary completion.
 - Multi-repository WorkItems with revision manifests, dependency order, and
   combined verification; `deploy` boundary only where a project needs it.
 - Extract a ProcessDefinition type only if a second process is now required.
+- Outcome (2026-09-08): merge boundary with CAS confirmed live — `approve` path
+  dispatches `integrate.merge` in the same transaction, merge commit pushed with
+  `--force-with-lease`, `projects.allowed_refs.main` advanced after integration.
+  Human-approval path (`pending_human` → `approve` command → `integrate.merge`
+  intent triggered before the approve response returned) PASS. Two-repository
+  manifest with combined verification: consumer `manifest-consumer@1` check read
+  the parser sibling at `AGENCYHQ_MANIFEST_0`; both remotes advanced to the
+  ledger result. Deploy boundary rejected with `DEPLOY_NOT_SUPPORTED` (not yet
+  implemented). `integrate.merge` is the only task that may push (push-boundary
+  test enforces this). ProcessDefinition not extracted — only one process exists;
+  extraction rule documented for when a second catalog entry needs a different
+  step/gate sequence. 9 defects found and fixed live, all with tests. 1,058 unit
+  tests, 178 integration tests (61 db + 117 coordinator). Full record:
+  [trials/2026-09-slice4.md](../engineering/trials/2026-09-slice4.md).
 
-## Slice 5 — control plane
+## Slice 5 — control plane (current)
 
 - Campaigns, cross-project rank, work overview, decisions view, evidence view,
   and authority-schema editing; browser tests for primary flows.
