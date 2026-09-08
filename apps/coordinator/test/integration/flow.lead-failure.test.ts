@@ -714,12 +714,13 @@ test("flow.lead-failure: COMPLETED worker with invalid schema output → failure
         const out = workerCompletedOutput(p.attemptId, {
           commitId: "deadbeef1234567890deadbeef1234567890dead",
         });
-        // Inject null pattern — z.string().optional() rejects null.
+        // Inject a denial without a message — the schema requires a string
+        // (a null `pattern` is accepted since 369f4aa, so use another field).
         (
           out.opencode as unknown as {
-            denials: Array<{ tool: string; pattern: null; message: string }>;
+            denials: Array<{ tool: string; pattern: string; message: null }>;
           }
-        ).denials = [{ tool: "edit", pattern: null, message: "path denied" }];
+        ).denials = [{ tool: "edit", pattern: "src/x.ts", message: null }];
         return { status: "COMPLETED", output: out };
       });
 
