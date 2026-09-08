@@ -646,7 +646,14 @@ export function createApp(deps: AppDeps): Hono {
         boundary: "artifact" | "merge" | "deploy";
         campaign_id: string | null;
       }> = [];
-      const allDecisions: Array<{ work_item_id: string | null; outcome: string | null }> = [];
+      const allDecisions: Array<{
+        id: string;
+        work_item_id: string | null;
+        kind: string;
+        outcome: string | null;
+        attempt_id: string | null;
+        at: string;
+      }> = [];
 
       for (const project of projects) {
         const wiRows = await listWorkItemsByProject(pgClient, project.id);
@@ -666,8 +673,12 @@ export function createApp(deps: AppDeps): Hono {
           const decisions = await listDecisionsByWorkItem(pgClient, wi.id);
           for (const d of decisions) {
             allDecisions.push({
+              id: d.id,
               work_item_id: d.work_item_id,
+              kind: d.kind,
               outcome: d.outcome,
+              attempt_id: d.attempt_id ?? null,
+              at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
             });
           }
         }
@@ -716,8 +727,12 @@ export function createApp(deps: AppDeps): Hono {
           campaignId: wi.campaign_id,
         })),
         decisions: allDecisions.map((d) => ({
+          id: d.id,
           workItemId: d.work_item_id,
+          kind: d.kind,
           outcome: d.outcome,
+          attemptId: d.attempt_id,
+          at: d.at,
         })),
       });
 

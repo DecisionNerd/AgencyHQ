@@ -405,3 +405,85 @@ describe("buildAuthorityView", () => {
     assert.equal(view.history.length, 0);
   });
 });
+
+describe("open pending decisions (resolved rows are history)", () => {
+  it("decisions view drops a pending decision once a later approved decision exists for the attempt", () => {
+    const view = buildDecisionsView({
+      decisions: [
+        {
+          id: "d1",
+          workItemId: "wi1",
+          kind: "accept",
+          outcome: "pending_human",
+          at: "2026-09-08T10:00:00Z",
+          attemptId: "a1",
+          contractVersion: 1,
+        },
+        {
+          id: "d2",
+          workItemId: "wi1",
+          kind: "accept",
+          outcome: "approved",
+          at: "2026-09-08T10:05:00Z",
+          attemptId: "a1",
+          contractVersion: 1,
+        },
+        {
+          id: "d3",
+          workItemId: "wi2",
+          kind: "accept",
+          outcome: "pending_human",
+          at: "2026-09-08T10:06:00Z",
+          attemptId: "a2",
+          contractVersion: 1,
+        },
+      ],
+      attempts: [],
+      contracts: [],
+      findings: [],
+    } as never);
+    const ids = view.decisions.map((d) => d.id);
+    assert.deepEqual(ids, ["d3"]);
+  });
+
+  it("overview counts only open pending decisions", () => {
+    const view = buildOverviewView({
+      campaigns: [],
+      projects: [{ id: "p1", authorityVersion: "1" }],
+      workItems: [
+        {
+          id: "wi1",
+          projectId: "p1",
+          intent: "x",
+          rank: 1,
+          mainEffort: false,
+          lifecycle: "active",
+          condition: "healthy",
+          boundary: "artifact",
+          campaignId: null,
+        },
+      ],
+      decisions: [
+        {
+          id: "d1",
+          workItemId: "wi1",
+          kind: "accept",
+          outcome: "pending_human",
+          attemptId: "a1",
+          at: "2026-09-08T10:00:00Z",
+        },
+        {
+          id: "d2",
+          workItemId: "wi1",
+          kind: "accept",
+          outcome: "rejected",
+          attemptId: "a1",
+          at: "2026-09-08T10:01:00Z",
+        },
+      ],
+    } as never);
+    const item = view.projects[0]?.workItems[0];
+    assert.ok(item);
+    assert.equal(item.pendingDecisionCount, 0);
+  });
+});

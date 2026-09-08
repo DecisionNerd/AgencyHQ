@@ -1,3 +1,4 @@
+import { seedIds } from "./helpers";
 /**
  * (iii) Approve pending_human decision → work item moves to completed.
  *
@@ -18,35 +19,22 @@ test.beforeEach(async ({ page }) => {
 test("decisions page: approve pending_human decision removes it from the list", async ({
   page,
 }) => {
+  // Target the seeded decision only: the shared database may hold other
+  // pending decisions (for example from live trials on the same ledger).
+  const ids = seedIds();
+  const decisionId = ids.decApprove;
+  expect(decisionId, "seed must publish decApprove").toBeTruthy();
+
   await page.goto("/#/decisions");
   await expect(page.getByTestId("decisions-list")).toBeVisible({ timeout: 10_000 });
+  const entry = page.getByTestId(`decision-entry-${decisionId}`);
+  await expect(entry).toBeVisible();
 
-  // Count initial pending decisions
-  const initialApproveButtons = page.locator(`[data-testid^="approve-btn-"]`);
-  const initialCount = await initialApproveButtons.count();
-  expect(initialCount).toBeGreaterThanOrEqual(1);
+  await page.getByTestId(`approve-btn-${decisionId}`).click();
 
-  // Click the first approve button
-  const firstApproveBtn = initialApproveButtons.first();
-  await firstApproveBtn.click();
-
-  // After approve, the page reloads the decisions list.
-  // Wait for the loading state to appear and then resolve.
-  await page.waitForFunction(
-    (count: number) => {
-      const buttons = document.querySelectorAll('[data-testid^="approve-btn-"]');
-      return buttons.length < count;
-    },
-    initialCount,
-    { timeout: 15_000 },
-  );
-
-  // Verify no action error occurred
+  // After approve, the page reloads the decisions list and the entry is gone.
+  await expect(entry).not.toBeVisible({ timeout: 15_000 });
   await expect(page.getByTestId("action-error")).not.toBeVisible();
-
-  // Verify count decreased
-  const finalCount = await page.locator(`[data-testid^="approve-btn-"]`).count();
-  expect(finalCount).toBeLessThan(initialCount);
 });
 
 test("work item page: approve via confirm dialog updates the item", async ({ page }) => {

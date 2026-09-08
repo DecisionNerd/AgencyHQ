@@ -12,6 +12,8 @@
 // Input types
 // ---------------------------------------------------------------------------
 
+import { openPendingDecisions } from "./pending.ts";
+
 export type DecisionInputLike = {
   id: string;
   workItemId: string | null;
@@ -121,7 +123,7 @@ export function buildDecisionsView(input: DecisionsViewInput): DecisionsView {
     }
   }
 
-  const pendingDecisions = decisions.filter((d) => d.outcome === "pending_human");
+  const pendingDecisions = openPendingDecisions(decisions);
 
   const entries: DecisionEntry[] = pendingDecisions.map((d) => {
     // Determine obstacle: finding kinds for the associated attempt, or the decision kind

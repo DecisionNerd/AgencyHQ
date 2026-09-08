@@ -10,6 +10,8 @@
 // Input types
 // ---------------------------------------------------------------------------
 
+import { openPendingDecisions } from "./pending.ts";
+
 export type OverviewCampaignLike = {
   id: string;
   name: string;
@@ -29,8 +31,12 @@ export type OverviewWorkItemLike = {
 };
 
 export type OverviewDecisionLike = {
+  id?: string;
   workItemId: string | null;
+  kind?: string | null;
   outcome: string | null;
+  attemptId?: string | null;
+  at?: string | null;
 };
 
 export type OverviewProjectLike = {
@@ -89,8 +95,9 @@ export function buildOverviewView(input: OverviewInput): OverviewView {
 
   // Count pending_human decisions per work item
   const pendingCountByWorkItem = new Map<string, number>();
-  for (const d of decisions) {
-    if (d.workItemId && d.outcome === "pending_human") {
+  const withIds = decisions.map((d, i) => ({ ...d, id: d.id ?? `idx-${i}` }));
+  for (const d of openPendingDecisions(withIds)) {
+    if (d.workItemId) {
       const prev = pendingCountByWorkItem.get(d.workItemId) ?? 0;
       pendingCountByWorkItem.set(d.workItemId, prev + 1);
     }
