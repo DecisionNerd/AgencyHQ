@@ -52,6 +52,8 @@ and the reason every other item was skipped.
 or not it was dispatched. It is stable when the top item is blocked by a busy
 repository or exhausted slots — the UI always shows the correct main effort.
 
+**Campaign ordering** (when `mainEffortByCampaign` is provided): campaign members cluster at their campaign's main effort's rank. Within the cluster, the designated main effort sorts first; remaining members follow in `(rank, createdAt, id)` order. Items without a `campaignId` keep the existing global `(rank, id)` order. No new skip reason (`not_main_effort_slot`) is introduced — the main effort is prioritised entirely through sort ordering.
+
 The function is pure (no I/O) and deterministic (ties broken by `id` ascending).
 ## Authority
 
@@ -71,6 +73,12 @@ Each violation carries a `ViolationCode`, a dot-path, and a detail string. Codes
 
 `requiresApproval(schema, bounds)` determines whether a contract requires a human Approval. Gates fire when any allow pattern intersects a `humanRequired.paths` pattern (conservative intersection), the change class is in `humanRequired.changeClasses`, or the boundary is in `humanRequired.boundaries`. Always computed from the assembled `ContractBounds`, never from the proposal's claimed class alone.
 
+### `update.ts` — Authority update proposal
+
+`proposeAuthorityUpdate(current, next)` validates an authority update. `next` must parse with `AuthoritySchema` and its numeric version must be strictly greater than `current.version`. Returns `Ok({ version, authority })` on success; `Err({ kind: "parse_error", issues })` or `Err({ kind: "version_not_greater" })` on failure. The returned `version` comes from the parsed authority so the project's `authorityVersion` can be updated atomically.
+
+`frozenContractsUnaffected(contract, newAuthority)` always returns `true`, documenting the R-018 invariant: an authority update never mutates existing `StepContract` bounds or digests — it governs only future proposals. The table test in `authority.update.test.ts` verifies `contract.bounds` is deep-equal before and after an update.
+
 ### `runtime.ts` — Dispatch enforceability
 
 `requiredBoundariesFor(bounds)` returns the `BoundaryKind[]` the runtime profile must enforce for a given contract. Always includes: `worktree`, `output_paths`, `push`, `termination`, `capability`, `duration`. Conditionally adds `fs_isolation` and `egress_spend` when external network tools are enabled. Adds `integrate` when `bounds.boundary` is `"merge"` or `"deploy"` (R-015).
@@ -84,6 +92,7 @@ Each violation carries a `ViolationCode`, a dot-path, and a detail string. Codes
 - **`ids.ts`** — Branded id types (`ProjectId`, `WorkItemId`, `StepContractId`, `AttemptId`, `DispatchIntentId`, `ArtifactId`, `VerificationResultId`, `ReviewId`, `DecisionId`, `ApprovalId`, `FindingId`, `FailureId`, `CommandId`). `newId(prefix)` generates a UUID-backed id. `asXId(s)` performs a prefix-check cast.
 - **`result.ts`** — `Ok<T>`, `Err<E>`, `Result<T,E>` discriminated union with `ok()`, `err()`, `isOk()`, `mapResult()` helpers. No dependencies.
 - **`ports.ts`** — Port interfaces: `ExecutionRuntime` (trigger/cancel/retrieve/createPublicToken), `Clock` (now), `IdGen` (next). Also exports `TriggerRunStatus`, `FINAL_RUN_STATUSES`, and `RunObservation`.
+- **`aggregates/campaign.ts`** — `Campaign` aggregate: `{ id, name, mainEffortWorkItemId: string | null }`. `setMainEffort(campaign, workItem)` returns `Ok(campaign)` when the work item's `campaignId` matches the campaign id, else `Err("work_item_not_in_campaign")`. `campaignRankOrder(items)` returns a new array sorted by `(rank asc, createdAt asc, id asc)` — a total order guaranteeing no two distinct items compare equal.
 - **`aggregates/project.ts`** — `Project` aggregate: remote, clone path, worktree base, allowed refs, profile catalog, delegated authority.
 - **`aggregates/work-item.ts`** — `WorkItem` aggregate: ranked, scoped unit of intended change with lifecycle and condition.
 - **`aggregates/step-contract.ts`** — `StepContract` re-export plus `freezeContract()` (pure assembly from an approved lead proposal — copies bounds from the proposal, not the authority schema) and `supersede()` (creates superseded old + active next; caller provides all replacement fields explicitly).

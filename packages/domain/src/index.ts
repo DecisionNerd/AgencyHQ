@@ -4,6 +4,7 @@ export const PACKAGE_NAME = "@agencyhq/domain";
 export * from "./aggregates/approval.ts";
 export * from "./aggregates/artifact.ts";
 export * from "./aggregates/attempt.ts";
+export * from "./aggregates/campaign.ts";
 export * from "./aggregates/decision.ts";
 export * from "./aggregates/dispatch-intent.ts";
 export * from "./aggregates/failure.ts";
