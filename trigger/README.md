@@ -424,7 +424,7 @@ commit locally only (ARCHITECTURE.md lines 85-110).
 
 - Task id: `integrate.merge`, `maxDuration: 300`, single-concurrency `integrate` queue,
   `retry: { maxAttempts: 1 }` (effectively no retry on failure).
-- Validates the payload locally (contracts import pending; swap noted in `types.ts`).
+- Validates the payload against `IntegrateMergePayloadSchema` from `@agencyhq/contracts`.
   Throws `AbortTaskRunError` for missing `repoPath` or invalid payload — not retried.
 - Runs with the **host environment** (credential helper available for pushes), not the
   scrubbed worker env.  `GIT_TERMINAL_PROMPT=0` is added to every git call.

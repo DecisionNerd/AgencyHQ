@@ -30,9 +30,10 @@ Concepts marked *deferred* are vocabulary now and code later.
 ## Relationships
 
 - A WorkItem belongs to one or more Projects via a RevisionManifest (one
-  entry per repository). Single-repository WorkItems have a manifest with one
-  entry. Merge completion requires a resolved manifest (all entries have a
-  non-null `resultRevision`).
+  entry per repository). Merge-boundary WorkItems targeting a single repository
+  have a manifest with one entry; artifact-boundary WorkItems have no manifest.
+  Merge completion requires a resolved manifest (all entries have a non-null
+  `resultRevision`).
 - A WorkItem has one or more StepContracts; the bounded repair process has one.
 - Each Attempt binds to exactly one StepContract version, one Trigger run, and
   one authority generation.
