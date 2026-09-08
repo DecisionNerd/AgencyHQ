@@ -802,8 +802,9 @@ test("scheduling(f): GET /api/metrics/lead returns array (empty when no rows)", 
 
       const res = await app.fetch(new Request("http://localhost/api/metrics/lead"));
       assert.equal(res.status, 200, "GET /api/metrics/lead returns 200");
-      const body = (await res.json()) as unknown[];
-      assert.ok(Array.isArray(body), "response is an array");
+      const body = (await res.json()) as { since: string | null; projects: unknown[] };
+      assert.ok("since" in body, "response carries since");
+      assert.ok(Array.isArray(body.projects), "projects is an array");
     } finally {
       await pool.end();
     }
@@ -856,9 +857,10 @@ test("scheduling(f): GET /api/capacity returns empty array when no capacity rows
 
       const res = await app.fetch(new Request("http://localhost/api/capacity"));
       assert.equal(res.status, 200, "GET /api/capacity returns 200");
-      const body = (await res.json()) as unknown[];
-      assert.ok(Array.isArray(body), "response is an array");
-      assert.equal(body.length, 0, "no capacity rows initially");
+      const body = (await res.json()) as { now: string; providers: unknown[] };
+      assert.equal(typeof body.now, "string", "response carries now");
+      assert.ok(Array.isArray(body.providers), "providers is an array");
+      assert.equal(body.providers.length, 0, "no capacity rows initially");
     } finally {
       await pool.end();
     }
@@ -915,21 +917,23 @@ test("scheduling(f): POST /api/commands set_capacity inserts row and is idempote
       // Verify GET /api/capacity returns the row.
       const capRes = await app.fetch(new Request("http://localhost/api/capacity"));
       assert.equal(capRes.status, 200);
-      const capBody = (await capRes.json()) as Array<{
-        provider: string;
-        model: string;
-        status: string;
-        effectiveStatus: string;
-        concurrency: number | null;
-        source: string;
-      }>;
+      const { providers: capBody } = (await capRes.json()) as {
+        providers: Array<{
+          provider: string;
+          model: string;
+          status: string;
+          effective: string;
+          concurrency: number | null;
+          source: string;
+        }>;
+      };
       assert.equal(capBody.length, 1, "one capacity row");
       const row = capBody[0]!;
       assert.equal(row.provider, "openai");
       assert.equal(row.model, "gpt-5.6-terra");
       assert.equal(row.status, "limited");
       assert.equal(row.source, "operator");
-      assert.ok(row.effectiveStatus !== undefined, "effectiveStatus present");
+      assert.ok(row.effective !== undefined, "effective present");
       assert.ok(row.concurrency !== undefined, "concurrency present");
 
       // Second call with same commandId — should replay.
@@ -949,7 +953,7 @@ test("scheduling(f): POST /api/commands set_capacity inserts row and is idempote
   });
 });
 
-test("scheduling(f): GET /api/capacity returns correct effectiveStatus and concurrency for limited", async (t) => {
+test("scheduling(f): GET /api/capacity returns correct effective and concurrency for limited", async (t) => {
   if (!DATABASE_URL) {
     t.skip("DATABASE_URL is not set");
     return;
@@ -985,18 +989,16 @@ test("scheduling(f): GET /api/capacity returns correct effectiveStatus and concu
       );
 
       const res = await app.fetch(new Request("http://localhost/api/capacity"));
-      const rows = (await res.json()) as Array<{
-        effectiveStatus: string;
-        concurrency: number | null;
-        status: string;
-      }>;
+      const { providers: rows } = (await res.json()) as {
+        providers: Array<{
+          effective: string;
+          concurrency: number | null;
+          status: string;
+        }>;
+      };
       const row = rows.find((r) => r.status === "limited");
       assert.ok(row, "limited row present");
-      assert.equal(
-        row!.effectiveStatus,
-        "limited",
-        "effectiveStatus=limited for non-stale limited row",
-      );
+      assert.equal(row!.effective, "limited", "effective=limited for non-stale limited row");
       assert.ok(
         row!.concurrency !== null && row!.concurrency > 0,
         "concurrency is positive number for limited",

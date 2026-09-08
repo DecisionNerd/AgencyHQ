@@ -23,7 +23,7 @@ describe("buildOverviewView", () => {
       workItems: [],
       decisions: [],
     });
-    assert.deepEqual(view, { campaigns: [], projects: [] });
+    assert.deepEqual(view, { campaigns: [], projects: [], capacity: [] });
   });
 
   it("groups work items by project and sorts by rank", () => {

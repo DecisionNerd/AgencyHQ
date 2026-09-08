@@ -27,8 +27,8 @@ import type { CommandId, RunObservation } from "@agencyhq/domain";
 import {
   effectiveCapacity,
   FINAL_RUN_STATUSES,
-  selectDispatch,
   type SkipReason,
+  selectDispatch,
 } from "@agencyhq/domain";
 
 import { confirmStop, readStopEvidence } from "../commands/confirm-stop.ts";
@@ -523,14 +523,11 @@ export class Reconciler {
 
     // Subscribe and call pollOnce on each observation.
     // The in-flight guard in pollOnce prevents concurrent polls.
-    await this.deps.runtime.subscribe(
-      { tags, signal },
-      (_obs: RunObservation) => {
-        // Wake-up hint: kick off a poll. The observation itself is NOT applied
-        // here — it goes through the normal applyObservation path (R-010).
-        void this.pollOnce();
-      },
-    );
+    await this.deps.runtime.subscribe({ tags, signal }, (_obs: RunObservation) => {
+      // Wake-up hint: kick off a poll. The observation itself is NOT applied
+      // here — it goes through the normal applyObservation path (R-010).
+      void this.pollOnce();
+    });
   }
 
   /**

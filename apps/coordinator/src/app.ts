@@ -33,8 +33,8 @@ import type { CoordinatorConfig } from "./config.ts";
 import { buildAuthorityView } from "./views/authority-view.ts";
 import { buildDecisionsView } from "./views/decisions-view.ts";
 import { buildEvidenceView } from "./views/evidence-view.ts";
-import { buildOverviewView } from "./views/overview-view.ts";
 import type { OverviewCapacitySummary } from "./views/overview-view.ts";
+import { buildOverviewView } from "./views/overview-view.ts";
 import {
   type AttemptLike,
   buildReturnView,
@@ -773,7 +773,7 @@ export function createApp(deps: AppDeps): Hono {
           provider: r.provider,
           model: r.model,
           status: r.status,
-          effectiveStatus: effStatus,
+          effective: effStatus,
           concurrency: concurrencyFor(effStatus),
           observedAt: r.observed_at.toISOString(),
           validUntil: r.valid_until.toISOString(),
@@ -842,7 +842,7 @@ export function createApp(deps: AppDeps): Hono {
     try {
       const pgClient = client as Parameters<typeof leadMetrics>[0];
       const rows = await leadMetrics(pgClient, { since: sinceDate });
-      return c.json(rows);
+      return c.json({ since: sinceDate ? sinceDate.toISOString() : null, projects: rows });
     } finally {
       client.release();
     }
@@ -872,14 +872,14 @@ export function createApp(deps: AppDeps): Hono {
           provider: r.provider,
           model: r.model,
           status: r.status,
-          effectiveStatus: effStatus,
+          effective: effStatus,
           concurrency: concurrencyFor(effStatus),
           observedAt: r.observed_at.toISOString(),
           validUntil: r.valid_until.toISOString(),
           source: r.source,
         };
       });
-      return c.json(result);
+      return c.json({ now: capNow, providers: result });
     } finally {
       client.release();
     }

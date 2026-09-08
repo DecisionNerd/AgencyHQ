@@ -54,7 +54,7 @@ export type OverviewActiveAttempt = {
 
 /**
  * Single-row capacity summary for the overview (one per provider/model pair).
- * The effectiveStatus is pre-computed by the app layer using effectiveCapacity().
+ * The effective status is pre-computed by the app layer using effectiveCapacity().
  */
 export type OverviewCapacitySummary = {
   provider: string;
@@ -62,7 +62,7 @@ export type OverviewCapacitySummary = {
   /** Raw recorded status (ok|limited|down). */
   status: "ok" | "limited" | "down";
   /** Effective status after staleness check (ok|limited|down|unknown). */
-  effectiveStatus: "ok" | "limited" | "down" | "unknown";
+  effective: "ok" | "limited" | "down" | "unknown";
   /** Maximum concurrency for this effective status (null = unbounded). */
   concurrency: number | null;
   observedAt: string;
