@@ -20,6 +20,7 @@ import {
 } from "@agencyhq/db";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
+import { createBearerAuthMiddleware } from "./auth.ts";
 import type { CoordinatorConfig } from "./config.ts";
 import {
   type AttemptLike,
@@ -254,6 +255,11 @@ export function createApp(deps: AppDeps): Hono {
   } = deps;
 
   const app = new Hono();
+
+  // ------------------------------------------------------------------
+  // Bearer-token auth middleware (guards /api/* except /api/health)
+  // ------------------------------------------------------------------
+  app.use("/api/*", createBearerAuthMiddleware(config.apiToken));
 
   // ------------------------------------------------------------------
   // GET /api/health

@@ -21,6 +21,8 @@ export type CoordinatorConfig = {
   webDist?: string;
   port: number;
   bindHost: string;
+  /** Bearer token for /api/* authentication. Absent when binding to loopback only. */
+  apiToken?: string;
 };
 
 export class ConfigError extends Error {
@@ -124,6 +126,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
   const port = portNum("PORT", 8787);
   const bindHost = optional("AGENCYHQ_BIND_HOST") ?? "127.0.0.1";
 
+  // Bearer token: optional when binding to a loopback address; required otherwise.
+  const apiToken = optional("AGENCYHQ_API_TOKEN");
+  const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
+  if (apiToken === undefined && !loopbackHosts.has(bindHost)) {
+    missing.push("AGENCYHQ_API_TOKEN");
+  }
+
   if (missing.length > 0 || invalid.length > 0) {
     throw new ConfigError(missing, invalid);
   }
@@ -145,8 +154,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     bindHost,
   };
 
+  let result: CoordinatorConfig = base;
   if (webDist !== undefined) {
-    return { ...base, webDist };
+    result = { ...result, webDist };
   }
-  return base;
+  if (apiToken !== undefined) {
+    result = { ...result, apiToken };
+  }
+  return result;
 }
