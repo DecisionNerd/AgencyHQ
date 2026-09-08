@@ -1,0 +1,25 @@
+{
+  "_comment": "verify.run result is fail despite worker claiming pass. Digests match the contract (set dynamically in tests from payload). Used as reference shape; tests build this dynamically via fake.script callback.",
+  "results": [
+    {
+      "verifier": { "name": "agencyhq-verifier", "version": "1.0.0" },
+      "stepContractId": "__RUNTIME_CONTRACT_ID__",
+      "attemptId": "__RUNTIME_ATTEMPT_ID__",
+      "criteriaDigest": "__RUNTIME_CRITERIA_DIGEST__",
+      "profileDigest": "__RUNTIME_PROFILE_DIGEST__",
+      "repository": "/repo",
+      "baseRevision": "0000000000000000000000000000000000000000",
+      "attemptRevision": "deadbeef1234567890deadbeef1234567890dead",
+      "diffDigest": "__RUNTIME_DIFF_DIGEST__",
+      "checkId": "pnpm-test",
+      "environmentFingerprint": { "node": "20.0.0" },
+      "startedAt": "2026-09-07T10:00:00.000Z",
+      "endedAt": "2026-09-07T10:00:30.000Z",
+      "exitStatus": 1,
+      "stdoutTail": "FAIL test/parser/reject.test.ts\n  1 test failed",
+      "stderrTail": "",
+      "artifactDigests": [],
+      "result": "fail"
+    }
+  ]
+}

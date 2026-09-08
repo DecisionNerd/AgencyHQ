@@ -1,0 +1,31 @@
+{
+  "name": "@agencyhq/trigger",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "trigger dev --profile agencyhq-local",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.ts'",
+    "trial": "node --env-file=.env scripts/trial.ts",
+    "echo": "node --env-file=.env scripts/echo.ts"
+  },
+  "dependencies": {
+    "@trigger.dev/sdk": "4.5.16",
+    "@opencode-ai/sdk": "1.18.29",
+    "@agencyhq/contracts": "workspace:*",
+    "@agencyhq/domain": "workspace:*",
+    "@agencyhq/verification": "workspace:*"
+  },
+  "devDependencies": {
+    "trigger.dev": "4.5.16",
+    "typescript": "^5.9",
+    "@types/node": "^24"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client/index.ts",
+    "./retention": "./src/retention.ts",
+    "./types": "./src/types.ts"
+  }
+}

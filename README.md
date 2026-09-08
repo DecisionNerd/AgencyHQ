@@ -4,8 +4,7 @@ AgencyHQ is an engineering coordination control plane. It turns intent into
 bounded, durable work while keeping completion tied to source-controlled
 changes and reproducible evidence.
 
-This repository is at **architecture baseline** stage. The structure and
-contracts are deliberate; product implementation has not started.
+Slices 1–3 are implemented (execution spike, domain kernel, and one complete bounded repair through acceptance). Slice 4 is next. See the [roadmap](docs/strategy/roadmap.md) for the current state.
 
 ## System boundary
 
@@ -15,7 +14,7 @@ contracts are deliberate; product implementation has not started.
 | Engineering judgment: definition of done, review, acceptance proposals | The Lead — OpenCode sessions in a read-only agent, validated by the coordinator |
 | Execution: queues, isolation, limits, retries, cancellation, run status, logs, realtime | Self-hosted Trigger.dev |
 | Coding-agent execution and model/provider abstraction | OpenCode |
-| Code, branches, commits, diffs | Git; attempt refs pushed by task adapters, shared refs by integration tasks only |
+| Code, branches, commits, diffs | Git; attempt and checkpoint refs committed locally by task adapters; shared refs pushed only by integration tasks |
 
 Trigger.dev is trusted for how work runs and whether it is still running. It is
 never trusted for whether work is done. OpenCode is the agent runtime, not the
@@ -74,3 +73,15 @@ See [ADR-0005](docs/engineering/adrs/0005-trigger-as-execution-runtime.md),
 [ADR-0006](docs/engineering/adrs/0006-lead-role-and-delegated-authority.md), and
 [ADR-0007](docs/engineering/adrs/0007-worker-effect-model.md) for the 2026-09-07
 revision.
+
+## Development
+
+Requires Node.js 24+ and pnpm 11+.
+
+```sh
+pnpm install
+pnpm check
+pnpm test
+pnpm db:up && DATABASE_URL=postgres://agencyhq:agencyhq@localhost:5432/agencyhq_test pnpm test:integration
+pnpm trigger:dev
+```

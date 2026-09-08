@@ -1,0 +1,18 @@
+{
+  "_comment": "Honest accept output: cites the real verificationResult ref and criterion. Used in the claims-pass scenario where verify fails but accept tries to proceed.",
+  "accept": true,
+  "criteria": [
+    {
+      "criterionId": "c1",
+      "satisfied": true,
+      "evidence": [
+        {
+          "kind": "verification_result",
+          "ref": "agencyhq-verifier:pnpm-test:deadbeef1234567890deadbeef1234567890dead"
+        }
+      ]
+    }
+  ],
+  "findingDispositions": [],
+  "rationale": "Criterion c1 satisfied by passing verification result"
+}

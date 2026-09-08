@@ -23,6 +23,8 @@ Concepts marked *deferred* are vocabulary now and code later.
 | ProcessDefinition | Versioned step/gate sequence. The bounded repair process is code until a second process exists. *Deferred.* | 4 |
 | ProviderCapacity | Timestamped capacity observation with validity window. *Deferred.* | 6 |
 
+*Implementation: all Slice 2 aggregates in `packages/domain/src/aggregates/`; lifecycle transitions namespaced per aggregate in `packages/domain/src/transitions/`.*
+
 ## Relationships
 
 - A WorkItem belongs to one Project (multi-repository WorkItems arrive in
@@ -51,6 +53,16 @@ what they attempted, exact outputs, checks run, unmet criteria, limitations,
 and Findings. An honest partial or failed report is valid execution evidence,
 not acceptance. Missing results remain unknown.
 
+A worker output with a null commit id (nothing changed) is classified as a
+failure; no Artifact is created for that attempt (untested: no test covers
+this path yet).
+
+When the authority schema sets `humanRequired` true, the work item is parked as
+`pending_human` after acceptance is proposed, and stays there until a matching
+Approval bound to the same contract version and attempt exists (untested: no
+test covers this parking path yet). No Approval write path (command or API)
+exists yet; this is Slice 4 scope.
+
 ## Delegated authority
 
 The schema is defined in ADR-0006. Two rules govern it here:
@@ -59,6 +71,10 @@ The schema is defined in ADR-0006. Two rules govern it here:
    narrowing ⊇ StepContract bounds ⊇ what a worker's permission rules allow.
 2. Widening any bound is a new StepContract version and, where `humanRequired`
    applies, an Approval. Workers cannot request widening; they report Findings.
+
+The Project's **verification profile catalog is an authority ceiling**: the Lead may only choose a `profileId` from this catalog. A proposal naming an unknown profile becomes a `pending_human` decision with `PROFILE_NOT_IN_CATALOG`.
+
+*Implementation: authority subset check with 15 violation codes in `packages/domain/src/authority/subset.ts`; human-approval determination in `packages/domain/src/authority/human-required.ts`; dispatch enforceability in `packages/domain/src/authority/runtime.ts`.*
 
 ## Allocation
 
@@ -88,11 +104,13 @@ The Lead classifies each Finding; the coordinator records the disposition.
 
 Match Findings by subject and cause before creating another.
 
+*Implementation: finding dispositions in `packages/domain/src/findings/disposition.ts`; acceptance rule with 14 reason codes (`PROPOSAL_REJECTS`, `VERIFIER_TAMPERED`, `CRITERION_UNCITED`, `CRITERION_UNSATISFIED`, `CITED_RESULT_MISSING`, `CITED_RESULT_NOT_PASSING`, `RESULT_VERSION_MISMATCH`, `REVIEW_MISSING`, `REVIEW_VERSION_MISMATCH`, `REVIEW_BLOCKING`, `REVIEW_BELOW_REQUIRED`, `REVIEWER_NOT_DISTINCT`, `APPROVAL_REQUIRED`, `APPROVAL_VERSION_MISMATCH`) in `packages/domain/src/evidence/acceptance.ts`; verifier-tampering detection in `packages/domain/src/evidence/integrity.ts` (protected paths: package manifests, lock files, workspace file, tsconfig*, biome.json, .github/**, vitest/jest configs; test source files are not protected).*
+
 ## Version repair
 
 | Change | Transition |
 | --- | --- |
-| Output needs correction; contract valid | New Attempt under the same contract once the prior run is final. |
+| Output needs correction; contract valid | New Attempt under the same contract once the prior run is final. A Failure record for the superseded attempt is committed in the same transaction before the new attempt is inserted. |
 | Inputs, scope, or criteria change | Supersede the StepContract; new version, new Attempt; prior Attempt's generation revoked. |
 | Evidence may carry forward | Link prior Artifacts with provenance. Reuse a VerificationResult only when criteria, profile, inputs, and revision match exactly; otherwise rerun. |
 
@@ -107,3 +125,5 @@ Every policy-relevant transition is validated in `packages/domain`, committed
 to Postgres with actor, causation, and an idempotency key, and only then
 followed by a DispatchIntent. Trigger runs are consumed as observations with
 the run id and attempt generation as the dedupe identity.
+
+*Implementation: failure classification table over 13 Trigger statuses in `packages/domain/src/failure/classify.ts`; dispatch selection in `packages/domain/src/dispatch/`.*

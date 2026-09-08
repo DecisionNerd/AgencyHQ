@@ -2,3 +2,6 @@ packages:
   - apps/*
   - packages/*
   - trigger
+allowBuilds:
+  '@depot/cli': true
+  esbuild: true

@@ -1,0 +1,34 @@
+{
+  "_comment": "Worker claims pnpm test passes but verify.run will return fail. The report.checksRun field must not appear in acceptance decision reasons (R-014).",
+  "attemptId": "__RUNTIME_ATTEMPT_ID__",
+  "sessionId": "session-false-success-001",
+  "outcome": "completed",
+  "worktreePath": "/worktrees/__RUNTIME_ATTEMPT_ID__",
+  "runDir": "/worktrees/__RUNTIME_ATTEMPT_ID__/.run",
+  "commitId": "deadbeef1234567890deadbeef1234567890dead",
+  "diffDigest": "sha256:d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5",
+  "changedPaths": ["test/parser/reject.test.ts", "src/parser/parse.ts"],
+  "pathViolations": [],
+  "checkpointCommit": null,
+  "survivors": [],
+  "opencode": {
+    "sessionID": "ocsess-false-success-001",
+    "exitCode": 0,
+    "denials": [],
+    "errors": []
+  },
+  "report": {
+    "attempted": "Fixed parser edge cases",
+    "outputs": ["test/parser/reject.test.ts", "src/parser/parse.ts"],
+    "checksRun": [{ "command": "pnpm test", "claimedResult": "pass" }],
+    "unmetCriteria": [],
+    "limitations": [],
+    "findings": [
+      {
+        "kind": "unrelated",
+        "description": "Noticed unrelated TODO comment in src/parser/utils.ts line 42",
+        "evidence": "src/parser/utils.ts:42"
+      }
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@agencyhq/coordinator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.ts'",
+    "test:integration": "node --test 'test/integration/**/*.test.ts'",
+    "seed": "node --env-file=../../.env scripts/seed.ts",
+    "start": "node --env-file=../../.env src/main.ts",
+    "dev": "node --env-file=../../.env --watch src/main.ts"
+  },
+  "dependencies": {
+    "@agencyhq/contracts": "workspace:*",
+    "@agencyhq/domain": "workspace:*",
+    "@agencyhq/db": "workspace:*",
+    "@agencyhq/verification": "workspace:*",
+    "@agencyhq/trigger": "workspace:*",
+    "hono": "^4",
+    "@hono/node-server": "^2",
+    "pg": "^8"
+  },
+  "devDependencies": {
+    "@types/pg": "^8"
+  }
+}

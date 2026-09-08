@@ -66,6 +66,8 @@ verification profiles, review depth, boundaries, Finding dispositions, failure
 classifications, review findings, and acceptance. Proposals become Decisions
 only through the coordinator.
 
+**Mechanism (Slice 3, 2026-09-07).** Lead tasks (`lead.plan`, `lead.review`, `lead.accept`) use the OpenCode SDK: `opencode serve --port 0` is spawned with a read-only permission ruleset, a single prompt is sent with `format: { type: "json_schema" }`, and the `StructuredOutput` tool is allowed so the JSON loop completes. The structured output is validated by `LeadPlanOutputSchema` / `ReviewOutput` / `AcceptanceProposal` before the coordinator records any Decision. The project's **verification profile catalog is an authority ceiling**: the Lead may only choose a `profileId` that appears in the project's catalog; a proposal naming an unknown profile is recorded as `pending_human` with `PROFILE_NOT_IN_CATALOG` and is not retried automatically. This was observed in the Slice 3 trial; see [trials/2026-09-slice3.md](trials/2026-09-slice3.md).
+
 ### Trigger.dev (execution runtime)
 
 Self-hosted v4 webapp stack (ADR-0005) plus, on the host profile, `trigger dev`
@@ -82,10 +84,10 @@ Thin, versioned task definitions with no policy:
 | Task | Does | Returns as run output |
 | --- | --- | --- |
 | `lead.plan` | Read-only OpenCode session in a worktree at the base revision; proposes StepContract, criteria, profile, review depth, boundary. | Structured proposal with source citations. |
-| `worker.attempt` | `git worktree add` at the base revision; spawn OpenCode with scrubbed env and the contract's permission rules; on exit diff, path-check, commit `agencyhq/attempts/<id>`; on cancel commit a checkpoint and kill the process group. | Worker report, commit id, diff digest, path violations. |
-| `verify.run` | Separate worktree at the attempt revision; run the approved profile's checks; capture bounded logs. | VerificationResult records. |
-| `lead.review` | Read-only session over the diff and evidence; adversarial review. | Review findings against exact versions. |
-| `lead.accept` | Judges criteria against evidence and review. | Acceptance proposal with rationale. |
+| `worker.attempt` | `git worktree add` at the base revision; resolves the model from `payload.model` then `AGENCYHQ_OPENCODE_MODEL` — neither being set is a setup failure (`AbortTaskRunError`, not retried); requires `permissionRules` in the payload — resolves with `resolveWorkerRuleset` (contract ruleset with always-deny set enforced on top) and fails setup with `AbortTaskRunError` if absent; spawn OpenCode with scrubbed env; on exit diff, path-check (`paths.deny` from the payload enforced in classification — violations quarantine), commit `agencyhq/attempts/<id>`; on cancel commit a checkpoint and kill the process group. | Worker report, commit id, diff digest, path violations. |
+| `verify.run` | Separate worktree at the attempt revision; run the approved profile's checks; `protectedPaths` from the payload (package manifests, lock files, workspace file, tsconfig*, biome.json, .github/**, vitest/jest configs; test source files are not protected) detect verifier tampering and produce blocking `verifier_tampered` findings; records `protectedPathsSource` (`"payload"` when the coordinator sent the field, `"default"` otherwise) — recorded by the adapter; not consumed by the coordinator; capture bounded logs. | VerificationResult records. |
+| `lead.review` | Read-only session over the diff and evidence; adversarial review. Reviewer identity is the invoked `payload.model`. | Review findings against exact versions. |
+| `lead.accept` | Judges criteria against evidence and review; coordinator's `evaluateAcceptance` reads `integrityFindings` from the attempt's `findings` table and rejects with `VERIFIER_TAMPERED` (one of 14 acceptance reason codes) when any blocking integrity finding is present. | Acceptance proposal with rationale. |
 | `integrate.merge` | After a recorded acceptance: merge to the target ref, compare-and-set on expected base, push with host credentials. | Resulting revision or conflict evidence. |
 
 Adapters raise `AbortTaskRunError` for contract failures so Trigger does not
@@ -109,7 +111,10 @@ Postgres stores commit ids and digests, never source.
 ## Enforcement boundaries
 
 Host profile as declared. A contract that requires a boundary the profile
-marks advisory is rejected at dispatch.
+marks advisory is rejected at dispatch. A spend estimate is advisory on the
+host profile and does not cause R-016 rejection; only contracts that enable
+`webfetch` or `websearch` tools additionally require `fs_isolation` and
+`egress_spend` to be enforceable (`packages/domain/src/authority/runtime.ts`).
 
 | Boundary | Host profile | Kind | Container profile |
 | --- | --- | --- | --- |
@@ -129,22 +134,30 @@ marks advisory is rejected at dispatch.
 
 `packages/domain` imports nothing from Trigger, OpenCode, React, or Postgres
 clients. `trigger/` and `packages/db` depend on `packages/contracts` and
-`packages/domain`. The coordinator composes them.
+`packages/domain`. The coordinator composes them. This is verified by
+`tests/dependency-rules.test.mjs` (6 cases), which runs as part of `pnpm check`.
 
 ## Deployment shape
 
 Host profile: one AgencyHQ process (web + coordinator), one AgencyHQ Postgres,
-the Trigger webapp stack (webapp, Postgres, Redis, Electric, registry, object
-storage, socket proxy; ClickHouse optional), and `trigger dev` kept running on
-the OpenCode host. No supervisor or worker machine. AgencyHQ and Trigger never
+the Trigger webapp stack (webapp, Postgres, Redis, Electric, ClickHouse, S2
+realtime streams, registry, object storage), and `trigger dev` kept running on
+the OpenCode host. The Docker socket proxy belongs to the worker stack and is
+not deployed on the host profile. No worker machine. AgencyHQ and Trigger never
 share a database or credentials; AgencyHQ uses only Trigger's SDK and
-management API.
+management API. On the host profile, the Trigger API reports a final run status
+before the adapter finishes cleanup; confirmation comes from the adapter's stop
+record on disk (`<runDir>/stop.ndjson`), not from run status alone — see the
+[Slice 1 execution trial](trials/2026-09-slice1.md).
 
 ## Security baseline
 
 - The coordinator holds AgencyHQ secrets and the Trigger secret key. Worker
   processes inherit the host's OpenCode credentials by design of the host
   profile; that exposure is recorded, not hidden.
+- The coordinator HTTP API binds to `AGENCYHQ_BIND_HOST` (default
+  `127.0.0.1`) and has no authentication; it must not be exposed beyond the
+  host. Bearer auth is planned but not yet implemented.
 - Every command is bound to actor, Project, contract version, attempt, and
   generation; Decisions and Approvals are immutable audit records.
 - Worker reports, repository content, Lead proposals, and run outputs are

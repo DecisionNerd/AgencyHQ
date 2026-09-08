@@ -5,7 +5,7 @@ riskiest assumption — that self-hosted Trigger.dev plus OpenCode can meet the
 isolation and recovery contract — is tested first, before domain code depends
 on it.
 
-## Slice 0 — architecture baseline (current)
+## Slice 0 — architecture baseline
 
 - Authority boundaries, runtime choice, Lead role, worker effect model, and
   delegated-authority schema are recorded (ADR-0001 to ADR-0007).
@@ -25,6 +25,9 @@ on it.
   `maxDuration` behave as documented.
 - Record results. If the contract cannot be met, supersede ADR-0005 with the
   evidence before any further slice.
+- Outcome (2026-09-07): items 1–4 PASS; contract held on the host profile;
+  ADR-0005 and ADR-0007 stand. Full record:
+  [trials/2026-09-slice1.md](../engineering/trials/2026-09-slice1.md).
 
 ## Slice 2 — domain kernel and ledger
 
@@ -36,6 +39,10 @@ on it.
   duplicate observation, and stale-generation refusal.
 - Add the Trigger client wrapper with a deterministic fake and the worktree
   retention policy.
+- Outcome (2026-09-07): contracts 184 tests, domain 344 tests, trigger 89 tests
+  (+1 skipped live), db 8 unit + 41 integration on Postgres 17.6; `pnpm check`
+  11/11; authority subset check with 15 violation codes, acceptance rule with 13
+  reason codes, FakeExecutionRuntime and RealExecutionRuntime, 15-table ledger.
 
 ## Slice 3 — one complete bounded repair
 
@@ -46,8 +53,17 @@ on it.
   Realtime for execution state and links to Trigger runs for logs.
 - Run the full execution trial on the real stack and record it. CI runs the
   baseline check and all slice tests.
+- Outcome (2026-09-07): items 1–7 run; items 1–3 PASS, item 4a PASS (4b/4c not
+  exercised live — worker model declined to write via bash; Slice 1 record and
+  unit tests are the evidence), item 5 PASS, item 6 PARTIAL (weakened-test path
+  not exercised live — detected by adversarial reviewer only; `flow.false-success
+  (f)` is the deterministic gate confirming `REVIEW_BLOCKING` rejection), item 7
+  PASS (work item `89cfe999-9710-4388-8dd1-caf520d26d49` completed at artifact,
+  no Approval, ~150 s end to end). 847 unit tests, 114 integration tests (as of
+  rework-4, 2026-09-08; unchanged from rework-3; earlier counts were 787 unit / 86 integration). Full
+  record: [trials/2026-09-slice3.md](../engineering/trials/2026-09-slice3.md).
 
-## Slice 4 — integration boundaries and multiple repositories
+## Slice 4 — integration boundaries and multiple repositories (current)
 
 - `integrate.merge` with compare-and-set and per-repository serialization;
   `merge` boundary completion.

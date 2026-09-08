@@ -1,0 +1,47 @@
+{
+  "paths-wider": {
+    "outcome": "pending_human",
+    "violationCodes": ["PATH_ALLOW_WIDER"]
+  },
+  "deny-dropped": {
+    "outcome": "pending_human",
+    "violationCodes": ["PATH_DENY_DROPPED"]
+  },
+  "bash-glob": {
+    "outcome": "pending_human",
+    "violationCodes": ["BASH_ALLOW_WIDER"]
+  },
+  "boundary-merge": {
+    "outcome": "pending_human",
+    "violationCodes": ["BOUNDARY_NOT_DELEGATED"]
+  },
+  "budget-10-attempts": {
+    "outcome": "pending_human",
+    "violationCodes": ["BUDGET_ATTEMPTS"]
+  },
+  "review-none-for-behavior": {
+    "outcome": "pending_human",
+    "violationCodes": ["REVIEW_BELOW_MINIMUM"]
+  },
+  "class-editorial-touching-public-api": {
+    "outcome": "pending_human",
+    "humanRequired": true,
+    "note": "proposal is within authority but touches humanRequired path src/parser/public-api.ts; contract created with humanRequired=true; worker attempt IS triggered per current flow"
+  },
+  "reviewer-same-model": {
+    "outcome": "pending_human",
+    "violationCodes": ["REVIEWER_SAME_AS_WORKER", "MODEL_NOT_ALLOWED"]
+  },
+  "no-operator-criterion": {
+    "outcome": "pending_human",
+    "violationCodes": ["NO_OPERATOR_CRITERION"]
+  },
+  "narrower": {
+    "outcome": "accepted",
+    "contractCreated": true,
+    "workerTriggered": true,
+    "pathsAllow": ["src/parser/parse.ts"],
+    "maxAttempts": 1,
+    "review": "adversarial"
+  }
+}
