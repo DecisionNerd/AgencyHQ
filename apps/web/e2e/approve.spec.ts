@@ -1,12 +1,13 @@
 import { seedIds } from "./helpers";
 /**
- * (iii) Approve pending_human decision → work item moves to completed.
+ * Approve journeys — 2 tests.
  *
- * Tests the decisions page approve flow:
- *   1. Navigate to the decisions page.
- *   2. Verify two pending decisions exist (wiApprove and wiReject from seed).
- *   3. Click the approve button for the first decision.
- *   4. Verify the decisions list refreshes with one fewer entry.
+ * (iii-a) Decisions page: approve pending_human decision via confirm dialog →
+ *         decision removed from list; confirm message names project, work item
+ *         and contract version.
+ * (iii-b) Work item page: approve via confirm dialog → lifecycle moves to
+ *         "completed"; confirm message names project, work item and contract
+ *         version.
  */
 
 import { expect, test } from "@playwright/test";
@@ -24,6 +25,8 @@ test("decisions page: approve pending_human decision removes it from the list", 
   const ids = seedIds();
   const decisionId = ids.decApprove;
   expect(decisionId, "seed must publish decApprove").toBeTruthy();
+  expect(ids.wiApprove, "seed must publish wiApprove").toBeTruthy();
+  expect(ids.projectId, "seed must publish projectId").toBeTruthy();
 
   await page.goto("/#/decisions");
   await expect(page.getByTestId("decisions-list")).toBeVisible({ timeout: 10_000 });
@@ -32,7 +35,17 @@ test("decisions page: approve pending_human decision removes it from the list", 
 
   await page.getByTestId(`approve-btn-${decisionId}`).click();
 
+  // A confirm dialog appears — assert it names the project, work item, and version.
+  const dialog = page.getByTestId("confirm-dialog");
+  await expect(dialog).toBeVisible({ timeout: 5_000 });
+  const message = await page.getByTestId("confirm-message").innerText();
+  expect(message).toContain(ids.projectId);
+  expect(message).toContain(ids.wiApprove);
+  expect(message).toMatch(/v\d+/i);
+  await page.getByTestId("confirm-ok").click();
+
   // After approve, the page reloads the decisions list and the entry is gone.
+  await expect(dialog).not.toBeVisible({ timeout: 5_000 });
   await expect(entry).not.toBeVisible({ timeout: 15_000 });
   await expect(page.getByTestId("action-error")).not.toBeVisible();
 });
@@ -40,6 +53,7 @@ test("decisions page: approve pending_human decision removes it from the list", 
 test("work item page: approve via confirm dialog updates the item", async ({ page }) => {
   const ids = seedIds();
   expect(ids.wiApprove2, "seed must publish wiApprove2").toBeTruthy();
+  expect(ids.projectId, "seed must publish projectId").toBeTruthy();
 
   await page.goto(`/#/work-items/${ids.wiApprove2}`);
   await expect(page.getByTestId("work-item-detail")).toBeVisible({ timeout: 10_000 });
@@ -51,8 +65,9 @@ test("work item page: approve via confirm dialog updates the item", async ({ pag
   const dialog = page.getByTestId("confirm-dialog");
   await expect(dialog).toBeVisible({ timeout: 5_000 });
   const message = await page.getByTestId("confirm-message").innerText();
+  expect(message).toContain(ids.projectId);
   expect(message).toContain(ids.wiApprove2);
-  expect(message).toMatch(/contract v?\d+/i);
+  expect(message).toMatch(/v\d+/i);
   await page.getByTestId("confirm-ok").click();
   await expect(dialog).not.toBeVisible({ timeout: 10_000 });
   await expect(page.getByTestId("work-item-action-error")).not.toBeVisible();
