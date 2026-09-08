@@ -18,6 +18,13 @@ export type WorkItemLike = {
   lifecycle: "proposed" | "admitted" | "active" | "completed" | "halted" | "reopened";
   condition: "healthy" | "blocked" | "uncertain";
   mainEffort: boolean;
+  /**
+   * Optional: true when this work item has an open integrate intent (i.e.
+   * integration is in flight for one of its repositories).  When true the
+   * item is skipped with reason "integration_pending".  Absent or false
+   * preserves existing dispatch behaviour unchanged.
+   */
+  hasOpenIntegrateIntent?: boolean;
 };
 
 /** Minimal active-attempt shape needed to detect busy repositories. */
@@ -34,7 +41,8 @@ export type SkipReason =
   | "repository_busy"
   | "repository_uncertain"
   | "no_slot"
-  | "already_active";
+  | "already_active"
+  | "integration_pending";
 
 export type SelectDispatchInput = {
   workItems: WorkItemLike[];
@@ -120,6 +128,15 @@ export function selectDispatch(input: SelectDispatchInput): SelectDispatchOutput
     // before any slot or repository checks.
     if (mainEffort === null) {
       mainEffort = item.id;
+    }
+
+    // Rule 2.5: integration is pending for this work item.
+    // An open integrate intent means integration is in flight; dispatching a
+    // new attempt would race with the integrator. Skipped regardless of repo
+    // or slot state.
+    if (item.hasOpenIntegrateIntent === true) {
+      skipped.push({ workItemId: item.id, reason: "integration_pending" });
+      continue;
     }
 
     // Rule 3: already has a running attempt.

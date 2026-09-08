@@ -4,8 +4,9 @@
  * Table-driven; every illegal transition returns Err with code "illegal_transition".
  */
 
-import type { Boundary } from "@agencyhq/contracts";
 import type { WorkItem, WorkItemCondition, WorkItemLifecycle } from "../aggregates/work-item.ts";
+import type { ManifestEntry } from "../integration/manifest.ts";
+import { allResolved } from "../integration/manifest.ts";
 import type { Result } from "../result.ts";
 import { err, ok } from "../result.ts";
 
@@ -109,10 +110,32 @@ export function activate(
 // ---------------------------------------------------------------------------
 // complete
 // ---------------------------------------------------------------------------
-export type CompleteCommand = {
-  readonly boundary: Boundary;
-  readonly revision: string;
-};
+
+/**
+ * CompleteCommand is a discriminated union on boundary:
+ *
+ *   - "artifact": requires the attempt revision (commit SHA).
+ *   - "merge": requires a fully-resolved RevisionManifest and its pre-computed
+ *     digest.  The completion revision is taken from the last entry (highest
+ *     position) in the manifest.  Returns Err when any entry is unresolved.
+ *   - "deploy": always returns Err (DEPLOY_NOT_SUPPORTED) — deploy boundary
+ *     completion is not yet implemented.
+ */
+export type CompleteCommand =
+  | {
+      readonly boundary: "artifact";
+      readonly revision: string;
+    }
+  | {
+      readonly boundary: "merge";
+      /** Fully-resolved revision manifest (all entries must have resultRevision set). */
+      readonly manifest: ManifestEntry[];
+      /** Pre-computed digest of the manifest (from manifestDigestInput). */
+      readonly manifestDigest: string;
+    }
+  | {
+      readonly boundary: "deploy";
+    };
 
 export function complete(
   workItem: WorkItem,
@@ -121,28 +144,78 @@ export function complete(
   const check = assertAllowed(workItem, "complete");
   if (!check.ok) return check;
 
-  // artifact boundary requires an attempt revision
-  if (command.boundary === "artifact" && !command.revision) {
-    return err({ code: "missing_revision", reason: "artifact boundary requires attempt revision" });
+  if (command.boundary === "artifact") {
+    // artifact boundary requires an attempt revision
+    if (!command.revision) {
+      return err({
+        code: "missing_revision",
+        reason: "artifact boundary requires attempt revision",
+      });
+    }
+
+    const next: WorkItem = {
+      ...workItem,
+      lifecycle: "completed",
+      boundary: "artifact",
+      version: workItem.version + 1,
+    };
+
+    return ok({
+      workItem: next,
+      events: [
+        {
+          type: "work_item.completed",
+          workItemId: workItem.id,
+          version: next.version,
+          detail: { boundary: "artifact", revision: command.revision },
+        },
+      ],
+    });
   }
 
-  const next: WorkItem = {
-    ...workItem,
-    lifecycle: "completed",
-    boundary: command.boundary,
-    version: workItem.version + 1,
-  };
+  if (command.boundary === "merge") {
+    // merge boundary requires all manifest entries to be resolved
+    if (!allResolved(command.manifest)) {
+      return err({
+        code: "manifest_unresolved",
+        reason: "all manifest entries must have resultRevision before completing merge boundary",
+      });
+    }
 
-  return ok({
-    workItem: next,
-    events: [
-      {
-        type: "work_item.completed",
-        workItemId: workItem.id,
-        version: next.version,
-        detail: { boundary: command.boundary, revision: command.revision },
-      },
-    ],
+    // Completion revision = last entry's resultRevision (highest position)
+    const sorted = [...command.manifest].sort((a, b) => a.position - b.position);
+    const lastEntry = sorted[sorted.length - 1];
+    // Safe: allResolved guarantees resultRevision is non-null on every entry
+    const revision = lastEntry!.resultRevision as string;
+
+    const next: WorkItem = {
+      ...workItem,
+      lifecycle: "completed",
+      boundary: "merge",
+      version: workItem.version + 1,
+    };
+
+    return ok({
+      workItem: next,
+      events: [
+        {
+          type: "work_item.completed",
+          workItemId: workItem.id,
+          version: next.version,
+          detail: {
+            boundary: "merge",
+            revision,
+            manifestDigest: command.manifestDigest,
+          },
+        },
+      ],
+    });
+  }
+
+  // boundary === "deploy"
+  return err({
+    code: "deploy_not_supported",
+    reason: "deploy boundary completion is not yet implemented",
   });
 }
 
