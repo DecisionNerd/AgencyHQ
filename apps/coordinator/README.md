@@ -36,6 +36,7 @@ The `BoundedRepairFlow` class drives the plan → admit → dispatch → verify 
 - **Status guards**: completion, quarantine, and failure updates in `onWorkerFinal` are guarded by `WHERE status IN ('admitted','dispatched','running')`; a stop that lands between `applyObservation` and the update wins (`stale_status`): the observation is skipped, the intent stays open, and the reconciler routes the `stopping` attempt to confirmation at its next poll (`flow.stop (CR-2a)`: COMPLETED run race → stale_status, attempt stays stopping gen 2, no artifact, no verify trigger, then uncertain after deadline; `flow.stop (CR-2b)`: same, survivors=[] → stopped with metadata evidence).
 - **`retry_dispatch` command**: takes `intentId` in the request body (not `workItemId`); calls `flow.retryDispatch(intentId, commandId)` to re-trigger the already-recorded intent.
 - **Stop command replay**: a repeated stop command with the same command id returns `replayed: true`.
+- **`approve` command**: handles human approval for `humanRequired` contracts. When `onAcceptFinal` detects that a contract requires human sign-off (`humanRequired: true`) and no `Approval` was supplied, it records a `pending_human` decision and leaves the work item active. The `approve` command (`POST /api/commands` with `kind: "approve"`) supplies the `Approval` (`contractId`, `contractVersion`, `attemptRevision`) and re-runs `evaluateAcceptance` via the shared `evaluateAcceptanceForAttempt` function. On match: inserts an `approvals` row, records an `accepted` decision, and sets `work_items.lifecycle = completed`. On mismatch: records a `rejected` decision with reason `APPROVAL_VERSION_MISMATCH` and leaves the item `pending_human`. The command is idempotent by `commandId`; a repeated call returns the stored result with `replayed: true`.
 
 ### Testing
 
@@ -47,11 +48,13 @@ DATABASE_URL=postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test pnpm --fi
 
 ## Network isolation
 
-The coordinator binds to `AGENCYHQ_BIND_HOST` (default `127.0.0.1`). The
-HTTP API has no authentication and must not be exposed beyond the host;
-bearer auth is planned but not yet implemented. All coordinator-to-Trigger
-communication uses the Trigger secret key held only by the coordinator
-process.
+The coordinator binds to `AGENCYHQ_BIND_HOST` (default `127.0.0.1`). All
+`/api/*` routes except `/api/health` require an `Authorization: Bearer
+<token>` header matching `AGENCYHQ_API_TOKEN`. When `AGENCYHQ_API_TOKEN` is
+unset and the bind host is not loopback, the server fails closed at startup.
+Loopback without a token is allowed but logs a startup warning. All
+coordinator-to-Trigger communication uses the Trigger secret key held only
+by the coordinator process.
 
 ## Running
 

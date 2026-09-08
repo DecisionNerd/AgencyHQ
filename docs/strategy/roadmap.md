@@ -62,6 +62,15 @@ on it.
   no Approval, ~150 s end to end). 847 unit tests, 114 integration tests (as of
   rework-4, 2026-09-08; unchanged from rework-3; earlier counts were 787 unit / 86 integration). Full
   record: [trials/2026-09-slice3.md](../engineering/trials/2026-09-slice3.md).
+- Post-rework issues wave (2026-09-07, branch issues-1-8): parking-path tests
+  added (`flow.parking.test.ts`: null-commit contract failure, humanRequired
+  pending_human — issues #1, #6 open items); `approve` command and
+  `approve.test.ts` (issue #2); bearer auth on `/api/*` with `AGENCYHQ_API_TOKEN`,
+  web client token prompt on 401 (issue #3); `verify.run` `integrity` field
+  consumed by coordinator — union of adapter and coordinator sets, both sides
+  in finding evidence (issue #6); `opencode-smoke.ts` exits 2 without `--model`
+  or `AGENCYHQ_OPENCODE_MODEL` (issue #7); `lead.plan` runs tagged `project:`
+  and `workItem:` (issue #8 part 1).
 
 ## Slice 4 — integration boundaries and multiple repositories (current)
 

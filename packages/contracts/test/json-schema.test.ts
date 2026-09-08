@@ -4,6 +4,7 @@ import { LeadPlanOutputSchema } from "../src/lead-proposal.ts";
 import { jsonSchemaFor, LEAD_OUTPUT_JSON_SCHEMAS } from "../src/opencode/json-schema.ts";
 import { AcceptanceProposalSchema } from "../src/tasks/lead-accept.ts";
 import { ReviewOutputSchema } from "../src/tasks/lead-review.ts";
+import { VerifyRunOutputSchema } from "../src/tasks/verify-run.ts";
 
 test("jsonSchemaFor: converts LeadPlanOutputSchema without throwing", () => {
   const schema = jsonSchemaFor(LeadPlanOutputSchema);
@@ -38,6 +39,17 @@ test("LEAD_OUTPUT_JSON_SCHEMAS.reviewOutput: contains 'findings' key reference",
 test("LEAD_OUTPUT_JSON_SCHEMAS.acceptanceProposal: contains 'accept' key reference", () => {
   const s = LEAD_OUTPUT_JSON_SCHEMAS.acceptanceProposal;
   assert.ok(JSON.stringify(s).includes("accept"));
+});
+
+test("jsonSchemaFor: converts VerifyRunOutputSchema without throwing", () => {
+  const schema = jsonSchemaFor(VerifyRunOutputSchema);
+  assert.ok(typeof schema === "object" && schema !== null);
+  const schemaStr = JSON.stringify(schema);
+  assert.ok(schemaStr.includes("integrity"), "JSON schema should reference 'integrity' field");
+  assert.ok(
+    schemaStr.includes("tamperedPaths"),
+    "JSON schema should reference 'tamperedPaths' field",
+  );
 });
 
 test("LEAD_OUTPUT_JSON_SCHEMAS: uses draft-2020-12 schema URI", () => {

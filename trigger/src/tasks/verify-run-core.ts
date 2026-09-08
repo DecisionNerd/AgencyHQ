@@ -1,6 +1,6 @@
 // Pure/injectable pieces of the `verify.run` task (ADR-0007 item 5,
 // docs/engineering/adrs/0007-worker-effect-model.md lines 39-41), factored
-// out so they can be unit-tested without importing `@trigger.dev/sdk`.
+// out so they can be unit-tested in isolation from the Trigger SDK.
 // No Trigger SDK usage; no direct child_process/fs calls except through
 // injected dependencies.
 //

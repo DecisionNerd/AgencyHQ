@@ -95,8 +95,16 @@ const flow = new BoundedRepairFlow(flowDeps);
 const reconciler = new Reconciler(flowDeps, flow, { uncertainAfterMs: config.uncertainAfterMs });
 reconciler.start(config.reconcileIntervalMs);
 
-// Construct command handlers
-const commands = commandHandlers({ pool, runtime, clock });
+// Construct command handlers (workerModel required for approve command evaluation)
+const commands = commandHandlers({
+  pool,
+  runtime,
+  clock,
+  config: {
+    workerModel: config.workerModel,
+    uncertainAfterMs: config.uncertainAfterMs,
+  },
+});
 
 // Build and serve the app
 const app = createApp({
@@ -120,6 +128,14 @@ const server = serve({
   port: config.port,
   hostname: config.bindHost,
 });
+
+// Warn when API runs without bearer-token protection (loopback-only allowed without a token).
+if (!config.apiToken) {
+  console.warn(
+    "WARNING: AGENCYHQ_API_TOKEN is not set. The API has no bearer-token protection. " +
+      "Set AGENCYHQ_API_TOKEN to enable authentication.",
+  );
+}
 
 // Log startup facts (no secrets)
 const webDistPresent = config.webDist !== undefined && existsSync(config.webDist);

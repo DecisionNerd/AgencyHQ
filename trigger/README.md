@@ -79,6 +79,10 @@ model (ADR-0007): no Trigger SDK usage, node built-ins only.
 `scripts/opencode-smoke.ts` exercises `opencode.ts` end to end against a
 disposable temp fixture repo and worktree: an allowed edit, three
 escape-path attempts, a `git push`, and a `task`-tool attempt, run once each.
+The model id is required: pass `--model <model-id>` or set
+`AGENCYHQ_OPENCODE_MODEL`; when neither is present the script writes a usage
+message to stderr and exits with code 2 (tested by
+`trigger/test/opencode-smoke-args.test.ts`).
 
 ## Tasks and scripts
 

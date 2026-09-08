@@ -200,6 +200,35 @@ test("VerifyRunOutputSchema: parses a valid output", () => {
   assert.equal(r.success, true, JSON.stringify(r));
 });
 
+test("VerifyRunOutputSchema: parses output with integrity field (adapter shape)", () => {
+  // Shape matches verify-run-core.ts return value; diffDigestMatches is
+  // stripped by Zod but integrity itself must survive.
+  const output = {
+    results: [validVerificationResult],
+    integrity: {
+      diffDigestMatches: true,
+      tamperedPaths: ["trigger/src/tasks/verify-run-core.ts"],
+      protectedPathsSource: "payload" as const,
+    },
+  };
+  const r = VerifyRunOutputSchema.safeParse(output);
+  assert.equal(r.success, true, JSON.stringify(r));
+  assert.ok(
+    r.success && r.data.integrity !== undefined,
+    "integrity field must be present after parse",
+  );
+  assert.deepEqual(r.success && r.data.integrity?.tamperedPaths, [
+    "trigger/src/tasks/verify-run-core.ts",
+  ]);
+  assert.equal(r.success && r.data.integrity?.protectedPathsSource, "payload");
+});
+
+test("VerifyRunOutputSchema: parses output without integrity field (backward compat)", () => {
+  const r = VerifyRunOutputSchema.safeParse({ results: [] });
+  assert.equal(r.success, true, JSON.stringify(r));
+  assert.ok(r.success && r.data.integrity === undefined, "integrity should be absent");
+});
+
 // --- LeadReviewPayload (independence invariant) ---
 
 test("LeadReviewPayloadSchema: has no sessionId/transcript/conversation key", () => {

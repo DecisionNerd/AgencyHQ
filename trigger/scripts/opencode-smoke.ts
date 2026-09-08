@@ -2,9 +2,8 @@
 // fixture repo, adds one worktree, and runs four tiny scenarios against the
 // real `opencode` binary to observe what the permission ruleset, scrubbed
 // env, and OPENCODE_DISABLE_PROJECT_CONFIG actually do. Not a node:test
-// suite; run manually with `node --env-file=.env scripts/opencode-smoke.ts`
-// (no `.env` values are required, but the flag matches the package's other
-// scripts). No Trigger SDK usage.
+// suite; run manually with `AGENCYHQ_OPENCODE_MODEL=<id> node scripts/opencode-smoke.ts`
+// or `node scripts/opencode-smoke.ts --model <model-id>`. No Trigger SDK usage.
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,7 +22,32 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const MODEL = process.env.AGENCYHQ_OPENCODE_MODEL ?? "opencode/big-pickle";
+/**
+ * Resolve the OpenCode model id from CLI args or the environment.
+ * Returns { model } on success or { error } when neither source is present.
+ * Pure: does not call process.exit.
+ */
+export function resolveModel(
+  argv: string[],
+  env: Partial<Record<string, string>>,
+): { model: string } | { error: string } {
+  const flagIdx = argv.indexOf("--model");
+  if (flagIdx !== -1) {
+    const next = argv[flagIdx + 1];
+    if (next !== undefined && !next.startsWith("-")) {
+      return { model: next };
+    }
+  }
+  const fromEnv = env["AGENCYHQ_OPENCODE_MODEL"];
+  if (fromEnv) {
+    return { model: fromEnv };
+  }
+  return {
+    error:
+      "Usage: AGENCYHQ_OPENCODE_MODEL=<model-id> node scripts/opencode-smoke.ts\n" +
+      "       node scripts/opencode-smoke.ts --model <model-id>",
+  };
+}
 
 async function git(args: string[], cwd: string): Promise<string> {
   const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: 16 * 1024 * 1024 });
@@ -72,6 +96,7 @@ async function runScenario(args: {
   attemptId: string;
   allowedPaths: string[];
   smokeRoot: string;
+  model: string;
 }): Promise<ScenarioOutcome> {
   const runDir = join(args.smokeRoot, args.name);
   await mkdir(runDir, { recursive: true });
@@ -80,7 +105,7 @@ async function runScenario(args: {
     allowedPaths: args.allowedPaths,
     worktreePath: args.worktreePath,
   });
-  await writeRunConfig({ runDir, model: MODEL, ruleset });
+  await writeRunConfig({ runDir, model: args.model, ruleset });
 
   const env = scrubbedChildEnv({ attemptId: args.attemptId });
 
@@ -88,7 +113,7 @@ async function runScenario(args: {
     worktreePath: args.worktreePath,
     runDir,
     prompt: args.prompt,
-    model: MODEL,
+    model: args.model,
     env,
   });
 
@@ -123,6 +148,13 @@ async function runScenario(args: {
 }
 
 async function main(): Promise<void> {
+  const resolved = resolveModel(process.argv.slice(2), process.env);
+  if ("error" in resolved) {
+    process.stderr.write(resolved.error + "\n");
+    process.exit(2);
+  }
+  const { model } = resolved;
+
   const { repoPath, baseRev } = await makeFixtureRepo();
   const worktreePath = join(tmpdir(), `agencyhq-opencode-smoke-wt-${Date.now()}`);
   await worktreeAdd({ repoPath, worktreePath, rev: baseRev });
@@ -161,6 +193,7 @@ async function main(): Promise<void> {
       attemptId: `smoke-${scenario.name}`,
       allowedPaths,
       smokeRoot,
+      model,
     });
     outcomes.push(outcome);
     console.log(`\n=== scenario ${scenario.name} ===`);
@@ -179,7 +212,12 @@ async function main(): Promise<void> {
   console.log(`Fixture repo: ${repoPath}`);
 }
 
-main().catch((error: unknown) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+// Guard top-level execution so that importing this module for tests does not
+// trigger the smoke run.
+const _scriptPath = process.argv[1] ?? "";
+if (_scriptPath.endsWith("opencode-smoke.ts") || _scriptPath.endsWith("opencode-smoke.js")) {
+  main().catch((error: unknown) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

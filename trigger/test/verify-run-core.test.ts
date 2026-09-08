@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import type { VerificationResult, VerifyRunPayload } from "@agencyhq/contracts";
-import { VerificationResultSchema } from "@agencyhq/contracts";
+import { VerificationResultSchema, VerifyRunOutputSchema } from "@agencyhq/contracts";
 import { changedPaths, diffDigest, worktreeAdd, worktreeRemove } from "../src/lib/git.ts";
 import type {
   RunProfileInput,
@@ -576,6 +576,118 @@ test("protectedPathsSource: explicit protectedPaths records source=payload", asy
       output.integrity.protectedPathsSource,
       "payload",
       "explicit protectedPaths should record source=payload",
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// I2.d: VerifyRunOutputSchema conformance (adapter contract shape)
+// ---------------------------------------------------------------------------
+
+// T16: contract shape (without diffDigestMatches) parses with VerifyRunOutputSchema
+// and retains integrity.tamperedPaths and integrity.protectedPathsSource —
+// the "default" (no payload.protectedPaths) case.
+test("contract output shape parses with VerifyRunOutputSchema and retains integrity fields (source=default)", async () => {
+  const fixture = await makeFixture({ includeTamperedFile: true });
+  try {
+    const payload = makePayload(fixture); // no protectedPaths -> source=default
+    const { runner } = makeFakeRunner();
+    const deps = makeDeps(runner);
+
+    const raw = await runVerification(payload, deps);
+
+    // Simulate what the adapter does: strip the internal diffDigestMatches field.
+    const { diffDigestMatches: _dm, ...contractIntegrity } = raw.integrity;
+    const contractOutput = { results: raw.results, integrity: contractIntegrity };
+
+    // Must parse successfully.
+    const parsed = VerifyRunOutputSchema.safeParse(contractOutput);
+    assert.equal(
+      parsed.success,
+      true,
+      `VerifyRunOutputSchema.safeParse failed: ${JSON.stringify(parsed)}`,
+    );
+
+    // Parsed value must retain the integrity sub-fields.
+    assert.ok(parsed.data?.integrity, "parsed output must have integrity");
+    assert.ok(
+      Array.isArray(parsed.data?.integrity?.tamperedPaths),
+      "integrity.tamperedPaths must be an array",
+    );
+    assert.equal(
+      parsed.data?.integrity?.protectedPathsSource,
+      "default",
+      "integrity.protectedPathsSource must be 'default' when no protectedPaths in payload",
+    );
+
+    // No extra keys inside integrity beyond what the schema declares.
+    const integrityKeys = Object.keys(contractOutput.integrity).sort();
+    const parsedIntegrityKeys = Object.keys(parsed.data?.integrity ?? {}).sort();
+    assert.deepEqual(
+      integrityKeys,
+      ["protectedPathsSource", "tamperedPaths"],
+      `contract integrity must have only the schema keys, got: ${JSON.stringify(integrityKeys)}`,
+    );
+    assert.deepEqual(
+      parsedIntegrityKeys,
+      ["protectedPathsSource", "tamperedPaths"],
+      `parsed integrity must have only the schema keys, got: ${JSON.stringify(parsedIntegrityKeys)}`,
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+// T17: same conformance check for the "payload" source case.
+test("contract output shape parses with VerifyRunOutputSchema and retains integrity fields (source=payload)", async () => {
+  const fixture = await makeFixture({ includeTamperedFile: false });
+  try {
+    const payload = makePayload(fixture, {
+      protectedPaths: ["src/critical-verifier.ts"],
+    }); // explicit protectedPaths -> source=payload
+    const { runner } = makeFakeRunner();
+    const deps = makeDeps(runner);
+
+    const raw = await runVerification(payload, deps);
+
+    // Simulate what the adapter does: strip the internal diffDigestMatches field.
+    const { diffDigestMatches: _dm, ...contractIntegrity } = raw.integrity;
+    const contractOutput = { results: raw.results, integrity: contractIntegrity };
+
+    // Must parse successfully.
+    const parsed = VerifyRunOutputSchema.safeParse(contractOutput);
+    assert.equal(
+      parsed.success,
+      true,
+      `VerifyRunOutputSchema.safeParse failed: ${JSON.stringify(parsed)}`,
+    );
+
+    // Parsed value must retain the integrity sub-fields.
+    assert.ok(parsed.data?.integrity, "parsed output must have integrity");
+    assert.ok(
+      Array.isArray(parsed.data?.integrity?.tamperedPaths),
+      "integrity.tamperedPaths must be an array",
+    );
+    assert.equal(
+      parsed.data?.integrity?.protectedPathsSource,
+      "payload",
+      "integrity.protectedPathsSource must be 'payload' when protectedPaths is explicit",
+    );
+
+    // No extra keys inside integrity beyond what the schema declares.
+    const integrityKeys = Object.keys(contractOutput.integrity).sort();
+    const parsedIntegrityKeys = Object.keys(parsed.data?.integrity ?? {}).sort();
+    assert.deepEqual(
+      integrityKeys,
+      ["protectedPathsSource", "tamperedPaths"],
+      `contract integrity must have only the schema keys, got: ${JSON.stringify(integrityKeys)}`,
+    );
+    assert.deepEqual(
+      parsedIntegrityKeys,
+      ["protectedPathsSource", "tamperedPaths"],
+      `parsed integrity must have only the schema keys, got: ${JSON.stringify(parsedIntegrityKeys)}`,
     );
   } finally {
     await cleanupFixture(fixture);

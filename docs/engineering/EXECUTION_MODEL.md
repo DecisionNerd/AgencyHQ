@@ -6,12 +6,15 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
 
 ## Lifecycle of one step
 
-1. **Plan.** The coordinator dispatches `lead.plan` for the WorkItem. The Lead
-   proposal is checked against delegated authority; the result is a Decision
-   and a frozen StepContract (or a pending human decision). The proposed
-   `profileId` must come from the project's verification profile catalog; a
-   proposal naming an unlisted profile becomes a `pending_human` decision with
-   `PROFILE_NOT_IN_CATALOG` and is not retried automatically.
+1. **Plan.** The coordinator dispatches `lead.plan` for the WorkItem, tagged
+   `project:<id>` and `workItem:<id>` so the operator view's realtime
+   subscription can track it. The Lead proposal is checked against delegated
+   authority; the result is a Decision and a frozen StepContract (or a pending
+   human decision). The proposed `profileId` must come from the project's
+   verification profile catalog; a proposal naming an unlisted profile becomes
+   a `pending_human` decision with `PROFILE_NOT_IN_CATALOG` and is not retried
+   automatically. Realtime evaluation of plan runs is Slice 4 trial scope
+   (planned).
 2. **Admit.** The coordinator confirms rank, budget, and that every bound the
    contract requires is enforceable by the runtime. It records an Attempt with
    a new authority generation and a DispatchIntent, in one transaction.
@@ -32,7 +35,10 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    run by id; tags are used by the operator view's realtime subscription. On a
    final status it stores the report and classifies the outcome (below).
    A worker output with a null commit id (nothing changed) is classified as a
-   failure; no Artifact is created (untested: no test covers this path yet).
+   failure; no Artifact is created. Covered by `flow.parking (a)`
+   (`apps/coordinator/test/integration/flow.parking.test.ts`): one `failures`
+   row (`class='contract'`, `phase='final'`), `attempt.status='failed'`, no
+   artifact, no `verify.run` dispatch.
    A completed run with a valid commit id has its Artifact stored. Status
    updates (completion, quarantine, failure) are guarded by the attempt's
    expected prior status (`WHERE status IN ('admitted','dispatched','running')`);
@@ -51,9 +57,14 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    proposal names every criterion, cites passing results, and has no blocking
    Review finding, then records the acceptance Decision. If the authority
    schema requires it (`humanRequired` is true), the work item is parked as
-   `pending_human` until a matching Approval exists (untested: no test covers
-   this parking path yet). No Approval write path (command or API) exists yet;
-   this is Slice 4 scope.
+   `pending_human` until a matching Approval exists. The `approve` command
+   (`POST /api/commands` with `kind: "approve"`, fields `contractId`,
+   `contractVersion`, `attemptRevision`) writes an `approvals` row and
+   re-runs acceptance via `evaluateAcceptanceForAttempt`; the command is
+   idempotent by `commandId`. `APPROVAL_VERSION_MISMATCH` leaves the item
+   `pending_human`. Covered by `flow.parking (b)`
+   (`apps/coordinator/test/integration/flow.parking.test.ts`) and
+   `apps/coordinator/test/integration/approve.test.ts`.
 9. **Integrate** (merge or deploy boundaries only). `integrate.merge` runs with
    an operation-scoped credential, serialized per repository, idempotent by
    attempt and target revision.

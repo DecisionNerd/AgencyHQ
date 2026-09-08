@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Freshness, Item, PendingDecision, ReturnView, State, Stop } from "./api.js";
-import { fetchReturnView, postCommand } from "./api.js";
+import { fetchReturnView, postCommand, setToken, UnauthorizedError } from "./api.js";
 import { ExecutionState } from "./ExecutionState.js";
 import { isStale, orderItems, stopBadge } from "./view-helpers.js";
 
@@ -91,6 +91,61 @@ function FreshnessBar({ freshness, now }: { freshness: Freshness; now: Date }) {
   );
 }
 
+// ---- Token entry form -------------------------------------------------------
+
+interface TokenFormProps {
+  onSubmit: (token: string) => void;
+  submitting: boolean;
+  error: string | null;
+}
+
+function TokenForm({ onSubmit, submitting, error }: TokenFormProps) {
+  const [value, setValue] = useState("");
+  return (
+    <div className="layout">
+      <div className="header">
+        <h1>AgencyHQ</h1>
+      </div>
+      <div className="section">
+        <p role="status">Authentication required: enter your API token to continue.</p>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            onSubmit(value);
+          }}
+        >
+          <div
+            style={{ display: "flex", flexDirection: "column", gap: "0.5rem", maxWidth: "24rem" }}
+          >
+            <label htmlFor="api-token">API token</label>
+            <input
+              id="api-token"
+              type="text"
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              disabled={submitting}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button
+              type="submit"
+              className="btn-primary"
+              disabled={submitting || value.trim() === ""}
+            >
+              {submitting ? "Submitting..." : "Submit"}
+            </button>
+          </div>
+        </form>
+        {error && (
+          <div className="error-box" role="alert" style={{ marginTop: "0.75rem" }}>
+            {error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ---- Main App -------------------------------------------------------------
 
 export function App() {
@@ -98,27 +153,56 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [acking, setAcking] = useState(false);
+  const [unauthorized, setUnauthorized] = useState(false);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+  const [tokenSubmitting, setTokenSubmitting] = useState(false);
   const [now] = useState(() => new Date());
 
-  const lastAckAt = typeof localStorage !== "undefined" ? localStorage.getItem(ACK_KEY) : null;
+  // Use a ref so load() doesn't change identity when lastAckAt changes.
+  const lastAckAtRef = useRef<string | null>(
+    typeof localStorage !== "undefined" ? localStorage.getItem(ACK_KEY) : null,
+  );
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    fetchReturnView(lastAckAt)
+    fetchReturnView(lastAckAtRef.current)
       .then((data) => {
         setView(data);
         setLoading(false);
       })
       .catch((err: unknown) => {
-        setError(err instanceof Error ? err.message : String(err));
+        if (err instanceof UnauthorizedError) {
+          setUnauthorized(true);
+        } else {
+          setError(err instanceof Error ? err.message : String(err));
+        }
         setLoading(false);
       });
-  }, [lastAckAt]);
+  }, []);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  const handleTokenSubmit = async (token: string) => {
+    setTokenSubmitting(true);
+    setTokenError(null);
+    setToken(token);
+    try {
+      const data = await fetchReturnView(lastAckAtRef.current);
+      setUnauthorized(false);
+      setView(data);
+    } catch (err: unknown) {
+      if (err instanceof UnauthorizedError) {
+        setTokenError("Token rejected: unauthorized. Check the token and try again.");
+      } else {
+        setTokenError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      setTokenSubmitting(false);
+    }
+  };
 
   const handleAckVisit = async () => {
     setAcking(true);
@@ -126,14 +210,25 @@ export function App() {
       await postCommand({ kind: "ack_visit" });
       const ts = new Date().toISOString();
       localStorage.setItem(ACK_KEY, ts);
+      lastAckAtRef.current = ts;
       // Reload the view with the new ack time
       load();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (err instanceof UnauthorizedError) {
+        setUnauthorized(true);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setAcking(false);
     }
   };
+
+  if (unauthorized) {
+    return (
+      <TokenForm onSubmit={handleTokenSubmit} submitting={tokenSubmitting} error={tokenError} />
+    );
+  }
 
   const mainEffortId = view?.mainEffort ?? null;
 
