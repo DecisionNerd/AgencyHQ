@@ -140,6 +140,43 @@ export function workerCompletedOutput(
   };
 }
 
+/**
+ * Build a null-commit completed output for tests.
+ * The run status is COMPLETED and outcome is "completed", but commitId is null.
+ * This is the F-14 scenario: worker claimed to finish but produced no commit.
+ */
+export function workerNullCommitOutput(
+  attemptId: string,
+): import("@agencyhq/contracts").WorkerAttemptOutput {
+  return {
+    attemptId,
+    sessionId: "session-null-commit",
+    outcome: "completed",
+    worktreePath: `/worktrees/${attemptId}`,
+    runDir: `/worktrees/${attemptId}/.run`,
+    commitId: null,
+    diffDigest: null,
+    changedPaths: [],
+    pathViolations: [],
+    checkpointCommit: null,
+    survivors: [],
+    opencode: {
+      sessionID: "ocsess-null-commit",
+      exitCode: 0,
+      denials: [],
+      errors: [],
+    },
+    report: {
+      attempted: "Ran to completion but produced no commit",
+      outputs: [],
+      checksRun: [],
+      unmetCriteria: [],
+      limitations: ["No commit produced"],
+      findings: [],
+    },
+  };
+}
+
 export function workerTimedOutOutput(
   attemptId: string,
 ): import("@agencyhq/contracts").WorkerAttemptOutput {
