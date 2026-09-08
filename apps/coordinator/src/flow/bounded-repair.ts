@@ -41,6 +41,8 @@ import {
 } from "@agencyhq/contracts";
 import { applyObservation, claimCommand, completeCommand, type createPool } from "@agencyhq/db";
 import {
+  type AcceptanceFailureReason,
+  type ApprovalLike,
   type ArtifactId,
   type AttemptId,
   checkProposal,
@@ -303,6 +305,127 @@ function triggerTags(opts: {
     `contract:${opts.contractId}:${opts.contractVersion}`,
     `attempt:${opts.attemptId}`,
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Shared acceptance evaluation — used by onAcceptFinal and approveWorkItem
+// ---------------------------------------------------------------------------
+
+/**
+ * Context returned by evaluateAcceptanceForAttempt.
+ * Provides everything the caller needs to record the decision and update state.
+ */
+export type AcceptanceEvalContext = {
+  acceptResult: { ok: true } | { ok: false; reasons: AcceptanceFailureReason[] };
+  humanRequired: boolean;
+  workItemId: string;
+  contractId: string;
+  contractVersion: number;
+  attemptId: string;
+  artifactRevision: string;
+  profileId: string;
+};
+
+/**
+ * Load all data needed for acceptance evaluation and run the domain gate.
+ *
+ * Called by onAcceptFinal (approval=undefined, normal flow) and by the
+ * approve command (with the human Approval supplied).  Avoids duplication
+ * of the acceptance-evaluation rule (R-001).
+ */
+export async function evaluateAcceptanceForAttempt(
+  pool: Pool,
+  config: Pick<import("./types.ts").FlowConfig, "workerModel">,
+  attemptId: string,
+  proposal: import("@agencyhq/contracts").AcceptanceProposal,
+  approval?: ApprovalLike,
+): Promise<AcceptanceEvalContext> {
+  const attemptRow = await loadAttempt(pool, attemptId);
+  const contractRow = await loadContract(pool, attemptRow.contract_id);
+  const artifactRow = await loadArtifact(pool, attemptRow.id);
+  const reviewRow = await loadReview(pool, attemptRow.id);
+  const verificationResults = await loadVerificationResults(pool, attemptRow.id);
+
+  // Load blocking verifier_tampered findings for this attempt (R-017).
+  const { rows: integrityFindingRows } = await pool.query(
+    `SELECT id, severity, kind, description, evidence FROM findings
+     WHERE attempt_id = $1 AND kind = 'verifier_tampered' AND severity = 'blocking'`,
+    [attemptRow.id],
+  );
+  const integrityFindings = integrityFindingRows.map(
+    (r: { id: string; severity: string; kind: string; description: string; evidence: string }) => ({
+      id: r.id,
+      severity: r.severity as "blocking" | "non_blocking",
+      kind: r.kind,
+      description: r.description,
+      evidence: r.evidence ?? "",
+    }),
+  );
+
+  const acceptResult = evaluateAcceptance({
+    contract: {
+      id: contractRow.id,
+      workItemId: contractRow.work_item_id,
+      projectId: contractRow.project_id,
+      version: contractRow.version,
+      baseRevision: contractRow.base_revision,
+      inputs: contractRow.inputs,
+      criteria: contractRow.criteria,
+      criteriaDigest: contractRow.criteria_digest,
+      profileId: contractRow.profile_id,
+      profileDigest: contractRow.profile_digest,
+      bounds: contractRow.bounds,
+      requiredBoundaries: contractRow.required_boundaries as BoundaryKind[],
+      humanRequired: contractRow.human_required,
+      status: contractRow.status as "active" | "superseded",
+    },
+    attempt: {
+      id: attemptRow.id,
+      contractId: attemptRow.contract_id,
+      contractVersion: attemptRow.contract_version,
+      generation: attemptRow.generation,
+    },
+    artifact: {
+      revision: artifactRow?.revision ?? "",
+      diffDigest: (artifactRow?.diff_digest ?? "") as Digest,
+      changedPaths: artifactRow?.changed_paths ?? [],
+    },
+    results: verificationResults,
+    review: reviewRow
+      ? {
+          attemptRevision: reviewRow.attempt_revision ?? "",
+          diffDigest: (reviewRow.diff_digest ?? "") as Digest,
+          criteriaDigest: (reviewRow.criteria_digest ?? "") as Digest,
+          profileDigest: (reviewRow.profile_digest ?? "") as Digest,
+          reviewerModel: reviewRow.reviewer_model ?? "",
+          profile: (reviewRow.profile ?? "lead_inspection") as ReviewProfile,
+          findings: reviewRow.findings as Array<{
+            id: string;
+            severity: "blocking" | "non_blocking";
+            kind: string;
+            description: string;
+            evidence: string;
+            disposition?: string;
+          }>,
+        }
+      : undefined,
+    proposal,
+    approval,
+    reviewerMustDiffer: contractRow.bounds?.models?.reviewer !== contractRow.bounds?.models?.worker,
+    workerModel: config.workerModel,
+    integrityFindings,
+  });
+
+  return {
+    acceptResult,
+    humanRequired: contractRow.human_required,
+    workItemId: contractRow.work_item_id,
+    contractId: contractRow.id,
+    contractVersion: contractRow.version,
+    attemptId: attemptRow.id,
+    artifactRevision: artifactRow?.revision ?? "",
+    profileId: contractRow.profile_id,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1358,103 +1481,25 @@ export class BoundedRepairFlow {
       const intentRow = await loadIntentByRunAndTask(pool, obs.runId, TASK_IDS.leadAccept);
       if (!intentRow.attempt_id) throw new Error(`Intent ${intentRow.id} has no attempt_id`);
 
-      const attemptRow = await loadAttempt(pool, intentRow.attempt_id);
-      const contractRow = await loadContract(pool, attemptRow.contract_id);
-      const artifactRow = await loadArtifact(pool, attemptRow.id);
-      const reviewRow = await loadReview(pool, attemptRow.id);
-      const verificationResults = await loadVerificationResults(pool, attemptRow.id);
-      const _resolvedProfile = await profileResolver(contractRow.profile_id);
-
-      // Load blocking verifier_tampered findings for this attempt (R-017).
-      const { rows: integrityFindingRows } = await pool.query(
-        `SELECT id, severity, kind, description, evidence FROM findings
-         WHERE attempt_id = $1 AND kind = 'verifier_tampered' AND severity = 'blocking'`,
-        [attemptRow.id],
-      );
-      const integrityFindings = integrityFindingRows.map(
-        (r: {
-          id: string;
-          severity: string;
-          kind: string;
-          description: string;
-          evidence: string;
-        }) => ({
-          id: r.id,
-          severity: r.severity as "blocking" | "non_blocking",
-          kind: r.kind,
-          description: r.description,
-          evidence: r.evidence ?? "",
-        }),
-      );
-
       const proposalResult = AcceptanceProposalSchema.safeParse(obs.output);
       if (!proposalResult.success) {
         throw new Error(`Invalid acceptance proposal: ${proposalResult.error.message}`);
       }
       const proposal = proposalResult.data;
 
-      const acceptResult = evaluateAcceptance({
-        contract: {
-          id: contractRow.id,
-          workItemId: contractRow.work_item_id,
-          projectId: contractRow.project_id,
-          version: contractRow.version,
-          baseRevision: contractRow.base_revision,
-          inputs: contractRow.inputs,
-          criteria: contractRow.criteria,
-          criteriaDigest: contractRow.criteria_digest,
-          profileId: contractRow.profile_id,
-          profileDigest: contractRow.profile_digest,
-          bounds: contractRow.bounds,
-          requiredBoundaries: contractRow.required_boundaries as BoundaryKind[],
-          humanRequired: contractRow.human_required,
-          status: contractRow.status as "active" | "superseded",
-        },
-        attempt: {
-          id: attemptRow.id,
-          contractId: attemptRow.contract_id,
-          contractVersion: attemptRow.contract_version,
-          generation: attemptRow.generation,
-        },
-        artifact: {
-          revision: artifactRow?.revision ?? "",
-          diffDigest: (artifactRow?.diff_digest ?? "") as Digest,
-          changedPaths: artifactRow?.changed_paths ?? [],
-        },
-        results: verificationResults,
-        review: reviewRow
-          ? {
-              attemptRevision: reviewRow.attempt_revision ?? "",
-              diffDigest: (reviewRow.diff_digest ?? "") as Digest,
-              criteriaDigest: (reviewRow.criteria_digest ?? "") as Digest,
-              profileDigest: (reviewRow.profile_digest ?? "") as Digest,
-              reviewerModel: reviewRow.reviewer_model ?? "",
-              profile: (reviewRow.profile ?? "lead_inspection") as ReviewProfile,
-              findings: reviewRow.findings as Array<{
-                id: string;
-                severity: "blocking" | "non_blocking";
-                kind: string;
-                description: string;
-                evidence: string;
-                disposition?: string;
-              }>,
-            }
-          : undefined,
-        proposal,
-        approval: undefined,
-        reviewerMustDiffer:
-          contractRow.bounds?.models?.reviewer !== contractRow.bounds?.models?.worker,
-        workerModel: config.workerModel,
-        integrityFindings,
-      });
+      // Use shared acceptance-evaluation function (also used by the approve command).
+      const ctx = await evaluateAcceptanceForAttempt(pool, config, intentRow.attempt_id, proposal);
+      // Preserve existing profileResolver side-effect (no behaviour change).
+      await profileResolver(ctx.profileId);
 
+      const { acceptResult } = ctx;
       const at = new Date();
       const decisionId = ids.next("dec") as DecisionId;
 
       // F-14: humanRequired contract reaching accept without an Approval emits
       // pending_human (not silently rejected) so the work item stays active.
       if (
-        contractRow.human_required &&
+        ctx.humanRequired &&
         !acceptResult.ok &&
         acceptResult.reasons?.some((r) => r.code === "APPROVAL_REQUIRED")
       ) {
@@ -1465,10 +1510,10 @@ export class BoundedRepairFlow {
            VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'pending_human', $6)`,
           [
             String(decisionId),
-            contractRow.work_item_id,
-            contractRow.id,
-            contractRow.version,
-            attemptRow.id,
+            ctx.workItemId,
+            ctx.contractId,
+            ctx.contractVersion,
+            ctx.attemptId,
             at,
           ],
         );
@@ -1487,7 +1532,7 @@ export class BoundedRepairFlow {
       }
 
       if (acceptResult.ok) {
-        const revision = artifactRow?.revision ?? "";
+        const revision = ctx.artifactRevision;
 
         await client.query("BEGIN");
         await client.query(
@@ -1496,10 +1541,10 @@ export class BoundedRepairFlow {
            VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'accepted', $6)`,
           [
             String(decisionId),
-            contractRow.work_item_id,
-            contractRow.id,
-            contractRow.version,
-            attemptRow.id,
+            ctx.workItemId,
+            ctx.contractId,
+            ctx.contractVersion,
+            ctx.attemptId,
             at,
           ],
         );
@@ -1508,7 +1553,7 @@ export class BoundedRepairFlow {
            SET lifecycle = 'completed', boundary = 'artifact',
                version = version + 1, updated_at = now()
            WHERE id = $1`,
-          [contractRow.work_item_id],
+          [ctx.workItemId],
         );
         // Close incoming accept intent (F-5).
         await client.query(
@@ -1529,10 +1574,10 @@ export class BoundedRepairFlow {
            VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'rejected', $6)`,
           [
             String(decisionId),
-            contractRow.work_item_id,
-            contractRow.id,
-            contractRow.version,
-            attemptRow.id,
+            ctx.workItemId,
+            ctx.contractId,
+            ctx.contractVersion,
+            ctx.attemptId,
             at,
           ],
         );
@@ -1542,7 +1587,7 @@ export class BoundedRepairFlow {
             await client.query(
               `INSERT INTO findings (id, attempt_id, severity, kind, description, disposition)
                VALUES ($1, $2, 'non_blocking', 'unrelated', $3, 'backlog')`,
-              [String(findingId), attemptRow.id, `${fd.findingId}: ${fd.reason}`],
+              [String(findingId), ctx.attemptId, `${fd.findingId}: ${fd.reason}`],
             );
           }
         }

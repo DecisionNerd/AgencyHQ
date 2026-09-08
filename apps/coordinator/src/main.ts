@@ -95,8 +95,16 @@ const flow = new BoundedRepairFlow(flowDeps);
 const reconciler = new Reconciler(flowDeps, flow, { uncertainAfterMs: config.uncertainAfterMs });
 reconciler.start(config.reconcileIntervalMs);
 
-// Construct command handlers
-const commands = commandHandlers({ pool, runtime, clock });
+// Construct command handlers (workerModel required for approve command evaluation)
+const commands = commandHandlers({
+  pool,
+  runtime,
+  clock,
+  config: {
+    workerModel: config.workerModel,
+    uncertainAfterMs: config.uncertainAfterMs,
+  },
+});
 
 // Build and serve the app
 const app = createApp({
