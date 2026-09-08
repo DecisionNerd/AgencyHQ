@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { IntegrateMergeOutputSchema } from "@agencyhq/contracts";
 import {
   fetchRef as gitFetchRef,
   isAncestor as gitIsAncestor,
@@ -176,7 +177,7 @@ function makePayload(
     attemptId: "attempt-test-1",
     generation: 1,
     contractId: "contract-1",
-    contractVersion: "1",
+    contractVersion: 1,
     projectId: "project-1",
     repoPath: fixture.repoPath,
     remote: "origin",
@@ -438,5 +439,97 @@ test("push_rejected: remote advances between fetch and push, observedTargetRevis
   } finally {
     await fixture.cleanup();
     await rm(clone2, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Packet 4.2.c: IntegrateMergeOutputSchema conformance — each outcome parses
+// ---------------------------------------------------------------------------
+
+// IM-7: integrated outcome parses with IntegrateMergeOutputSchema
+test("IntegrateMergeOutputSchema: integrated outcome parses", async () => {
+  const fixture = await makeFixture();
+  try {
+    const payload = makePayload(fixture);
+    const deps = makeDeps(fixture);
+    const output = await runIntegrateMerge(payload, deps, fixture.runDir);
+
+    assert.equal(output.outcome, "integrated", "expected integrated outcome");
+    const parsed = IntegrateMergeOutputSchema.safeParse(output);
+    assert.equal(
+      parsed.success,
+      true,
+      `IntegrateMergeOutputSchema failed for integrated: ${JSON.stringify(parsed)}`,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// IM-8: already_integrated outcome parses with IntegrateMergeOutputSchema
+test("IntegrateMergeOutputSchema: already_integrated outcome parses", async () => {
+  const fixture = await makeFixture();
+  try {
+    const deps = makeDeps(fixture);
+    // First integration succeeds.
+    await runIntegrateMerge(makePayload(fixture), deps, fixture.runDir);
+    // Second integration with same attemptRevision is idempotent: already_integrated.
+    const runDir2 = await mkdtemp(join(tmpdir(), "agencyhq-im-rundir2-"));
+    try {
+      const output = await runIntegrateMerge(makePayload(fixture), deps, runDir2);
+      assert.equal(output.outcome, "already_integrated", "expected already_integrated outcome");
+      const parsed = IntegrateMergeOutputSchema.safeParse(output);
+      assert.equal(
+        parsed.success,
+        true,
+        `IntegrateMergeOutputSchema failed for already_integrated: ${JSON.stringify(parsed)}`,
+      );
+    } finally {
+      await rm(runDir2, { recursive: true, force: true }).catch(() => undefined);
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// IM-9: base_moved outcome parses with IntegrateMergeOutputSchema
+test("IntegrateMergeOutputSchema: base_moved outcome parses", async () => {
+  const fixture = await makeFixture();
+  try {
+    const payload = makePayload(fixture, {
+      expectedBaseRevision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    const deps = makeDeps(fixture);
+    const output = await runIntegrateMerge(payload, deps, fixture.runDir);
+
+    assert.equal(output.outcome, "base_moved", "expected base_moved outcome");
+    const parsed = IntegrateMergeOutputSchema.safeParse(output);
+    assert.equal(
+      parsed.success,
+      true,
+      `IntegrateMergeOutputSchema failed for base_moved: ${JSON.stringify(parsed)}`,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// IM-10: conflict outcome parses with IntegrateMergeOutputSchema
+test("IntegrateMergeOutputSchema: conflict outcome parses", async () => {
+  const fixture = await makeConflictFixture();
+  try {
+    const payload = makePayload(fixture, { strategy: "merge_commit" });
+    const deps = makeDeps(fixture);
+    const output = await runIntegrateMerge(payload, deps, fixture.runDir);
+
+    assert.equal(output.outcome, "conflict", "expected conflict outcome");
+    const parsed = IntegrateMergeOutputSchema.safeParse(output);
+    assert.equal(
+      parsed.success,
+      true,
+      `IntegrateMergeOutputSchema failed for conflict: ${JSON.stringify(parsed)}`,
+    );
+  } finally {
+    await fixture.cleanup();
   }
 });

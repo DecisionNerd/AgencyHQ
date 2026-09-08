@@ -23,11 +23,16 @@ import { runVerification } from "./verify-run-core.ts";
 // Real VerificationRunner backed by @agencyhq/verification
 // ---------------------------------------------------------------------------
 
-function createRealRunner(env: Record<string, string>): VerificationRunner {
+function createRealRunner(scrubEnv: Record<string, string>): VerificationRunner {
   return {
     async runProfile(input: RunProfileInput) {
       const fingerprint = await environmentFingerprint(input.cwd);
       const results = [];
+
+      // Merge the scrubbed base env with any manifest env vars injected by the core.
+      // input.env contains AGENCYHQ_MANIFEST_* and AGENCYHQ_MANIFEST_DIGEST when
+      // combined verification is active; it is empty ({}) for single-repo runs.
+      const env = { ...scrubEnv, ...input.env };
 
       for (const check of input.checks) {
         // check objects from the payload already match CheckDef shape
@@ -81,6 +86,18 @@ export const verifyRun = task({
     }
     const payload = parseResult.data;
 
+    // Extract coordinator-supplied manifest extension fields from the raw payload.
+    // These are not in the contracts schema and must be pulled directly from the raw object.
+    const rawObj = rawPayload as Record<string, unknown>;
+    const manifestProjectId =
+      typeof rawObj.manifestProjectId === "string" ? rawObj.manifestProjectId : undefined;
+    const manifestRepoPaths =
+      rawObj.manifestRepoPaths !== null &&
+      typeof rawObj.manifestRepoPaths === "object" &&
+      !Array.isArray(rawObj.manifestRepoPaths)
+        ? (rawObj.manifestRepoPaths as Record<string, string>)
+        : undefined;
+
     metadata.set("phase", "worktree_ready");
 
     // Build the scrubbed environment.  The verifier must not be able to push.
@@ -112,6 +129,8 @@ export const verifyRun = task({
       runner,
       fingerprint: buildFingerprint,
       now: () => new Date().toISOString(),
+      ...(manifestProjectId !== undefined ? { manifestProjectId } : {}),
+      ...(manifestRepoPaths !== undefined ? { manifestRepoPaths } : {}),
     });
 
     metadata.set("phase", "checks_running");

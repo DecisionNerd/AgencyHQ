@@ -14,10 +14,16 @@
 //   - Protected-path tamper findings are reported in output but do NOT change
 //     results; the coordinator maps them to Findings and the review blocks on them.
 
-import type { VerificationResult, VerifyRunOutput, VerifyRunPayload } from "@agencyhq/contracts";
+import type {
+  ManifestEntry,
+  VerificationResult,
+  VerifyRunOutput,
+  VerifyRunPayload,
+} from "@agencyhq/contracts";
 // Relative imports to the package sources (trigger has no @agencyhq/* deps).
 import { VerificationResultSchema } from "@agencyhq/contracts";
 import { DEFAULT_PROTECTED_PATHS, detectVerifierTampering } from "@agencyhq/domain";
+import { manifestEnv, siblingEntries } from "../lib/manifest.ts";
 
 // ---------------------------------------------------------------------------
 // VerificationRunner
@@ -66,11 +72,36 @@ export type VerifyRunDeps = {
   fingerprint?: () => Promise<Record<string, string>>;
   /** ISO 8601 timestamp factory. */
   now: () => string;
+  // ---- Combined manifest verification (Packet 4.2.c, R-006) ----
+  /**
+   * ProjectId of the project currently under verification.
+   * Required when `payload.manifest` is present; used to exclude the current
+   * entry and identify siblings to materialize.
+   * Coordinator-supplied; extracted from the raw payload alongside the schema.
+   */
+  manifestProjectId?: string;
+  /**
+   * Absolute paths to coordinator-owned clones of sibling repositories, keyed
+   * by projectId. Only sibling entries (not the current project) appear here.
+   * Required when `payload.manifest` is present.
+   * Coordinator-supplied; extracted from the raw payload alongside the schema.
+   */
+  manifestRepoPaths?: Record<string, string>;
 };
 
 // ---------------------------------------------------------------------------
 // RunVerificationOutput
 // ---------------------------------------------------------------------------
+
+/** Manifest materialization record included in the output when combined
+ * verification was performed (payload.manifest present + sibling repos supplied). */
+export type ManifestRecord = {
+  /** The stable manifest plan digest used for this run. */
+  digest: string;
+  /** One entry per sibling worktree that was materialized. */
+  materializedSiblings: { position: number; projectId: string; revision: string }[];
+};
+
 export type RunVerificationOutput = VerifyRunOutput & {
   integrity: {
     diffDigestMatches: boolean;
@@ -87,6 +118,13 @@ export type RunVerificationOutput = VerifyRunOutput & {
      */
     protectedPathsSource: "payload" | "default";
   };
+  /**
+   * Combined manifest verification record.
+   * Present when payload.manifest was supplied and sibling worktrees were
+   * materialized. Includes the plan digest and per-sibling revision info.
+   * Absent when no manifest was present (single-repo WorkItem).
+   */
+  manifest?: ManifestRecord;
 };
 
 /** Resolve the worktree path for a verification run. */
@@ -129,6 +167,15 @@ function errorResult(args: {
   }) as VerificationResult;
 }
 
+/** Resolve the base directory for manifest sibling worktrees within a run. */
+export function resolveManifestWorktreeDir(args: {
+  worktreeBase: string;
+  attemptId: string;
+  generation: number;
+}): string {
+  return `${args.worktreeBase}/manifest-${args.attemptId}-${args.generation}`;
+}
+
 export async function runVerification(
   payload: VerifyRunPayload,
   deps: VerifyRunDeps,
@@ -147,7 +194,76 @@ export async function runVerification(
     rev: payload.attemptRevision,
   });
 
+  // ---- Combined manifest verification setup (Packet 4.2.c, R-006) ----
+  // Materialized sibling worktrees are tracked here so the finally block can
+  // clean them up regardless of outcome.
+  const materializedSiblings: {
+    position: number;
+    projectId: string;
+    revision: string;
+    worktreePath: string;
+    repoPath: string;
+  }[] = [];
+  let manifestCheckEnv: Record<string, string> = {};
+  let manifestRecord: ManifestRecord | undefined;
+
   try {
+    // --- Manifest sibling materialization (only when manifest + deps are present) ---
+    if (
+      payload.manifest !== undefined &&
+      deps.manifestProjectId !== undefined &&
+      deps.manifestRepoPaths !== undefined
+    ) {
+      const manifest = payload.manifest;
+      const repoPaths = deps.manifestRepoPaths;
+      const siblings: ManifestEntry[] = siblingEntries(manifest.entries, deps.manifestProjectId);
+      const manifestDir = resolveManifestWorktreeDir({
+        worktreeBase: payload.worktreeBase,
+        attemptId: payload.attemptId,
+        generation: payload.generation,
+      });
+
+      const worktreePaths: Record<number, string> = {};
+
+      for (const sibling of siblings) {
+        const siblingRepoPath = repoPaths[sibling.projectId];
+        if (siblingRepoPath === undefined) {
+          // Coordinator did not supply this sibling's path; skip materialization.
+          continue;
+        }
+        const rev = sibling.resultRevision ?? sibling.expectedBaseRevision;
+        const siblingWt = `${manifestDir}/${sibling.position}`;
+
+        await deps.worktreeAdd({
+          repoPath: siblingRepoPath,
+          worktreePath: siblingWt,
+          rev,
+        });
+
+        materializedSiblings.push({
+          position: sibling.position,
+          projectId: sibling.projectId,
+          revision: rev,
+          worktreePath: siblingWt,
+          repoPath: siblingRepoPath,
+        });
+        worktreePaths[sibling.position] = siblingWt;
+      }
+
+      // Build env vars for the check environment.
+      manifestCheckEnv = manifestEnv(siblings, worktreePaths, manifest.digest);
+
+      // Record for the output.
+      manifestRecord = {
+        digest: manifest.digest,
+        materializedSiblings: materializedSiblings.map(({ position, projectId, revision }) => ({
+          position,
+          projectId,
+          revision,
+        })),
+      };
+    }
+
     // --- Integrity check: reproduce diffDigest before any check runs ---
     const computedDigest = await deps.diffDigest({
       worktreePath,
@@ -172,6 +288,7 @@ export async function runVerification(
         // protectedPathsSource is not meaningful on a digest-mismatch path since
         // tamper detection is skipped; use "default" as a safe sentinel.
         integrity: { diffDigestMatches: false, tamperedPaths: [], protectedPathsSource: "default" },
+        ...(manifestRecord !== undefined ? { manifest: manifestRecord } : {}),
       };
     }
 
@@ -199,11 +316,11 @@ export async function runVerification(
       })
       .filter((p) => p.length > 0);
 
-    // --- Run checks ---
+    // --- Run checks (with manifest env vars injected when present) ---
     const results = await deps.runner.runProfile({
       checks: payload.checks,
       cwd: worktreePath,
-      env: {},
+      env: manifestCheckEnv,
       attemptId: payload.attemptId,
       contractId: payload.contractId,
       profileId: payload.profileId,
@@ -231,8 +348,20 @@ export async function runVerification(
     return {
       results: validated,
       integrity: { diffDigestMatches: true, tamperedPaths, protectedPathsSource },
+      ...(manifestRecord !== undefined ? { manifest: manifestRecord } : {}),
     };
   } finally {
+    // Remove manifest sibling worktrees before removing the main verify worktree.
+    // Errors are swallowed so they do not mask the primary outcome.
+    for (const sibling of materializedSiblings) {
+      await deps
+        .worktreeRemove({
+          repoPath: sibling.repoPath,
+          worktreePath: sibling.worktreePath,
+          force: true,
+        })
+        .catch(() => undefined);
+    }
     // Verification worktrees are disposable; the attempt worktree is the
     // retained artifact (ADR-0007 item 5).
     await deps.worktreeRemove({ repoPath: payload.repoPath, worktreePath, force: true });
