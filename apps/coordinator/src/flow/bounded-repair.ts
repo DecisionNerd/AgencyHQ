@@ -1226,41 +1226,69 @@ export class BoundedRepairFlow {
 
       await client.query("COMMIT");
 
-      // Trigger AFTER commit (R-002)
-      const { runId } = await runtime.trigger({
-        intentId: workerIntentId,
-        task: TASK_IDS.workerAttempt,
-        payload: workerPayload,
-        options: {
-          idempotencyKey: workerIntentKey,
-          maxDurationSeconds: contract.bounds.budget.maxDurationSeconds,
-          concurrencyKey: String(contract.projectId),
-          tags: triggerTags({
-            projectId: String(contract.projectId),
-            workItemId: String(contract.workItemId),
-            contractId: String(contractId),
-            contractVersion: contract.version,
-            attemptId: String(attemptId),
-          }),
-        },
-      });
-
-      await pool.query(
-        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-        [String(workerIntentId), runId],
+      // Slot check: count active worker attempts to decide whether to dispatch
+      // immediately or queue for the scheduler (R-008, Slice 6).
+      // The check is outside the transaction — the scheduler handles races via
+      // the in-flight guard and idempotency key.
+      const workerSlots = config.workerSlots ?? 1;
+      const { rows: slotRows } = await pool.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM attempts WHERE status IN ('dispatched', 'running', 'stopping')`,
       );
-      await pool.query(
-        "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",
-        [String(attemptId), runId],
-      );
+      const activeCount = Number(slotRows[0]?.cnt ?? 0);
 
-      await completeCommand(client, commandId, {
-        decisionId: String(decisionId),
-        contractId: String(contractId),
-        attemptId: String(attemptId),
-        workerIntentId: String(workerIntentId),
-        runId,
-      });
+      if (activeCount < workerSlots) {
+        // Slot available: dispatch immediately (R-002 path).
+        // Trigger AFTER commit (R-002)
+        const { runId } = await runtime.trigger({
+          intentId: workerIntentId,
+          task: TASK_IDS.workerAttempt,
+          payload: workerPayload,
+          options: {
+            idempotencyKey: workerIntentKey,
+            maxDurationSeconds: contract.bounds.budget.maxDurationSeconds,
+            concurrencyKey: String(contract.projectId),
+            tags: triggerTags({
+              projectId: String(contract.projectId),
+              workItemId: String(contract.workItemId),
+              contractId: String(contractId),
+              contractVersion: contract.version,
+              attemptId: String(attemptId),
+            }),
+          },
+        });
+
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+          [String(workerIntentId), runId],
+        );
+        await pool.query(
+          "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",
+          [String(attemptId), runId],
+        );
+
+        await completeCommand(client, commandId, {
+          decisionId: String(decisionId),
+          contractId: String(contractId),
+          attemptId: String(attemptId),
+          workerIntentId: String(workerIntentId),
+          runId,
+        });
+      } else {
+        // No slot: move the intent to 'queued' so the scheduler can dispatch it
+        // when a slot becomes free.  The attempt stays 'admitted'.
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'queued', updated_at = now() WHERE id = $1",
+          [String(workerIntentId)],
+        );
+
+        await completeCommand(client, commandId, {
+          decisionId: String(decisionId),
+          contractId: String(contractId),
+          attemptId: String(attemptId),
+          workerIntentId: String(workerIntentId),
+          queued: true,
+        });
+      }
     } catch (err) {
       // Rollback any open transaction.
       try {

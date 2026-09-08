@@ -69,6 +69,92 @@ export async function listOpenDispatchIntents(client: pg.PoolClient): Promise<Di
   return rows.map((r) => DispatchIntentRowSchema.parse(r));
 }
 
+// ---------------------------------------------------------------------------
+// Queued worker intents (scheduler)
+// ---------------------------------------------------------------------------
+
+/**
+ * Queued worker intent with joined work item + project data for the scheduler.
+ * Returned by listQueuedWorkerIntents so scheduleOnce() can call selectDispatch.
+ */
+export type QueuedWorkerIntentRow = {
+  intent_id: string;
+  idempotency_key: string;
+  attempt_id: string;
+  attempt_generation: number;
+  work_item_id: string;
+  project_id: string;
+  wi_rank: number;
+  wi_main_effort: boolean;
+  wi_lifecycle: string;
+  wi_condition: string;
+  wi_campaign_id: string | null;
+  wi_created_at: Date | null;
+  bounds: Record<string, unknown>;
+  has_open_integrate_intent: boolean;
+};
+
+/**
+ * Load all queued worker dispatch intents with the associated work item and
+ * step contract data needed for selectDispatch.
+ *
+ * "Queued" = status = 'queued', task = 'worker.attempt'.
+ * Includes a flag indicating whether the same work item has an open
+ * integrate.merge intent (for hasOpenIntegrateIntent).
+ */
+export async function listQueuedWorkerIntents(
+  client: pg.PoolClient,
+): Promise<QueuedWorkerIntentRow[]> {
+  const { rows } = await client.query<{
+    intent_id: string;
+    idempotency_key: string;
+    attempt_id: string;
+    attempt_generation: number;
+    work_item_id: string;
+    project_id: string;
+    wi_rank: number;
+    wi_main_effort: boolean;
+    wi_lifecycle: string;
+    wi_condition: string;
+    wi_campaign_id: string | null;
+    wi_created_at: Date | null;
+    bounds: Record<string, unknown>;
+    has_open_integrate_intent: boolean;
+  }>(`
+    SELECT
+      di.id                            AS intent_id,
+      di.idempotency_key,
+      a.id                             AS attempt_id,
+      a.generation                     AS attempt_generation,
+      sc.work_item_id,
+      sc.project_id,
+      wi.rank                          AS wi_rank,
+      wi.main_effort                   AS wi_main_effort,
+      wi.lifecycle                     AS wi_lifecycle,
+      wi.condition                     AS wi_condition,
+      wi.campaign_id                   AS wi_campaign_id,
+      wi.created_at                    AS wi_created_at,
+      sc.bounds,
+      EXISTS (
+        SELECT 1
+        FROM dispatch_intents di2
+        JOIN attempts a2       ON a2.id  = di2.attempt_id
+        JOIN step_contracts s2 ON s2.id  = a2.contract_id
+        WHERE s2.work_item_id = sc.work_item_id
+          AND di2.task        = 'integrate.merge'
+          AND di2.status      = 'triggered'
+      )                                AS has_open_integrate_intent
+    FROM dispatch_intents di
+    JOIN attempts       a  ON a.id  = di.attempt_id
+    JOIN step_contracts sc ON sc.id = a.contract_id
+    JOIN work_items     wi ON wi.id = sc.work_item_id
+    WHERE di.status = 'queued'
+      AND di.task   = 'worker.attempt'
+    ORDER BY di.created_at
+  `);
+  return rows as QueuedWorkerIntentRow[];
+}
+
 /**
  * Transition a dispatch intent's status.
  * Uses optimistic concurrency: WHERE id = $1 AND status = $2.

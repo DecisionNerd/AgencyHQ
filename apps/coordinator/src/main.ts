@@ -86,6 +86,7 @@ const flowDeps: FlowDeps = {
     verifierName: "agencyhq/verify.run",
     leadVariant: config.leadVariant,
     uncertainAfterMs: config.uncertainAfterMs,
+    workerSlots: config.workerSlots,
     ...(config.integrateRetries !== undefined ? { integrateRetries: config.integrateRetries } : {}),
   },
   profileResolver,
@@ -93,7 +94,11 @@ const flowDeps: FlowDeps = {
 
 // Construct flow and reconciler
 const flow = new BoundedRepairFlow(flowDeps);
-const reconciler = new Reconciler(flowDeps, flow, { uncertainAfterMs: config.uncertainAfterMs });
+const reconciler = new Reconciler(flowDeps, flow, {
+  uncertainAfterMs: config.uncertainAfterMs,
+  ...(config.workerSlots !== undefined ? { workerSlots: config.workerSlots } : {}),
+  ...(config.realtimeWakeup !== undefined ? { realtimeWakeup: config.realtimeWakeup } : {}),
+});
 reconciler.start(config.reconcileIntervalMs);
 
 // Construct command handlers (workerModel required for approve command evaluation)
