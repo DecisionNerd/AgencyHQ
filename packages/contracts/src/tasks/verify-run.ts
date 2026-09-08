@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { RevisionManifestSchema } from "../manifest.ts";
 import { DigestStringSchema } from "../step-contract.ts";
 import { VerificationResultSchema } from "../verification-result.ts";
 
@@ -28,6 +29,11 @@ export const VerifyRunPayloadSchema = z.object({
       timeoutSeconds: z.number().int().min(1),
     }),
   ),
+  /**
+   * Revision manifest for multi-repository WorkItems. The verifier uses this
+   * to confirm that the attempt revision is consistent with the plan.
+   */
+  manifest: RevisionManifestSchema.optional(),
 });
 export type VerifyRunPayload = z.infer<typeof VerifyRunPayloadSchema>;
 
