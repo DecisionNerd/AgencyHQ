@@ -10,6 +10,8 @@ export * from "./aggregates/dispatch-intent.ts";
 export * from "./aggregates/failure.ts";
 export * from "./aggregates/finding.ts";
 export * from "./aggregates/project.ts";
+// ProviderCapacity: timestamped capacity observation with validity window (slice 6)
+export * from "./aggregates/provider-capacity.ts";
 export * from "./aggregates/review.ts";
 export * from "./aggregates/step-contract.ts";
 export * from "./aggregates/verification-result.ts";
