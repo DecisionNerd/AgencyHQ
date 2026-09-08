@@ -767,10 +767,99 @@ describe("loadConfig bindHost (CR-3)", () => {
   });
 
   it("bindHost reads from AGENCYHQ_BIND_HOST env var", () => {
+    // Non-loopback bind host requires a token (I2.a); provide one so this test
+    // stays focused on bindHost and doesn't conflict with the auth config rule.
     const config = loadConfig({
       ...REQUIRED_ENV,
       AGENCYHQ_BIND_HOST: "0.0.0.0",
+      AGENCYHQ_API_TOKEN: "test-token",
     } as NodeJS.ProcessEnv);
     assert.equal(config.bindHost, "0.0.0.0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I2.a: Bearer-token authentication middleware
+// ---------------------------------------------------------------------------
+
+describe("Bearer-token auth middleware (I2.a)", () => {
+  const TOKEN = "test-secret-bearer-token";
+
+  function makeAuthApp(apiToken?: string) {
+    // exactOptionalPropertyTypes: don't spread undefined into optional field
+    const configOverrides: Partial<import("../src/config.ts").CoordinatorConfig> =
+      apiToken !== undefined ? { apiToken } : {};
+    // Use makeCommandPool so POST /api/commands (plan) can reach pool.connect()
+    // without throwing (the legacy path is used when no commands are injected).
+    return createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(configOverrides),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+    });
+  }
+
+  // ---------- with token configured ----------
+
+  it("with token: missing Authorization header → 401 on /api/return-view", async () => {
+    const app = makeAuthApp(TOKEN);
+    const res = await app.request("/api/return-view");
+    assert.equal(res.status, 401);
+    const body = (await res.json()) as { error: string };
+    assert.equal(body.error, "unauthorized");
+  });
+
+  it("with token: wrong token → 401", async () => {
+    const app = makeAuthApp(TOKEN);
+    const res = await app.request("/api/return-view", {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    assert.equal(res.status, 401);
+    const body = (await res.json()) as { error: string };
+    assert.equal(body.error, "unauthorized");
+  });
+
+  it("with token: correct token → 200 on GET /api/return-view", async () => {
+    const app = makeAuthApp(TOKEN);
+    const res = await app.request("/api/return-view", {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    assert.equal(res.status, 200);
+  });
+
+  it("with token: correct token → 200 on POST /api/commands", async () => {
+    const app = makeAuthApp(TOKEN);
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${TOKEN}`,
+      },
+      body: JSON.stringify({ commandId: "cmd-auth-1", kind: "plan", workItemId: "wi-auth-1" }),
+    });
+    assert.equal(res.status, 200);
+  });
+
+  it("with token: /api/health → 200 without Authorization header", async () => {
+    const app = makeAuthApp(TOKEN);
+    const res = await app.request("/api/health");
+    assert.equal(res.status, 200);
+  });
+
+  // ---------- without token configured ----------
+
+  it("without token: /api/return-view → 200 without Authorization header", async () => {
+    const app = makeAuthApp(undefined);
+    const res = await app.request("/api/return-view");
+    assert.equal(res.status, 200);
+  });
+
+  it("without token: /api/health → 200 without Authorization header", async () => {
+    const app = makeAuthApp(undefined);
+    const res = await app.request("/api/health");
+    assert.equal(res.status, 200);
   });
 });

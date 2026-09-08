@@ -129,6 +129,14 @@ const server = serve({
   hostname: config.bindHost,
 });
 
+// Warn when API runs without bearer-token protection (loopback-only allowed without a token).
+if (!config.apiToken) {
+  console.warn(
+    "WARNING: AGENCYHQ_API_TOKEN is not set. The API has no bearer-token protection. " +
+      "Set AGENCYHQ_API_TOKEN to enable authentication.",
+  );
+}
+
 // Log startup facts (no secrets)
 const webDistPresent = config.webDist !== undefined && existsSync(config.webDist);
 console.log(
