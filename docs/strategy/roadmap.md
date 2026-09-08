@@ -90,8 +90,9 @@ on it.
   implemented). `integrate.merge` is the only task that may push (push-boundary
   test enforces this). ProcessDefinition not extracted — only one process exists;
   extraction rule documented for when a second catalog entry needs a different
-  step/gate sequence. 9 defects found and fixed live, all with tests. 1,058 unit
-  tests, 178 integration tests (61 db + 117 coordinator). Full record:
+  step/gate sequence. 9 defects found and fixed live; 8 have deterministic tests (defect 1, seed
+  script crash, has none). 1,055 unit tests, 178 integration tests (61 db +
+  117 coordinator). Full record:
   [trials/2026-09-slice4.md](../engineering/trials/2026-09-slice4.md).
 
 ## Slice 5 — control plane (current)
