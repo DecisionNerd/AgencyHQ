@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { digestOf, HOST_TRIAL_AUTHORITY, TASK_IDS } from "@agencyhq/contracts";
+import { type Authority, digestOf, HOST_TRIAL_AUTHORITY, TASK_IDS } from "@agencyhq/contracts";
 import { createPool, withTestSchema } from "@agencyhq/db";
 import { newId } from "@agencyhq/domain";
 import { FakeExecutionRuntime } from "../../../../trigger/src/client/fake.ts";
@@ -67,6 +67,24 @@ const HOST_PROFILE = {
 
 const clock = { now: () => new Date().toISOString() };
 const ids = { next: (prefix: string) => newId(prefix as Parameters<typeof newId>[0]) };
+
+// ---------------------------------------------------------------------------
+// Authority that allows "merge" boundary without requiring human approval.
+// Used to seed projects for tests 1–5 so that checkProposal admits the
+// "merge" boundary proposal (HOST_TRIAL_AUTHORITY.boundaries = ["artifact"]
+// would trigger BOUNDARY_NOT_DELEGATED, parking the proposal).
+// The humanRequired.boundaries list is empty so onAcceptFinal can proceed
+// directly to dispatching integrate.merge without waiting for an Approval.
+// ---------------------------------------------------------------------------
+const MERGE_AUTHORITY: Authority = {
+  ...HOST_TRIAL_AUTHORITY,
+  boundaries: ["artifact", "merge"],
+  humanRequired: {
+    paths: ["src/parser/public-api.ts"],
+    changeClasses: [],
+    boundaries: [],
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Helpers: run the full flow up to acceptance (plan → work → verify → review → accept)
@@ -254,7 +272,10 @@ test("flow.integrate (1): merge happy path — accept, integrate, complete", asy
     poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
     const pool = createPool(poolUrl.toString());
     try {
-      const { workItemId, projectId } = await seedProjectAndWorkItem(client, { boundary: "merge" });
+      const { workItemId, projectId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_AUTHORITY,
+      });
 
       const fake = new FakeExecutionRuntime();
 
@@ -404,7 +425,10 @@ test("flow.integrate (2): base_moved → pending_human, integration_conflict fin
     poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
     const pool = createPool(poolUrl.toString());
     try {
-      const { workItemId } = await seedProjectAndWorkItem(client, { boundary: "merge" });
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_AUTHORITY,
+      });
       const fake = new FakeExecutionRuntime();
 
       fake.script(TASK_IDS.integrateMerge, () => ({
@@ -507,7 +531,10 @@ test("flow.integrate (3): crashed run + remote contains attempt → completed", 
     poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
     const pool = createPool(poolUrl.toString());
     try {
-      const { workItemId } = await seedProjectAndWorkItem(client, { boundary: "merge" });
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_AUTHORITY,
+      });
       const fake = new FakeExecutionRuntime();
 
       // Script integrate.merge to FAIL (crash)
@@ -601,7 +628,10 @@ test("flow.integrate (4): crashed + unchanged remote → retry_cas; exhaust → 
     poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
     const pool = createPool(poolUrl.toString());
     try {
-      const { workItemId } = await seedProjectAndWorkItem(client, { boundary: "merge" });
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_AUTHORITY,
+      });
       const fake = new FakeExecutionRuntime();
 
       // Script integrate.merge to CRASH
@@ -735,7 +765,10 @@ test("flow.integrate (5): replay of integrated observation → idempotent", asyn
     poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
     const pool = createPool(poolUrl.toString());
     try {
-      const { workItemId } = await seedProjectAndWorkItem(client, { boundary: "merge" });
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_AUTHORITY,
+      });
       const fake = new FakeExecutionRuntime();
 
       fake.script(TASK_IDS.integrateMerge, () => ({
@@ -961,7 +994,7 @@ test("flow.integrate (7): two-entry manifest — entry 0 integrates → lead.pla
       );
       await client.query(
         `INSERT INTO work_items (id, project_id, rank, intent, defect, boundary, lifecycle, condition, main_effort, version)
-         VALUES ($1, $2, 1, 'Multi-repo fix', NULL, 'merge', 'proposed', 'healthy', true, 1)`,
+         VALUES ($1, $2, 1, 'Multi-repo fix', NULL, 'merge', 'active', 'healthy', true, 1)`,
         [workItemId, projectAId],
       );
 

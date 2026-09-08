@@ -434,7 +434,7 @@ test("flow.disposition: remediate disposition → no auto new Attempt (dispositi
       );
       assert.equal(
         (wiRows[0] as { lifecycle: string }).lifecycle,
-        "proposed",
+        "active",
         "WorkItem NOT completed",
       );
     } finally {
