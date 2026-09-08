@@ -47,7 +47,7 @@ The first executable slice needs a minimal view for this journey:
 
 The acceptance scenario is an operator who can correctly identify what advanced,
 what needs them, what continues, and why completion is justified without opening
-worker logs. Keep the initial view small; add Campaign navigation in slice 5.
+worker logs. The initial view is small; Campaign navigation was added in Slice 5.
 
 ## Interaction principles
 

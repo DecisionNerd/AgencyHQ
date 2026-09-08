@@ -140,3 +140,7 @@ pnpm --filter @agencyhq/coordinator test:integration
 ## Trial
 
 The `BoundedRepairFlow` and the full coordinator pipeline were exercised against the real Trigger.dev stack on 2026-09-07 (Slice 3 trial items 5–7). Item 7 PASS: work item `89cfe999-9710-4388-8dd1-caf520d26d49` completed at artifact boundary with adversarial review and no Approval in ~150 s. Full record: [docs/engineering/trials/2026-09-slice3.md](../../docs/engineering/trials/2026-09-slice3.md).
+
+Slice 4 (2026-09-08): merge boundary with human approval live (item 8 PASS, fifth run); CAS base_moved (item 9 PASS); two-repo manifest with combined verification (item 10 PASS, seventh run). Full record: [docs/engineering/trials/2026-09-slice4.md](../../docs/engineering/trials/2026-09-slice4.md).
+
+Slice 5 (2026-09-08): approve via operator UI on the real stack — work item `8fafbd54`, merge boundary, `pending_human` at 174 s; operator clicked approve in `#/decisions`; `integrate.merge` dispatched in one transaction; remote `main` advanced from `b1f48d0` to `5cbff2c`; work item `completed/healthy`. One defect found by screenshot (single-item view omitted integration state; fixed in `6ab2f2f`). 16 Playwright browser journeys on the fake-runtime coordinator. Full record: [docs/engineering/trials/2026-09-slice5.md](../../docs/engineering/trials/2026-09-slice5.md).

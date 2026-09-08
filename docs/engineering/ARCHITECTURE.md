@@ -39,10 +39,57 @@ Arrows are commands and observations. Authority lives where the table in the
 
 ### Web control plane
 
-React/TypeScript. Renders coordinator state and submits typed commands. For
-live execution state it subscribes to Trigger runs by tag with Trigger's React
-hooks using scoped public access tokens. Contains no scheduling or acceptance
-logic. Runs in the same Node process as the coordinator.
+React/TypeScript. Hash-router with five routes: `#/` (overview — campaigns
+with main effort, projects, ranked work items with lifecycle/condition/boundary/
+pending-decision count), `#/decisions` (every open `pending_human` decision
+with obstacle, recommendation, impact, no-action consequence, and inline
+approve/reject actions), `#/work-items/:id` (five state cards — contract,
+execution, verification, acceptance, integration — plus an evidence panel and
+operator actions), `#/projects/:id/authority` (JSON authority editor with
+version history and confirm dialog), `#/return` (return-after-interruption
+view). Every destructive action shows a `ConfirmDialog` naming the project,
+work item, and version. Bearer-auth token stored in
+`localStorage["agencyhq.apiToken"]`; all `/api/*` calls include
+`Authorization: Bearer <token>`; a 401 response clears the token and shows a
+token-entry form. For live execution state it subscribes to Trigger runs by
+tag with Trigger's React hooks using scoped public access tokens. Contains no
+scheduling or acceptance logic. Runs in the same Node process as the
+coordinator.
+
+**Decisions view semantics.** A `pending_human` decision is *open* when no
+later decision of a resolving outcome (`approved`, `rejected`, `accepted`,
+`invalidated`) exists for the same attempt. After the operator approves or
+rejects, the coordinator appends a resolving decision for that attempt; the
+decisions view re-filters and the entry disappears without deleting any row.
+This is the behavior observed and fixed during the Slice 5 browser journey
+(`apps/coordinator/src/views/pending.ts`, `isOpenPending`). A pending decision
+without an attempt id cannot be resolved by inference and stays open until a
+command updates it.
+
+### Coordinator API (Slice 5)
+
+All routes require `Authorization: Bearer <token>`.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/overview` | Campaigns with main effort, projects, ranked work items |
+| `GET` | `/api/decisions` | Open `pending_human` decisions (filtered by `isOpenPending`) |
+| `GET` | `/api/work-items/:id/evidence` | Full evidence for one work item |
+| `GET` | `/api/work-items/:id/view` | Single-item return view including integrations and manifest rows |
+| `GET` | `/api/projects/:id/authority` | Current authority and full `authority_versions` history |
+| `PUT` | `/api/projects/:id/authority` | Dispatches `update_authority` command |
+
+**Slice 5 commands** (`POST /api/commands`, idempotent by `commandId`):
+
+| `kind` | Effect |
+| --- | --- |
+| `reject` | Pending decision → `rejected`; work item lifecycle → `halted` |
+| `invalidate_acceptance` | Inserts new `invalidate` decision; work item → `reopened`; historical rows untouched |
+| `create_campaign` | Creates a campaign |
+| `assign_campaign` | Sets `campaign_id` on a work item |
+| `set_main_effort` | Sets `main_effort_work_item_id` on a campaign |
+| `set_rank` | Optimistic CAS on work item `version`; returns `stale_version` on mismatch |
+| `update_authority` | Schema-validated; version must increase; appends to `authority_versions`; frozen contract bounds untouched |
 
 ### Coordinator
 
