@@ -20,15 +20,19 @@ Concepts marked *deferred* are vocabulary now and code later.
 | Approval | Human decision over an exact subject version and evidence set, required only where the authority schema says so. Never a mutable boolean. | 2 |
 | Finding | Evidence-backed observation from any task with an owned disposition; never silently widens a contract. | 2 |
 | Campaign | Grouping of WorkItems across Projects with a shared rank order and declared main effort. *Deferred.* | 5 |
-| ProcessDefinition | Versioned step/gate sequence. The bounded repair process is code until a second process exists. *Deferred.* | 4 |
+| RevisionManifest | Ordered list of `(projectId, targetRef, expectedBaseRevision, resultRevision?)` entries covering all repositories in a multi-repository WorkItem. The manifest digest is computed from entries excluding `resultRevision` and is stable throughout the WorkItem's lifetime. Merge completion requires every entry to carry a non-null `resultRevision` (all entries resolved). | 4 |
+| IntegrationDecision | The outcome of one `integrate.merge` run: `integrated`, `already_integrated`, `base_moved`, `conflict`, or `push_rejected`. Non-integrated outcomes produce a `pending_human` decision with an `integration_conflict` finding. | 4 |
+| ProcessDefinition | Versioned step/gate sequence. The bounded repair process is code until a second process exists; extract when a second catalog entry needs a different step/gate sequence. *Deferred.* | 4 |
 | ProviderCapacity | Timestamped capacity observation with validity window. *Deferred.* | 6 |
 
 *Implementation: all Slice 2 aggregates in `packages/domain/src/aggregates/`; lifecycle transitions namespaced per aggregate in `packages/domain/src/transitions/`.*
 
 ## Relationships
 
-- A WorkItem belongs to one Project (multi-repository WorkItems arrive in
-  slice 4 with revision manifests).
+- A WorkItem belongs to one or more Projects via a RevisionManifest (one
+  entry per repository). Single-repository WorkItems have a manifest with one
+  entry. Merge completion requires a resolved manifest (all entries have a
+  non-null `resultRevision`).
 - A WorkItem has one or more StepContracts; the bounded repair process has one.
 - Each Attempt binds to exactly one StepContract version, one Trigger run, and
   one authority generation.
@@ -114,7 +118,7 @@ The Lead classifies each Finding; the coordinator records the disposition.
 
 Match Findings by subject and cause before creating another.
 
-*Implementation: finding dispositions in `packages/domain/src/findings/disposition.ts`; acceptance rule with 14 reason codes (`PROPOSAL_REJECTS`, `VERIFIER_TAMPERED`, `CRITERION_UNCITED`, `CRITERION_UNSATISFIED`, `CITED_RESULT_MISSING`, `CITED_RESULT_NOT_PASSING`, `RESULT_VERSION_MISMATCH`, `REVIEW_MISSING`, `REVIEW_VERSION_MISMATCH`, `REVIEW_BLOCKING`, `REVIEW_BELOW_REQUIRED`, `REVIEWER_NOT_DISTINCT`, `APPROVAL_REQUIRED`, `APPROVAL_VERSION_MISMATCH`) in `packages/domain/src/evidence/acceptance.ts`; verifier-tampering detection in `packages/domain/src/evidence/integrity.ts` (protected paths: package manifests, lock files, workspace file, tsconfig*, biome.json, .github/**, vitest/jest configs; test source files are not protected).*
+*Implementation: finding dispositions in `packages/domain/src/findings/disposition.ts`; acceptance rule with 14 reason codes (`PROPOSAL_REJECTS`, `VERIFIER_TAMPERED`, `CRITERION_UNCITED`, `CRITERION_UNSATISFIED`, `CITED_RESULT_MISSING`, `CITED_RESULT_NOT_PASSING`, `RESULT_VERSION_MISMATCH`, `REVIEW_MISSING`, `REVIEW_VERSION_MISMATCH`, `REVIEW_BLOCKING`, `REVIEW_BELOW_REQUIRED`, `REVIEWER_NOT_DISTINCT`, `APPROVAL_REQUIRED`, `APPROVAL_VERSION_MISMATCH`) in `packages/domain/src/evidence/acceptance.ts`; verifier-tampering detection in `packages/domain/src/evidence/integrity.ts` (protected paths: package manifests, lock files, workspace file, tsconfig*, biome.json, .github/**, vitest/jest configs; test source files are not protected); integration decision logic in `packages/domain/src/integration/decide.ts` and `packages/domain/src/integration/manifest.ts`; runtime enforceability in `packages/domain/src/authority/runtime.ts` — `deploy` boundary returns `DEPLOY_NOT_SUPPORTED` (not yet implemented; only `artifact` and `merge` are supported).*
 
 ## Version repair
 
