@@ -809,6 +809,17 @@ export class BoundedRepairFlow {
         [intentId],
       );
 
+      // Activate the work item now that a contract + worker are admitted.
+      // Raw SQL (no domain transition): the real system starts work items in
+      // "admitted" (createWorkItem) and transitions proposed→active or
+      // admitted→active here. The guard prevents downgrading a halted/completed item.
+      await client.query(
+        `UPDATE work_items
+         SET lifecycle = 'active', version = version + 1, updated_at = now()
+         WHERE id = $1 AND lifecycle NOT IN ('active', 'completed', 'halted')`,
+        [workItemId],
+      );
+
       await client.query("COMMIT");
 
       // Trigger AFTER commit (R-002)

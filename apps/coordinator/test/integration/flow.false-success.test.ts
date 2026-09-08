@@ -343,7 +343,7 @@ test("flow.false-success (a): verify fails → reject CITED_RESULT_NOT_PASSING (
       );
       assert.equal(
         (wiRows[0] as { lifecycle: string }).lifecycle,
-        "proposed",
+        "active",
         "WorkItem NOT completed",
       );
 
@@ -522,14 +522,14 @@ test("flow.false-success (b): tampers-verifier → verifier_tampered finding AND
         "decision rejected due to verifier tampering",
       );
 
-      // WorkItem NOT completed (stays in proposed lifecycle)
+      // WorkItem NOT completed (stays active, not completed)
       const { rows: wiRows } = await client.query(
         "SELECT lifecycle FROM work_items WHERE id = $1",
         [workItemId],
       );
       assert.equal(
         (wiRows[0] as { lifecycle: string }).lifecycle,
-        "proposed",
+        "active",
         "WorkItem NOT completed",
       );
 
@@ -899,7 +899,7 @@ test("flow.false-success (c): blocking review finding → reject REVIEW_BLOCKING
       );
       assert.equal(
         (wiRows[0] as { lifecycle: string }).lifecycle,
-        "proposed",
+        "active",
         "WorkItem NOT completed",
       );
 
@@ -1291,7 +1291,7 @@ test("flow.false-success (e): overclaims → CITED_RESULT_MISSING + CRITERION_UN
       );
       assert.equal(
         (wiRows[0] as { lifecycle: string }).lifecycle,
-        "proposed",
+        "active",
         "WorkItem NOT completed",
       );
 
@@ -1496,7 +1496,7 @@ test("flow.false-success (f): weakened test — review blocks, no verifier_tampe
       );
       assert.equal(
         (fWiRows[0] as { lifecycle: string }).lifecycle,
-        "proposed",
+        "active",
         "(f) WorkItem NOT completed",
       );
 
