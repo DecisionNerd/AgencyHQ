@@ -18,6 +18,11 @@ export type CoordinatorConfig = {
   reconcileIntervalMs: number;
   freshnessStaleMs: number;
   uncertainAfterMs: number;
+  /**
+   * Maximum compare-and-set retries for integrate.merge on retry_cas outcome.
+   * Default: 2.
+   */
+  integrateRetries?: number | undefined;
   webDist?: string;
   port: number;
   bindHost: string;
@@ -122,6 +127,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
   const reconcileIntervalMs = integer("RECONCILE_INTERVAL_MS", 5000);
   const freshnessStaleMs = integer("FRESHNESS_STALE_MS", 30000);
   const uncertainAfterMs = integer("AGENCYHQ_UNCERTAIN_AFTER_MS", 120_000);
+  const integrateRetries = integer("AGENCYHQ_INTEGRATE_RETRIES", 2);
   const webDist = optional("WEB_DIST");
   const port = portNum("PORT", 8787);
   const bindHost = optional("AGENCYHQ_BIND_HOST") ?? "127.0.0.1";
@@ -150,6 +156,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     reconcileIntervalMs,
     freshnessStaleMs,
     uncertainAfterMs,
+    integrateRetries,
     port,
     bindHost,
   };

@@ -86,6 +86,7 @@ const flowDeps: FlowDeps = {
     verifierName: "agencyhq/verify.run",
     leadVariant: config.leadVariant,
     uncertainAfterMs: config.uncertainAfterMs,
+    ...(config.integrateRetries !== undefined ? { integrateRetries: config.integrateRetries } : {}),
   },
   profileResolver,
 };
