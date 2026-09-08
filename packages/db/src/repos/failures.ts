@@ -8,11 +8,11 @@ import { FailureRowSchema } from "../rows.ts";
 
 export interface FailureInsert {
   id: string;
-  class?: string | null;
-  phase?: string | null;
+  class: string;
+  phase: string;
   attempt_id?: string | null;
   run_id?: string | null;
-  cause?: string | null;
+  cause: string;
   evidence?: string | null;
 }
 
@@ -28,11 +28,11 @@ export async function insertFailure(
      RETURNING *`,
     [
       row.id,
-      row.class ?? null,
-      row.phase ?? null,
+      row.class,
+      row.phase,
       row.attempt_id ?? null,
       row.run_id ?? null,
-      row.cause ?? null,
+      row.cause,
       row.evidence ?? null,
     ],
   );

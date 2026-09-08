@@ -63,8 +63,6 @@ import {
   type WorkItemId,
 } from "@agencyhq/domain";
 
-import { confirmStop } from "../commands/confirm-stop.ts";
-import type { CommandDeps } from "../commands/stop.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -743,54 +741,11 @@ export class BoundedRepairFlow {
         return;
       }
 
-      // F-2: CANCELED/TIMED_OUT when a stop was requested → call confirmStop;
-      // never dispatch a replacement on this path.
-      if (classification.attemptStatus === "stopping") {
-        const commandDeps: CommandDeps = {
-          pool,
-          runtime,
-          clock: this.deps.clock,
-          ...(config.uncertainAfterMs !== undefined
-            ? { config: { uncertainAfterMs: config.uncertainAfterMs } }
-            : {}),
-        };
-        const csResult = await confirmStop(commandDeps, client, {
-          attemptId: attemptRow.id,
-          generation: attemptRow.generation,
-          observation: obs,
-          // Anchor the uncertainty deadline to the run's observation time so
-          // elapsed time is computed correctly on repeated poll cycles.
-          finalObservedAt: obs.observedAt,
-        });
-
-        if (csResult.status === "pending_confirmation") {
-          // Evidence not yet available; leave intent open for next poll.
-          await completeCommand(client, commandId, { skipped: "pending_confirmation" });
-          return;
-        }
-
-        if (csResult.status === "uncertain") {
-          // Survivors remain — block dispatch until a human resolves.
-          await pool.query(
-            `UPDATE work_items
-             SET condition = 'uncertain', version = version + 1, updated_at = now()
-             WHERE id = (
-               SELECT sc.work_item_id FROM step_contracts sc
-               JOIN attempts a ON a.contract_id = sc.id WHERE a.id = $1
-             )`,
-            [attemptRow.id],
-          );
-        }
-
-        // Close the incoming worker intent (F-5).
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
-          [workerIntentRow.id],
-        );
-
-        await completeCommand(client, commandId, { confirmStop: csResult.status });
-        return;
-      }
+      // J-3: The onWorkerFinal stopping branch was removed because it was
+      // unreachable: stopRequested requires the attempt to already be `stopping`
+      // at load time, but revokeGeneration bumps the generation, making the
+      // observation stale before the stopping check could fire.  Stop+COMPLETED
+      // races are now handled by the Reconciler via handleStoppingWorker (J-1).
 
       if (classification.attemptStatus === "completed") {
         const workerOutput = WorkerAttemptOutputSchema.safeParse(obs.output);

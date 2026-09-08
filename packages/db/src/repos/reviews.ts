@@ -13,8 +13,8 @@ export interface ReviewInsert {
   diff_digest?: string | null;
   criteria_digest?: string | null;
   profile_digest?: string | null;
-  reviewer_model?: string | null;
-  profile?: string | null;
+  reviewer_model: string;
+  profile: string;
   findings: unknown;
 }
 
@@ -33,8 +33,8 @@ export async function insertReview(client: pg.PoolClient, row: ReviewInsert): Pr
       row.diff_digest ?? null,
       row.criteria_digest ?? null,
       row.profile_digest ?? null,
-      row.reviewer_model ?? null,
-      row.profile ?? null,
+      row.reviewer_model,
+      row.profile,
       JSON.stringify(row.findings),
     ],
   );
