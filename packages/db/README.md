@@ -59,6 +59,13 @@ The migration also adds nullable `campaign_id` (FK to `campaigns`) to `work_item
 
 Migration `migrations/0005_decision_reason.sql` adds a nullable `reason` text column to `decisions` (`ALTER TABLE decisions ADD COLUMN IF NOT EXISTS reason text`). The `reject` and `invalidate_acceptance` commands persist the operator-supplied reason here. Idempotent.
 
+Migration `migrations/0006_capacity_metrics.sql` adds the `provider_capacity` table and `lead_metrics` view (Slice 6):
+
+| Object | Purpose |
+| --- | --- |
+| `provider_capacity` | Adapter- or operator-sourced capacity observations per `(provider, model, observed_at)`. Primary key `(provider, model, observed_at)`. Columns: `status` (`ok`\|`limited`\|`down`), `valid_until`, `source` (`adapter`\|`operator`), nullable `run_id`. Index on `(provider, model, valid_until desc)`. Stale handling is computed by the domain; this table stores every observation. |
+| `lead_metrics` (view) | Per-project quality metrics aggregated from the full ledger. See **Lead metrics** below for precise definitions. |
+
 Row schemas with inferred TypeScript types live in `src/rows.ts`. `mapRow` helpers parse jsonb columns (`authority`, `bounds`, `criteria`, `record`) through their contracts Zod schemas. Repository insert types (e.g. `FindingInsert`, `DecisionInsert`, `ReviewInsert`) require the columns marked NOT NULL in migration 0002 — `severity`, `kind`, `description` for findings; `kind`, `actor` for decisions; `reviewer_model`, `profile` for reviews; `class`, `phase`, `cause` for failures; `kind` for commands — as non-nullable fields; the coordinator always supplies them. Migration 0003 adds `WorkItemProjectRowSchema` / `WorkItemProjectRow` and `IntegrationRowSchema` / `IntegrationRow`.
 
 ## Fencing and idempotency
@@ -102,9 +109,34 @@ Each table has a typed repository module in `src/repos/`. Every function takes a
 | `repos/transitions.ts` | `insertTransition` (append-only audit) |
 | `repos/work-item-projects.ts` | `insertWorkItemProjects` (bulk), `listWorkItemProjects` (ordered by position), `setResultRevision` (guarded: only writes when `result_revision IS NULL`; returns `"applied" | "already_set"`) |
 | `repos/integrations.ts` | `insertIntegration` (idempotent on `(attempt_id, target_ref, expected_base_revision)`; returns `{ status: "inserted" | "existing", row }`), `finalizeIntegration` (guarded: only writes when `outcome IS NULL`; returns `"applied" | "already_set"`), `getIntegrationByAttempt`, `listIntegrationsByAttempt` |
+| `repos/provider-capacity.ts` | `recordCapacity` (idempotent on PK; returns `{ result: "inserted" | "existing", row }`), `latestCapacity` (most recent by `observed_at`), `listCurrentCapacity` (one row per `(provider, model)`, most recent) |
+| `repos/metrics.ts` | `leadMetrics(client, { since? })` — per-project `ProjectMetricsRow[]` (see **Lead metrics** below) |
 
 Every `updateXStatus(client, id, from, to, audit)` applies `UPDATE … WHERE id=$1 AND status=$2`. Zero rows updated returns `{ ok: false, reason: "state_mismatch" }` and writes no audit row. On success it appends a `transitions` row with `actor`, `causation_id`, and `command_id`.
 
 ## Unit of Work
 
 `src/unit-of-work.ts` exports `recordDecisionAndIntent(client, input)`, which implements R-002: it commits a Decision, an optional StepContract, an optional Attempt, and a DispatchIntent in a single transaction before any trigger call. When `audit.commandId` matches an existing `commands` row the stored result is returned immediately (idempotent replay). Accepts `pg.Pool` (manages BEGIN/COMMIT/ROLLBACK) or `pg.PoolClient` (caller controls the transaction).
+
+## Lead metrics
+
+`leadMetrics(client, { since? })` returns a `ProjectMetricsRow[]`, one row per project. An optional `since: Date` restricts all counts to rows with `created_at >= since`; omitting it covers the full ledger.
+
+Metric definitions (also documented as SQL comments in `migrations/0006_capacity_metrics.sql`):
+
+| Metric | Type | Definition |
+| --- | --- | --- |
+| `project_id` | `string` | Project row id. |
+| `plans_total` | `number` | Decisions with `kind = 'plan'` linked to the project via `work_item_id`. |
+| `plans_escalated` | `number` | Plan decisions with `outcome = 'pending_human'`. |
+| `escalation_rate` | `number \| null` | `plans_escalated / plans_total`; `null` when `plans_total = 0`. |
+| `acceptances` | `number` | Decisions with `kind = 'accept'` and `outcome IN ('accepted', 'approved')`. |
+| `invalidations` | `number` | Decisions with `kind = 'invalidate'` linked to the project. |
+| `reversal_rate` | `number \| null` | `invalidations / acceptances`; `null` when `acceptances = 0`. |
+| `reviews_total` | `number` | Review rows linked via `attempt → step_contract → project`. |
+| `reviews_with_findings` | `number` | Reviews where `jsonb_array_length(findings) > 0`. |
+| `review_yield` | `number \| null` | `reviews_with_findings / reviews_total`; `null` when `reviews_total = 0`. |
+| `findings_by_disposition` | `Record<string, number>` | Count of finding rows per `disposition` value; rows with `NULL` disposition are counted under `"unset"`. |
+| `integrations_by_outcome` | `Record<string, number>` | Count of integration rows per `outcome` value; rows with `NULL` outcome are counted under `"unknown"`. |
+
+The `lead_metrics` SQL view in migration 0006 defines the same aggregation without the `since` filter and serves as the canonical reference for the coordinator's metrics endpoint.
