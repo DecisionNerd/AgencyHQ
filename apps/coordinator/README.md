@@ -50,7 +50,7 @@ Integration tests use `withTestSchema` (isolated Postgres schema per test) and `
 DATABASE_URL=postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test pnpm --filter @agencyhq/coordinator test:integration
 ```
 
-## Control-plane API (slice 5)
+## Control-plane API (slices 5–6)
 
 ### Routes
 
@@ -58,11 +58,13 @@ All routes require `Authorization: Bearer <token>`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/overview` | Campaigns with main effort, projects, work items ranked by `rank` with lifecycle/condition/boundary/pending decision count |
+| `GET` | `/api/overview` | Campaigns with main effort, projects, work items ranked by `rank` with lifecycle/condition/boundary/pending decision count, active-attempt counts, and optional `skipReason` |
 | `GET` | `/api/decisions` | Every `pending_human` decision with obstacle, recommendation, impact, no-action consequence, and available actions |
 | `GET` | `/api/work-items/:id/evidence` | Artifacts, verification results, reviews, findings, decisions, approvals, integrations, manifest rows, attempts with run ids |
 | `GET` | `/api/projects/:id/authority` | Current authority version plus full history from `authority_versions` |
 | `PUT` | `/api/projects/:id/authority` | Body `{ commandId, authority, actor }` — dispatches `update_authority` command |
+| `GET` | `/api/capacity` | Current `provider_capacity` rows with `effective` and `concurrency` fields |
+| `GET` | `/api/metrics/lead` | Per-project Lead quality metrics via `leadMetrics()`; optional `since` query param (ISO-8601 date) |
 
 ### Commands (POST /api/commands)
 
@@ -70,6 +72,7 @@ All commands are idempotent by `commandId` (R-010). Repeated delivery with the s
 
 | `kind` | Required fields | Effect |
 |--------|-----------------|--------|
+| `set_capacity` | `provider`, `model`, `status`, `validUntil` | Writes a `provider_capacity` row with `source = "operator"`; reflected immediately in `selectDispatch` capacity gating and `/api/capacity` |
 | `reject` | `workItemId`, `decisionId`, `reason` | Appends a new `rejected` decision for the same attempt (pending row kept as history — R-017); persists reason in `decisions.reason`; work item lifecycle set to `halted` |
 | `invalidate_acceptance` | `workItemId`, `attemptId`, `reason` | Inserts new decision of kind `invalidate` referencing historical accept; persists reason in `decisions.reason`; work item lifecycle set to `reopened`; historical rows untouched (R-017) |
 | `create_campaign` | `name` | Creates a campaign; returns `campaignId` (`cmp-<commandId[:8]>`) |
@@ -81,6 +84,13 @@ All commands are idempotent by `commandId` (R-010). Repeated delivery with the s
 ### Schema note
 
 `campaigns`, `work_items.campaign_id`, and `authority_versions` are introduced by migration 0004; `decisions.reason` by migration 0005 (`ALTER TABLE decisions ADD COLUMN IF NOT EXISTS reason text`). Integration tests apply the DDL via `withControlPlaneSchema` in `apps/coordinator/test/helpers/control-plane-schema.ts` — never in `packages/db`.
+
+## Scheduler and capacity environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AGENCYHQ_WORKER_SLOTS` | 1 | Maximum concurrent worker attempts across the shared ledger. The polling loop deducts active attempts (`listActiveAttemptsForScheduling`: dispatched with an in-flight `worker.attempt` intent, or in `stopping`) before selecting new ones. Confirmed live 2026-09-08 (T3 PASS at ecc3cd6; see [docs/engineering/trials/2026-09-slice6.md](../../docs/engineering/trials/2026-09-slice6.md)). |
+| `AGENCYHQ_REALTIME_WAKEUP` | false | When `true`, subscribes to `runs.subscribeToRunsWithTag` for the tags of all non-terminal work items; refreshes and resubscribes after every poll when the tag set changes. On subscribe the SDK replays current run states (observed 2026-09-08, `@trigger.dev/sdk` 4.5.16); the pollOnce in-flight guard absorbs replays. Polling remains the authoritative observation path. |
 
 ## Network isolation
 
@@ -144,3 +154,5 @@ The `BoundedRepairFlow` and the full coordinator pipeline were exercised against
 Slice 4 (2026-09-08): merge boundary with human approval live (item 8 PASS, fifth run); CAS base_moved (item 9 PASS); two-repo manifest with combined verification (item 10 PASS, seventh run). Full record: [docs/engineering/trials/2026-09-slice4.md](../../docs/engineering/trials/2026-09-slice4.md).
 
 Slice 5 (2026-09-08): approve via operator UI on the real stack — work item `8fafbd54`, merge boundary, `pending_human` at 174 s; operator clicked approve in `#/decisions`; `integrate.merge` dispatched in one transaction; remote `main` advanced from `b1f48d0` to `5cbff2c`; work item `completed/healthy`. One defect found by screenshot (single-item view omitted integration state; fixed in `6ab2f2f`). Rework commit `84cdb08` (open-pending rule, persisted reasons, membership guard, authority CAS). 17 Playwright browser journeys on the fake-runtime coordinator; CI green at `04c3893` per PR #12. Full record: [docs/engineering/trials/2026-09-slice5.md](../../docs/engineering/trials/2026-09-slice5.md).
+
+Slice 6 (2026-09-08): batch scheduler wired into the polling loop; T0–T6 PASS or FIXED live (see items T1 concurrency at 21:22–21:24Z, T2 repository release at 20:52:10Z, T3 slots at ecc3cd6, T4 operator capacity at 21:25–21:30Z, T5 metrics at 20:48Z, T6 wake-up at 21:41Z); 7 defects found and fixed; container spike PARTIAL (supervisor connected; image build incomplete). Full record: [docs/engineering/trials/2026-09-slice6.md](../../docs/engineering/trials/2026-09-slice6.md).

@@ -28,3 +28,5 @@ All modules are re-exported from `src/index.ts`. The package depends only on `@a
 ## Trial
 
 `verify.run` used the profiles and result builder from this package in the Slice 3 trial on 2026-09-07. Both `pnpm-typecheck@1` and `pnpm-test@1` checks passed on the fixture parser at attempt revision `63a2eb1029468b81af5c3ed2c71fb2bd1b970308`. See [docs/engineering/trials/2026-09-slice3.md](../../docs/engineering/trials/2026-09-slice3.md).
+
+Slice 6 trial (2026-09-08): v2 profiles (`node-pnpm-v2`, `multi-repo-v2`) prepend `pnpm-install@1` — added after defect 3 was found live (`pnpm-typecheck@1` failed in all four first-pair runs because node_modules were absent in the task process; run_cmtt5usml, 709154c). With `node-pnpm-v2`, the same attempt passed install, typecheck, and test in a single `verify.run` task process (run_cmtt6awoj). The v1 profiles are frozen; existing StepContracts continue to resolve against them without change. See [docs/engineering/trials/2026-09-slice6.md](../../docs/engineering/trials/2026-09-slice6.md).

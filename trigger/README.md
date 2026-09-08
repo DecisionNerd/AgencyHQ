@@ -66,17 +66,45 @@ The container profile uses API-key providers only; subscription-based logins
 from `~/.local/share/opencode/auth.json` are host-bound and not available
 inside task containers.
 
-### Not yet observed
+### Slice 6 container spike (2026-09-08, partial)
 
-The following have not been exercised in a live run (pending: Slice 6 container spike):
+**Observed:**
 
-- Task image build (`trigger deploy --local-build` against the bundled registry).
-- Trigger worker stack container (supervisor) dequeuing and running `spike-echo`
-  in a container.
-- `worker.attempt` executing inside a container (worktree-add, opencode run,
-  diff, commit sequence).
+- Supervisor v4.5.16 + docker-proxy v0.5.0 started as a trigger worker stack
+  overlay alongside the running webapp stack.
+- The trigger worker stack supervisor (v4.5.16) read the bootstrap worker token
+  from the shared volume at `/home/node/shared/worker_token` and connected to
+  the trigger.dev platform ("Connected to platform" — `s6/supervisor-boot.log`).
+- First `trigger deploy --local-build` failed at the indexer stage: "Failed to
+  fetch environment variables: Connection error." The CLI rewrites
+  localhost→host.docker.internal and adds
+  `--add-host host.docker.internal:192.168.1.173` (buildImage.js:744-768 of
+  trigger.dev 4.5.16, read 2026-09-08) while the webapp is published on
+  127.0.0.1 only (`WEBAPP_PUBLISH_IP`). With a user-approved temporary TCP
+  forwarder on the LAN IP the deploy succeeded: version 20260908.2, 7 tasks,
+  image 238.78 MB (linux/amd64 on arm64 host) pushed to localhost:5001 and
+  promoted current for prod (`s6/deploy-2.log`).
+- `spike.echo` run run_cmtt9txxd00hl3qp3tygv0v2k: DEQUEUED 22:58:53Z, EXECUTING 22:58:59Z, COMPLETED 22:59:02Z. Container runner-cmtt9txxd… pulled the image from localhost:5001 and exited 0 (trigger worker stack `s6/supervisor-run.log`).
+- Inside the container (`s6/container-spike-echo.log`): git 2.39.5 present;
+  node v21.7.3 (image node, not host v24); cwd /app; uid 1000; HOME unset;
+  platform linux/x64 (amd64 image emulated on arm64 host); env =
+  TRIGGER_*/OTEL_*/NODE_* only (no host environment, no SSH agent, no git
+  credential helper, no OpenCode auth).
+
+**Not observed:**
+
+- `opencode` and `pnpm` on PATH inside the container (ENOENT). Build extension
+  `additionalPackages({opencode-ai})` installs the package into
+  /app/node_modules but does not add the binary to PATH — this is the
+  build-extension gap that must be closed before `worker.attempt` can run in a
+  container. Next step: configure the extension or entrypoint to put the binary
+  on PATH.
+- `worker.attempt` executing inside a container (OpenCode not runnable via PATH;
+  adapters also need a local repository path — no clone-from-remote step exists).
 - Push token handling (generation-bound token issuance for container profile
   attempts).
+- PAT push from a container.
+- Provider credentials as Trigger env vars.
 
 ## Libraries
 

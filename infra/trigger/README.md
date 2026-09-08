@@ -239,8 +239,8 @@ Non-interactive authentication uses `TRIGGER_ACCESS_TOKEN` and `TRIGGER_API_URL`
 
 | Component | Version | Status |
 | --- | --- | --- |
-| `ghcr.io/triggerdotdev/supervisor` | `v4.5.16` (via `TRIGGER_IMAGE_TAG`) | pending: Slice 6 container spike |
-| `tecnativa/docker-socket-proxy` | `v0.5.0` (via `DOCKER_PROXY_IMAGE_TAG`) | pending: Slice 6 container spike |
+| `ghcr.io/triggerdotdev/supervisor` | `v4.5.16` (via `TRIGGER_IMAGE_TAG`) | connected to the trigger.dev platform and ran spike.echo in a container 2026-09-08 (Slice 6 spike) |
+| `tecnativa/docker-socket-proxy` | `v0.5.0` (via `DOCKER_PROXY_IMAGE_TAG`) | connected to the trigger.dev platform and ran spike.echo in a container 2026-09-08 (Slice 6 spike) |
 
 ## Pinned versions
 
@@ -252,7 +252,7 @@ Non-interactive authentication uses `TRIGGER_ACCESS_TOKEN` and `TRIGGER_API_URL`
 | `redis` | `7` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
 | `electricsql/electric` | `1.2.4` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
 | `clickhouse/clickhouse-server` | `26.2` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| `registry` | `2` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
+| `registry` | `2` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial); image pulled by the Docker daemon 2026-09-08 (Slice 6 spike) |
 | `bitnamilegacy/minio` | `2025.5.24-debian-12-r5` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
 | `busybox` (s2-init) | `1.37` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
 | `ghcr.io/s2-streamstore/s2` (s2-lite) | digest-pinned, see `.env.example` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |

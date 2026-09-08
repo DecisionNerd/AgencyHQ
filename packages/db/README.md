@@ -97,7 +97,7 @@ Each table has a typed repository module in `src/repos/`. Every function takes a
 | `repos/authority-versions.ts` | `insertAuthorityVersion` (idempotent on `(project_id, version)`; returns `{ status: "inserted" \| "existing", row }`), `listAuthorityVersions` |
 | `repos/work-items.ts` | `insertWorkItem`, `getWorkItem`, `listWorkItemsByProject`, `setWorkItemRank` (optimistic CAS on `version`; returns `"applied" \| "stale"`) |
 | `repos/step-contracts.ts` | `insertStepContract`, `getStepContract`, `listStepContractsByWorkItem`, `updateStepContractStatus` |
-| `repos/attempts.ts` | `insertAttempt`, `getAttempt`, `listAttemptsByContract`, `updateAttemptStatus` |
+| `repos/attempts.ts` | `insertAttempt`, `getAttempt`, `listAttemptsByContract`, `updateAttemptStatus`, `listActiveAttemptsForScheduling` (returns attempts with an in-flight `worker.attempt` intent or in `stopping` status, across non-terminal work items; used by the batch scheduler to deduct active attempts from the slot count) |
 | `repos/dispatch-intents.ts` | `insertDispatchIntent`, `getDispatchIntent`, `listOpenDispatchIntents`, `updateDispatchIntentStatus` |
 | `repos/artifacts.ts` | `insertArtifact`, `getArtifact`, `listArtifactsByAttempt` |
 | `repos/verification-results.ts` | `insertVerificationResult`, `getVerificationResult`, `listVerificationResultsByAttempt` |
