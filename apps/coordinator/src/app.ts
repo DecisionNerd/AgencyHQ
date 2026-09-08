@@ -30,6 +30,7 @@ import { buildAuthorityView } from "./views/authority-view.ts";
 import { buildDecisionsView } from "./views/decisions-view.ts";
 import { buildEvidenceView } from "./views/evidence-view.ts";
 import { buildOverviewView } from "./views/overview-view.ts";
+import { openPendingDecisions } from "./views/pending.ts";
 import {
   type AttemptLike,
   buildReturnView,
@@ -512,6 +513,8 @@ export function createApp(deps: AppDeps): Hono {
         kind: d.kind ?? "",
         outcome: d.outcome ?? "",
         at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
+        attemptId: d.attempt_id ?? null,
+        contractVersion: d.contract_version ?? null,
       }));
 
       const wiContracts = await listStepContractsByWorkItem(pgClient, id);
@@ -624,7 +627,19 @@ export function createApp(deps: AppDeps): Hono {
         return c.json({ error: "item not renderable" }, 500);
       }
 
-      return c.json(item);
+      // U-4: expose open pending decisions so the web UI can hide Approve/Reject
+      // when no pending decision is open for this item.
+      const openPending = openPendingDecisions(decisions);
+      return c.json({
+        ...item,
+        openPendingDecisions: openPending.map((d) => ({
+          id: d.id,
+          kind: d.kind ?? null,
+          attemptId: d.attemptId ?? null,
+          contractVersion: d.contractVersion ?? null,
+          at: d.at,
+        })),
+      });
     } finally {
       client.release();
     }
@@ -811,54 +826,27 @@ export function createApp(deps: AppDeps): Hono {
         severity: string;
       }> = [];
 
+      // U-11: collect raw decisions per work item, then batch-load rationales
+      // in 2 queries (one for dispatch_intents, one for run_observations) rather
+      // than 2 queries per decision. The contracts/attempts/findings loop is
+      // unchanged — only the rationale loading is batched.
+      type RawDecisionEntry = {
+        id: string;
+        work_item_id: string | null;
+        kind: string | null;
+        outcome: string | null;
+        at: Date;
+        contract_version: number | null;
+        attempt_id: string | null;
+      };
+      const rawDecisionEntries: RawDecisionEntry[] = [];
+
       for (const project of projects) {
         const workItems = await listWorkItemsByProject(pgClient, project.id);
         for (const wi of workItems) {
           const decisions = await listDecisionsByWorkItem(pgClient, wi.id);
           for (const d of decisions) {
-            // T-11: load the Lead proposal's rationale from the lead.plan run
-            // observation for this attempt, if present.
-            let rationale: string | null = null;
-            if (d.attempt_id) {
-              try {
-                const { rows: planIntentRows } = await client.query(
-                  `SELECT run_id FROM dispatch_intents
-                   WHERE attempt_id = $1 AND task = $2
-                   ORDER BY created_at DESC LIMIT 1`,
-                  [d.attempt_id, TASK_IDS.leadPlan],
-                );
-                const planRunId = (planIntentRows[0] as { run_id?: string | null } | undefined)
-                  ?.run_id;
-                if (planRunId) {
-                  const { rows: obsRows } = await client.query(
-                    `SELECT payload FROM run_observations
-                     WHERE run_id = $1 AND stale = false
-                     ORDER BY generation DESC LIMIT 1`,
-                    [planRunId],
-                  );
-                  const obsPayload = (obsRows[0] as { payload?: unknown } | undefined)?.payload as
-                    | { output?: unknown }
-                    | undefined;
-                  const planResult = LeadPlanOutputSchema.safeParse(obsPayload?.output);
-                  if (planResult.success && planResult.data.kind === "proposal") {
-                    rationale = planResult.data.proposal.rationale;
-                  }
-                }
-              } catch {
-                // Best-effort; keep rationale null on any error
-              }
-            }
-
-            allDecisions.push({
-              id: d.id,
-              workItemId: d.work_item_id,
-              kind: d.kind ?? "",
-              outcome: d.outcome,
-              at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
-              contractVersion: d.contract_version,
-              attemptId: d.attempt_id,
-              rationale,
-            });
+            rawDecisionEntries.push(d as RawDecisionEntry);
           }
 
           const contracts = await listStepContractsByWorkItem(pgClient, wi.id);
@@ -900,6 +888,68 @@ export function createApp(deps: AppDeps): Hono {
             }
           }
         }
+      }
+
+      // U-11: batch-load rationales in 2 queries keyed by attempt, not 2 per decision.
+      const rationaleByAttempt = new Map<string, string | null>();
+      const uniqueAttemptIds = [
+        ...new Set(rawDecisionEntries.map((d) => d.attempt_id).filter(Boolean)),
+      ] as string[];
+      if (uniqueAttemptIds.length > 0) {
+        try {
+          const placeholders = uniqueAttemptIds.map((_, i) => `$${i + 2}`).join(", ");
+          const { rows: intentRowsRaw } = await client.query(
+            `SELECT DISTINCT ON (attempt_id) attempt_id, run_id FROM dispatch_intents
+             WHERE attempt_id IN (${placeholders}) AND task = $1
+             ORDER BY attempt_id, created_at DESC`,
+            [TASK_IDS.leadPlan, ...uniqueAttemptIds],
+          );
+          const intentRows = intentRowsRaw as Array<{ attempt_id: string; run_id: string | null }>;
+          const runIdByAttempt = new Map<string, string>();
+          for (const row of intentRows) {
+            if (row.run_id) runIdByAttempt.set(row.attempt_id, row.run_id);
+          }
+          const runIds = [...runIdByAttempt.values()];
+          if (runIds.length > 0) {
+            const runPhs = runIds.map((_, i) => `$${i + 1}`).join(", ");
+            const { rows: obsRowsRaw } = await client.query(
+              `SELECT DISTINCT ON (run_id) run_id, payload FROM run_observations
+               WHERE run_id IN (${runPhs}) AND stale = false
+               ORDER BY run_id, generation DESC`,
+              runIds,
+            );
+            const obsRows = obsRowsRaw as Array<{ run_id: string; payload: unknown }>;
+            for (const obsRow of obsRows) {
+              const planResult = LeadPlanOutputSchema.safeParse(
+                (obsRow.payload as { output?: unknown } | undefined)?.output,
+              );
+              if (planResult.success && planResult.data.kind === "proposal") {
+                for (const [attemptId, rid] of runIdByAttempt) {
+                  if (rid === obsRow.run_id) {
+                    rationaleByAttempt.set(attemptId, planResult.data.proposal.rationale);
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        } catch {
+          // Best-effort; rationale stays null on any error
+        }
+      }
+
+      // Build the allDecisions array with rationales from the batch result.
+      for (const d of rawDecisionEntries) {
+        allDecisions.push({
+          id: d.id,
+          workItemId: d.work_item_id,
+          kind: d.kind ?? "",
+          outcome: d.outcome,
+          at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
+          contractVersion: d.contract_version,
+          attemptId: d.attempt_id,
+          rationale: d.attempt_id ? (rationaleByAttempt.get(d.attempt_id) ?? null) : null,
+        });
       }
 
       const view = buildDecisionsView({
@@ -1210,7 +1260,7 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ error: "Invalid JSON body" }, 400);
     }
 
-    const { commandId, authority, actor } = body;
+    const { commandId, authority, actor, expectedVersion } = body;
 
     if (!commandId || typeof commandId !== "string") {
       return c.json({ error: "commandId is required" }, 400);
@@ -1226,13 +1276,64 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ error: "update_authority not supported in this configuration" }, 400);
     }
 
-    const result = await commands.updateAuthority({
+    // U-2: if the client sends expectedVersion, inject the next version into the
+    // authority object so the client does not need to compute it.
+    const nextVersion = typeof expectedVersion === "number" ? expectedVersion + 1 : undefined;
+    const authorityToSubmit =
+      nextVersion !== undefined
+        ? { ...(authority as Record<string, unknown>), version: String(nextVersion) }
+        : authority;
+
+    // U-2: validate authority schema at the route level to return 422 with
+    // structured Zod errors rather than the generic validation_failed reason.
+    const { AuthoritySchema: AuthSchema } = await import("@agencyhq/contracts");
+    const parseResult = AuthSchema.safeParse(authorityToSubmit);
+    if (!parseResult.success) {
+      const errors = parseResult.error.issues.map((issue) => ({
+        path: issue.path.map(String),
+        message: issue.message,
+      }));
+      return c.json({ commandId, errors }, 422);
+    }
+
+    const resultRaw = await commands.updateAuthority({
       commandId,
       projectId: id,
-      authority,
-      actor,
+      authority: authorityToSubmit,
+      actor: actor as string,
     });
+    const result = resultRaw as { ok: true; version: string } | { ok: false; reason: string };
 
+    if (result.ok) {
+      // Return version as number for the web client.
+      return c.json({ commandId, result: { ok: true, version: Number(result.version) } }, 200);
+    }
+
+    if (result.reason === "project_not_found") {
+      return c.json({ error: "project not found" }, 404);
+    }
+
+    if (result.reason === "version_not_increasing" || result.reason === "stale_version") {
+      // Look up the current version for the 409 response body.
+      const client = await pool.connect();
+      let currentVersion = 0;
+      try {
+        const { rows: pvRowsRaw } = await client.query(
+          "SELECT authority_version FROM projects WHERE id = $1",
+          [id],
+        );
+        const pvRows = pvRowsRaw as Array<{ authority_version: string }>;
+        currentVersion = pvRows[0] ? Number(pvRows[0].authority_version) : 0;
+      } finally {
+        client.release();
+      }
+      return c.json(
+        { commandId, result: { ok: false, reason: result.reason, currentVersion } },
+        409,
+      );
+    }
+
+    // Fallback: validation_failed should have been caught above by safeParse.
     return c.json({ commandId, result }, 200);
   });
 
@@ -1484,14 +1585,15 @@ export function createApp(deps: AppDeps): Hono {
       if (kind === "reject") {
         const workItemId = body.workItemId;
         const decisionId = body.decisionId;
-        const reason = typeof body.reason === "string" ? body.reason : "";
+        // U-7: trim before checking; whitespace-only reason → 400 reason_required
+        const reason = (typeof body.reason === "string" ? body.reason : "").trim();
         if (!workItemId || typeof workItemId !== "string") {
           return c.json({ error: "workItemId required for reject" }, 400);
         }
         if (!decisionId || typeof decisionId !== "string") {
           return c.json({ error: "decisionId required for reject" }, 400);
         }
-        // T-5: reason is required; empty reason → 400
+        // T-5 / U-7: reason is required; empty or whitespace-only reason → 400
         if (!reason) {
           return c.json({ ok: false, reason: "reason_required" }, 400);
         }
@@ -1502,12 +1604,16 @@ export function createApp(deps: AppDeps): Hono {
       if (kind === "invalidate_acceptance") {
         const workItemId = body.workItemId;
         const attemptId = body.attemptId;
-        const reason = typeof body.reason === "string" ? body.reason : "acceptance invalidated";
+        // U-7: non-empty (trimmed) reason required; no server-side default.
+        const reason = (typeof body.reason === "string" ? body.reason : "").trim();
         if (!workItemId || typeof workItemId !== "string") {
           return c.json({ error: "workItemId required for invalidate_acceptance" }, 400);
         }
         if (!attemptId || typeof attemptId !== "string") {
           return c.json({ error: "attemptId required for invalidate_acceptance" }, 400);
+        }
+        if (!reason) {
+          return c.json({ ok: false, reason: "reason_required" }, 400);
         }
         const result = await commands.invalidateAcceptance({
           commandId,

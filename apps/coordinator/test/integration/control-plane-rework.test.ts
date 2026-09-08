@@ -1,5 +1,6 @@
 /**
  * Rework integration tests for S5 findings T-4, T-5, T-8, T-9, T-12, T-13.
+ * Also covers U-1 (reject guard), U-3 (invalidate accepted), U-8 (backfill actor).
  *
  * Requires DATABASE_URL pointing to the test Postgres instance.
  * DATABASE_URL=postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test
@@ -19,6 +20,7 @@ import {
   setMainEffort,
   updateAuthority,
 } from "../../src/commands/index.ts";
+import { buildDecisionsView } from "../../src/views/decisions-view.ts";
 import { withControlPlaneSchema } from "../helpers/control-plane-schema.ts";
 
 // ---------------------------------------------------------------------------
@@ -129,16 +131,20 @@ test("T-4: mismatch decision remains open in view and a later correct approve su
     const projectId = await seedProject(ctx);
     const workItemId = await seedWorkItem(ctx, projectId, { lifecycle: "active" });
     const contractId = await seedContract(ctx, workItemId, projectId);
-    const { attemptId } = await seedAttemptWithDecision(ctx, contractId, workItemId, {
-      decisionOutcome: "pending_human",
-    });
+    const { attemptId, decisionId: pendingId } = await seedAttemptWithDecision(
+      ctx,
+      contractId,
+      workItemId,
+      { decisionOutcome: "pending_human" },
+    );
 
     // Insert an approval_mismatch decision (same attempt, same kind) — this is what
     // the approve command now writes on a version mismatch (T-4).
+    const mismatchId = `dec-mismatch-${randomUUID()}`;
     await ctx.client.query(
       `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
        VALUES ($1, 'accept', 'human', $2, $3, 'approval_mismatch', now())`,
-      [`dec-mismatch-${randomUUID()}`, workItemId, attemptId],
+      [mismatchId, workItemId, attemptId],
     );
 
     // The pending_human decision must still be open (not resolved by approval_mismatch).
@@ -156,6 +162,52 @@ test("T-4: mismatch decision remains open in view and a later correct approve su
       [attemptId],
     )) as { rows: Array<{ outcome: string }> };
     assert.equal(resolvedRows.length, 0, "no resolving decision — pending remains open for retry");
+
+    // U-13: exercise the decisions view builder — the pending must appear as open,
+    // and the approval_mismatch decision must exist in the DB. The view function
+    // runs openPendingDecisions, which must not close the pending due to mismatch.
+    const viewDecisions = [
+      {
+        id: pendingId,
+        workItemId,
+        kind: "accept",
+        outcome: "pending_human",
+        at: new Date().toISOString(),
+        attemptId,
+        contractVersion: 1 as number | null,
+        rationale: null as string | null,
+      },
+      {
+        id: mismatchId,
+        workItemId,
+        kind: "accept",
+        outcome: "approval_mismatch",
+        at: new Date().toISOString(),
+        attemptId,
+        contractVersion: 1 as number | null,
+        rationale: null as string | null,
+      },
+    ];
+    const decisionsView = buildDecisionsView({
+      decisions: viewDecisions,
+      attempts: [],
+      contracts: [],
+      findings: [],
+    });
+    // The decisions view should list the pending as open (approval_mismatch is not resolving).
+    assert.equal(
+      decisionsView.decisions.length,
+      1,
+      "decisions view: pending still open (not resolved by approval_mismatch)",
+    );
+    assert.equal(decisionsView.decisions[0]?.id, pendingId, "open pending id matches");
+
+    // The approval_mismatch decision must exist in the DB (command side covered by approve.test.ts).
+    const { rows: mismatchRows } = (await ctx.client.query(
+      `SELECT outcome FROM decisions WHERE id = $1`,
+      [mismatchId],
+    )) as { rows: Array<{ outcome: string }> };
+    assert.equal(mismatchRows[0]?.outcome, "approval_mismatch", "approval_mismatch decision in DB");
   });
 });
 
@@ -252,6 +304,12 @@ test("T-9: update_authority stale_version when update base is no longer current"
       assert.equal(r1.ok, true, "first update ok");
 
       // Second update proposes version "2" again (same base) — domain rejects it.
+      // With SELECT FOR UPDATE, the second writer reads the already-updated row
+      // (version "2"), so proposeAuthorityUpdate sees next.version ("2") <= current ("2")
+      // and returns version_not_greater → version_not_increasing. stale_version is
+      // unreachable under FOR UPDATE (the CAS branch never fires for a concurrent writer
+      // because the lock serialises writes); stale_version remains in the type for the
+      // non-locking path if any is ever introduced.
       const r2 = await updateAuthority(
         { pool },
         {
@@ -263,9 +321,10 @@ test("T-9: update_authority stale_version when update base is no longer current"
       );
       assert.equal(r2.ok, false, "second update from same base fails");
       if (!r2.ok) {
-        assert.ok(
-          r2.reason === "stale_version" || r2.reason === "version_not_increasing",
-          `expected stale_version or version_not_increasing, got ${r2.reason}`,
+        assert.equal(
+          r2.reason,
+          "version_not_increasing",
+          "FOR UPDATE serialises writes: second writer sees new version, gets version_not_increasing",
         );
       }
     } finally {
@@ -355,12 +414,31 @@ test("T-13: update_authority backfills initial version in authority_versions on 
       );
       assert.equal(r.ok, true);
 
-      const { rows: after } = (await ctx.client.query(
-        `SELECT version FROM authority_versions WHERE project_id = $1 ORDER BY at`,
+      // U-8: the backfilled row must be attributed to "backfill" (not the updating
+      // actor) and its timestamp must match the project's created_at.
+      const { rows: projectMeta } = (await ctx.client.query(
+        `SELECT created_at FROM projects WHERE id = $1`,
         [projectId],
-      )) as { rows: Array<{ version: string }> };
+      )) as { rows: Array<{ created_at: Date }> };
+
+      const { rows: after } = (await ctx.client.query(
+        `SELECT version, actor, at FROM authority_versions WHERE project_id = $1 ORDER BY at`,
+        [projectId],
+      )) as { rows: Array<{ version: string; actor: string; at: Date }> };
       assert.equal(after.length, 2, "initial + new version both recorded");
       assert.equal(after[0]?.version, "1", "initial version backfilled");
+      assert.equal(
+        after[0]?.actor,
+        "backfill",
+        "backfill row attributed to 'backfill' actor (U-8)",
+      );
+      // Timestamp should equal project created_at (within 1 second tolerance for DB precision).
+      const backfillAt = after[0]?.at?.getTime() ?? 0;
+      const projectCreatedAt = projectMeta[0]?.created_at?.getTime() ?? -1;
+      assert.ok(
+        Math.abs(backfillAt - projectCreatedAt) < 1000,
+        `backfill at (${new Date(backfillAt).toISOString()}) should match project created_at (${new Date(projectCreatedAt).toISOString()})`,
+      );
       assert.equal(after[1]?.version, "2", "new version recorded");
     } finally {
       await pool.end();
@@ -405,6 +483,127 @@ test("T-13: invalidate_acceptance leaves step_contracts row unchanged", async (t
         after[0]?.criteria_digest,
         before[0]?.criteria_digest,
         "criteria_digest unchanged",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// U-1: reject guard — reject-after-approve returns state_mismatch (R-001, R-010)
+// ---------------------------------------------------------------------------
+
+test("U-1: reject-after-approve returns state_mismatch; lifecycle and decision count unchanged", async (t) => {
+  await withControlPlaneSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(process.env.DATABASE_URL ?? "", ctx.schema);
+    try {
+      const projectId = await seedProject(ctx);
+      const workItemId = await seedWorkItem(ctx, projectId, { lifecycle: "completed" });
+      const contractId = await seedContract(ctx, workItemId, projectId);
+      const { decisionId: pendingId, attemptId } = await seedAttemptWithDecision(
+        ctx,
+        contractId,
+        workItemId,
+        { decisionOutcome: "pending_human" },
+      );
+
+      // Simulate what approve wrote: an approved decision for the same attempt.
+      await ctx.client.query(
+        `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
+         VALUES ($1, 'accept', 'coordinator', $2, $3, 'approved', now())`,
+        [`dec-approved-${randomUUID()}`, workItemId, attemptId],
+      );
+
+      // Reject on an already-approved decision must return state_mismatch (U-1).
+      const r1 = await rejectWorkItem(
+        { pool },
+        { commandId: randomUUID(), workItemId, decisionId: pendingId, reason: "late" },
+      );
+      assert.equal(r1.ok, false, "reject-after-approve: ok must be false");
+      if (!r1.ok) {
+        assert.equal(r1.reason, "state_mismatch", "reject-after-approve: reason = state_mismatch");
+      }
+
+      // Lifecycle must remain 'completed' — not halted.
+      const { rows: wiRows } = (await ctx.client.query(
+        `SELECT lifecycle FROM work_items WHERE id = $1`,
+        [workItemId],
+      )) as { rows: Array<{ lifecycle: string }> };
+      assert.equal(
+        wiRows[0]?.lifecycle,
+        "completed",
+        "lifecycle unchanged after reject-after-approve",
+      );
+
+      // No rejected decision row was appended.
+      const { rows: rejRows } = (await ctx.client.query(
+        `SELECT count(*)::int AS n FROM decisions WHERE attempt_id = $1 AND outcome = 'rejected'`,
+        [attemptId],
+      )) as { rows: Array<{ n: number }> };
+      assert.equal(rejRows[0]?.n, 0, "no rejected decision appended after reject-after-approve");
+
+      // Repeat reject with a fresh commandId must also be state_mismatch (R-010).
+      const r2 = await rejectWorkItem(
+        { pool },
+        { commandId: randomUUID(), workItemId, decisionId: pendingId, reason: "again" },
+      );
+      assert.equal(r2.ok, false, "double-reject with new commandId: ok must be false");
+      if (!r2.ok) {
+        assert.equal(r2.reason, "state_mismatch", "double-reject: reason = state_mismatch");
+      }
+
+      // Still no rejected rows.
+      const { rows: rejRows2 } = (await ctx.client.query(
+        `SELECT count(*)::int AS n FROM decisions WHERE attempt_id = $1 AND outcome = 'rejected'`,
+        [attemptId],
+      )) as { rows: Array<{ n: number }> };
+      assert.equal(rejRows2[0]?.n, 0, "still no rejected decisions after double-reject");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// U-3: invalidate_acceptance works on coordinator-accepted ('accepted') decisions
+// ---------------------------------------------------------------------------
+
+test("U-3: invalidate_acceptance succeeds on coordinator-accepted (outcome='accepted') decision", async (t) => {
+  await withControlPlaneSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(process.env.DATABASE_URL ?? "", ctx.schema);
+    try {
+      const projectId = await seedProject(ctx);
+      const workItemId = await seedWorkItem(ctx, projectId, { lifecycle: "completed" });
+      const contractId = await seedContract(ctx, workItemId, projectId);
+      const { attemptId } = await seedAttemptWithDecision(ctx, contractId, workItemId, {
+        decisionOutcome: "accepted",
+        decisionKind: "accept",
+      });
+
+      // Invalidate an 'accepted' (coordinator auto-acceptance) decision.
+      const r = await invalidateAcceptance(
+        { pool },
+        { commandId: randomUUID(), workItemId, attemptId, reason: "defect found post-acceptance" },
+      );
+      assert.equal(r.ok, true, "invalidate on 'accepted' decision should succeed (U-3)");
+
+      // Historical accept decision row must NOT be modified (R-017).
+      const { rows: acceptRows } = (await ctx.client.query(
+        `SELECT outcome FROM decisions WHERE attempt_id = $1 AND kind = 'accept' AND outcome = 'accepted'`,
+        [attemptId],
+      )) as { rows: Array<{ outcome: string }> };
+      assert.equal(acceptRows.length, 1, "historical 'accepted' decision row untouched");
+
+      // Work item lifecycle should be reopened.
+      const { rows: wiRows } = (await ctx.client.query(
+        `SELECT lifecycle FROM work_items WHERE id = $1`,
+        [workItemId],
+      )) as { rows: Array<{ lifecycle: string }> };
+      assert.equal(
+        wiRows[0]?.lifecycle,
+        "reopened",
+        "work item lifecycle = reopened after invalidation",
       );
     } finally {
       await pool.end();

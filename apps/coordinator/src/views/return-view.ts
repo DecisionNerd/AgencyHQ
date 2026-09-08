@@ -8,6 +8,8 @@
  * No database access. No side effects. Fully testable with plain objects.
  */
 
+import { openPendingDecisions } from "./pending.ts";
+
 // ---------------------------------------------------------------------------
 // Input snapshot shapes (minimal fields; named to match domain aggregates)
 // ---------------------------------------------------------------------------
@@ -47,6 +49,10 @@ export type DecisionLike = {
   outcome: string; // DecisionOutcome
   at: string; // ISO-8601
   detail?: string; // free-form detail for pending decisions
+  /** Attempt id — required for attempt-scoped open-pending resolution (U-4). */
+  attemptId?: string | null;
+  /** Contract version — required for no-attempt open-pending resolution (U-4). */
+  contractVersion?: number | null;
 };
 
 export type ResultLike = {
@@ -339,29 +345,27 @@ export function buildReturnView(input: ReturnViewInput): ReturnView {
     }
   }
 
-  // Collect pending decisions (outcome = "pending_human"), enriched with
-  // integration_conflict finding evidence when no explicit detail is set.
+  // Collect pending decisions — only open ones (U-4: use openPendingDecisions
+  // so resolved rows are not re-listed after approve/reject).
   const pendingDecisions: PendingDecision[] = [];
-  for (const d of decisions) {
-    if (d.outcome === "pending_human") {
-      const pd: PendingDecision = {
-        decisionId: d.id,
-        workItemId: d.workItemId,
-        kind: d.kind,
-        outcome: d.outcome,
-        at: d.at,
-      };
-      if (d.detail !== undefined) {
-        pd.detail = d.detail;
-      } else {
-        // Enrich with integration_conflict finding evidence if available
-        const conflictFinding = integConflictFindingByWorkItem.get(d.workItemId);
-        if (conflictFinding?.evidence) {
-          pd.detail = conflictFinding.evidence;
-        }
+  for (const d of openPendingDecisions(decisions)) {
+    const pd: PendingDecision = {
+      decisionId: d.id,
+      workItemId: d.workItemId,
+      kind: d.kind,
+      outcome: d.outcome,
+      at: d.at,
+    };
+    if (d.detail !== undefined) {
+      pd.detail = d.detail;
+    } else {
+      // Enrich with integration_conflict finding evidence if available
+      const conflictFinding = integConflictFindingByWorkItem.get(d.workItemId);
+      if (conflictFinding?.evidence) {
+        pd.detail = conflictFinding.evidence;
       }
-      pendingDecisions.push(pd);
     }
+    pendingDecisions.push(pd);
   }
   // Sort by at ascending
   pendingDecisions.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));

@@ -176,7 +176,10 @@ test("runCheck: timeout kills process group and sets timedOut", { timeout: 15_00
     version: "1",
     // Spawn a shell that starts a background sleep and a foreground sleep.
     // If the process group is killed, both sleeps should die.
-    command: ["sh", "-c", "sleep 30 & sleep 30"],
+    // The unusual duration is a marker: pgrep below must not match unrelated
+    // "sleep 30" processes on the host (observed 2026-09-08: a shell snapshot
+    // and a monitor loop both matched).
+    command: ["sh", "-c", "sleep 30.31337 & sleep 30.31337"],
     timeoutSeconds: 1,
   };
   const result = await runCheck(def, { cwd: tmpdir() });
@@ -186,12 +189,12 @@ test("runCheck: timeout kills process group and sets timedOut", { timeout: 15_00
   await new Promise((r) => setTimeout(r, 500));
 
   // Verify no `sleep 30` remains.
-  const pgrep = spawnSync("pgrep", ["-f", "sleep 30"]);
+  const pgrep = spawnSync("pgrep", ["-f", "sleep 30.31337"]);
   // pgrep exits 1 when no processes match.
   assert.equal(
     pgrep.status,
     1,
-    `Expected no 'sleep 30' processes to survive, got: ${pgrep.stdout.toString()}`,
+    `Expected no 'sleep 30.31337' processes to survive, got: ${pgrep.stdout.toString()}`,
   );
 });
 

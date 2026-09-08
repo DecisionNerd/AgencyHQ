@@ -89,9 +89,12 @@ export async function updateAuthority(
         id: string;
         authority_version: string;
         authority: unknown;
-      }>(`SELECT id, authority_version, authority FROM projects WHERE id = $1 FOR UPDATE`, [
-        projectId,
-      ]);
+        created_at: Date;
+        updated_at: Date;
+      }>(
+        `SELECT id, authority_version, authority, created_at, updated_at FROM projects WHERE id = $1 FOR UPDATE`,
+        [projectId],
+      );
 
       if (projectRows.length === 0) {
         await client.query("ROLLBACK");
@@ -103,6 +106,9 @@ export async function updateAuthority(
       const currentVersionStr = projectRows[0]?.authority_version ?? "0";
       // proposeAuthorityUpdate uses current.version; current.authority satisfies the type.
       const currentAuthority = (projectRows[0]?.authority ?? {}) as Authority;
+      // U-8: backfill is attributed to "backfill" with the project's creation timestamp.
+      const projectCreatedAt =
+        projectRows[0]?.created_at ?? projectRows[0]?.updated_at ?? new Date();
 
       // 4. Validate and check version via domain function
       const proposal = proposeAuthorityUpdate(
@@ -145,12 +151,14 @@ export async function updateAuthority(
         [projectId],
       );
       if (existingVersionRows.length === 0) {
+        // U-8: backfill is attributed to actor "backfill" with the project's
+        // created_at timestamp (audit trail correctness — not the updating actor).
         await insertAuthorityVersion(client, {
           project_id: projectId,
           version: currentVersionStr,
           authority: currentAuthority,
-          actor,
-          at: new Date(now.getTime() - 1), // just before the new version
+          actor: "backfill",
+          at: projectCreatedAt,
         });
       }
 
