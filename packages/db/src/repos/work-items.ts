@@ -66,3 +66,28 @@ export async function listWorkItemsByProject(
   );
   return rows.map((r) => WorkItemRowSchema.parse(r));
 }
+
+/**
+ * Update a work item's rank with optimistic concurrency (CAS on version).
+ *
+ * Bumps work_items.version by 1. Returns "applied" when the row was updated,
+ * or "stale" when expectedVersion does not match the current row version
+ * (another writer updated it first).
+ */
+export async function setWorkItemRank(
+  client: pg.PoolClient,
+  workItemId: string,
+  rank: number,
+  expectedVersion: number,
+): Promise<"applied" | "stale"> {
+  const { rowCount } = await client.query(
+    `UPDATE work_items
+        SET rank       = $3,
+            version    = version + 1,
+            updated_at = now()
+      WHERE id = $1
+        AND version = $2`,
+    [workItemId, expectedVersion, rank],
+  );
+  return (rowCount ?? 0) > 0 ? "applied" : "stale";
+}
