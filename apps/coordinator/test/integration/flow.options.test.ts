@@ -524,3 +524,53 @@ test("flow.options: review trigger includes concurrencyKey and tags (F-3)", asyn
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Test 5: lead.plan trigger carries project: and workItem: tags (issue #8)
+// ---------------------------------------------------------------------------
+
+test("flow.options: lead.plan trigger includes project: and workItem: tags (issue-8)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId, projectId } = await seedProjectAndWorkItem(client);
+      const fake = new FakeExecutionRuntime();
+
+      // Only need plan to trigger; no need to advance past plan
+      fake.script(TASK_IDS.leadPlan, () => ({ status: "QUEUED" }));
+
+      const deps = makeFlowDeps(pool, fake);
+      const flow = new BoundedRepairFlow(deps);
+
+      await flow.plan(workItemId, newId("cmd"));
+
+      const planCalls = triggerCallsForTask(fake, TASK_IDS.leadPlan);
+      assert.equal(planCalls.length, 1, "lead.plan triggered once");
+      assert.ok(planCalls[0], "plan call record exists");
+
+      const opts = planCalls[0].options;
+      const tags = opts.tags as string[] | undefined;
+      assert.ok(Array.isArray(tags), "lead.plan trigger options has tags array");
+      assert.ok(
+        tags.some((tag) => tag === `project:${projectId}`),
+        `tags must include project:${projectId}, got ${JSON.stringify(tags)}`,
+      );
+      assert.ok(
+        tags.some((tag) => tag === `workItem:${workItemId}`),
+        `tags must include workItem:${workItemId}, got ${JSON.stringify(tags)}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});

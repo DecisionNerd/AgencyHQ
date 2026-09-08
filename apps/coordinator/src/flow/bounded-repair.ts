@@ -491,7 +491,10 @@ export class BoundedRepairFlow {
         intentId,
         task: TASK_IDS.leadPlan,
         payload,
-        options: { idempotencyKey },
+        options: {
+          idempotencyKey,
+          tags: [`project:${projectRow.id}`, `workItem:${wiRow.id}`],
+        },
       });
 
       await pool.query(
@@ -1247,24 +1250,106 @@ export class BoundedRepairFlow {
       }
 
       const changedPaths = artifactRow.changed_paths ?? [];
-      const tamperingFindings = detectVerifierTampering(
+      const coordinatorFindings = detectVerifierTampering(
         changedPaths,
         resolvedProfile.protectedPaths,
       );
-      for (const finding of tamperingFindings) {
-        const findingId = ids.next("fnd") as FindingId;
-        await client.query(
-          `INSERT INTO findings (id, attempt_id, severity, kind, description, evidence)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [
-            String(findingId),
-            attemptRow.id,
-            finding.severity,
-            finding.kind,
-            finding.description,
-            String(finding.evidence ?? ""),
-          ],
-        );
+
+      // Build the set of paths the coordinator detected as tampered.
+      // The evidence string format is "path:<path> pattern:<pattern>"; extract
+      // the path by matching up to the first space.
+      const coordinatorTamperedPaths = [
+        ...new Set(
+          coordinatorFindings
+            .map((f) => {
+              const m = String(f.evidence ?? "").match(/^path:(\S+)/);
+              return m?.[1] ?? "";
+            })
+            .filter(Boolean),
+        ),
+      ];
+
+      // Parse adapter integrity field (optional; absent on pre-H-6 runs).
+      const adapterIntegrity = verifyOutput.success ? verifyOutput.data.integrity : undefined;
+
+      if (adapterIntegrity) {
+        const adapterPaths = adapterIntegrity.tamperedPaths;
+        const coordinatorSet = new Set(coordinatorTamperedPaths);
+        const adapterSet = new Set(adapterPaths);
+
+        // Detect disagreement: either side has paths the other does not.
+        const setsDiffer =
+          coordinatorTamperedPaths.some((p) => !adapterSet.has(p)) ||
+          adapterPaths.some((p) => !coordinatorSet.has(p));
+
+        if (setsDiffer) {
+          console.error(
+            "[onVerifyFinal] integrity mismatch: adapter and coordinator tampered-path sets differ",
+            { adapter: adapterPaths, coordinator: coordinatorTamperedPaths },
+          );
+        }
+
+        // Enriched evidence records both sides for every finding.
+        const enrichedEvidence = JSON.stringify({
+          adapter: adapterPaths,
+          coordinator: coordinatorTamperedPaths,
+          ...(adapterIntegrity.protectedPathsSource
+            ? { protectedPathsSource: adapterIntegrity.protectedPathsSource }
+            : {}),
+        });
+
+        // Write coordinator findings with enriched evidence.
+        for (const finding of coordinatorFindings) {
+          const findingId = ids.next("fnd") as FindingId;
+          await client.query(
+            `INSERT INTO findings (id, attempt_id, severity, kind, description, evidence)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              String(findingId),
+              attemptRow.id,
+              finding.severity,
+              finding.kind,
+              finding.description,
+              enrichedEvidence,
+            ],
+          );
+        }
+
+        // Union: add findings for paths the adapter detected but coordinator did not.
+        for (const path of adapterPaths) {
+          if (!coordinatorSet.has(path)) {
+            const findingId = ids.next("fnd") as FindingId;
+            await client.query(
+              `INSERT INTO findings (id, attempt_id, severity, kind, description, evidence)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [
+                String(findingId),
+                attemptRow.id,
+                "blocking",
+                "verifier_tampered",
+                `Changed path "${path}" reported by adapter as tampered but not matched by coordinator protected-path rules. Any change to an approved verifier or its configuration is Review-blocking until the profile is re-versioned.`,
+                enrichedEvidence,
+              ],
+            );
+          }
+        }
+      } else {
+        // Adapter omitted integrity — use coordinator findings unchanged (backward compatible).
+        for (const finding of coordinatorFindings) {
+          const findingId = ids.next("fnd") as FindingId;
+          await client.query(
+            `INSERT INTO findings (id, attempt_id, severity, kind, description, evidence)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              String(findingId),
+              attemptRow.id,
+              finding.severity,
+              finding.kind,
+              finding.description,
+              String(finding.evidence ?? ""),
+            ],
+          );
+        }
       }
       const reviewIntentId = ids.next("di") as DispatchIntentId;
       const reviewPayload = LeadReviewPayloadSchema.parse({
