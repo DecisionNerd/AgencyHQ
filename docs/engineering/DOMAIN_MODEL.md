@@ -54,14 +54,24 @@ and Findings. An honest partial or failed report is valid execution evidence,
 not acceptance. Missing results remain unknown.
 
 A worker output with a null commit id (nothing changed) is classified as a
-failure; no Artifact is created for that attempt (untested: no test covers
-this path yet).
+failure; no Artifact is created for that attempt. Test: `flow.parking (a)`
+(`apps/coordinator/test/integration/flow.parking.test.ts`) asserts one
+`failures` row with `class='contract'`, `phase='final'`, `cause` mentioning
+`null commitId`; `attempt.status='failed'`; no `artifacts` row; no
+`dispatch_intents` row for `verify.run`.
 
 When the authority schema sets `humanRequired` true, the work item is parked as
 `pending_human` after acceptance is proposed, and stays there until a matching
-Approval bound to the same contract version and attempt exists (untested: no
-test covers this parking path yet). No Approval write path (command or API)
-exists yet; this is Slice 4 scope.
+Approval bound to the same contract version and attempt exists. The `approve`
+command (`POST /api/commands` with `kind: "approve"`) supplies the Approval
+(`contractId`, `contractVersion`, `attemptRevision`), writes an `approvals`
+row, and re-runs acceptance via `evaluateAcceptanceForAttempt`; the command is
+idempotent by `commandId`. `APPROVAL_VERSION_MISMATCH` leaves the item
+`pending_human`. Test: `flow.parking (b)` asserts one `decisions` row with
+`kind='accept'`, `outcome='pending_human'`, `actor='coordinator'`; `work_items`
+lifecycle not `'completed'`; no `approvals` row; replay is a no-op (still
+exactly one decision row). The Approval command is covered by
+`apps/coordinator/test/integration/approve.test.ts`.
 
 ## Delegated authority
 

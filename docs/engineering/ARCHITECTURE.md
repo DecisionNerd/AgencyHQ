@@ -85,7 +85,7 @@ Thin, versioned task definitions with no policy:
 | --- | --- | --- |
 | `lead.plan` | Read-only OpenCode session in a worktree at the base revision; proposes StepContract, criteria, profile, review depth, boundary. | Structured proposal with source citations. |
 | `worker.attempt` | `git worktree add` at the base revision; resolves the model from `payload.model` then `AGENCYHQ_OPENCODE_MODEL` — neither being set is a setup failure (`AbortTaskRunError`, not retried); requires `permissionRules` in the payload — resolves with `resolveWorkerRuleset` (contract ruleset with always-deny set enforced on top) and fails setup with `AbortTaskRunError` if absent; spawn OpenCode with scrubbed env; on exit diff, path-check (`paths.deny` from the payload enforced in classification — violations quarantine), commit `agencyhq/attempts/<id>`; on cancel commit a checkpoint and kill the process group. | Worker report, commit id, diff digest, path violations. |
-| `verify.run` | Separate worktree at the attempt revision; run the approved profile's checks; `protectedPaths` from the payload (package manifests, lock files, workspace file, tsconfig*, biome.json, .github/**, vitest/jest configs; test source files are not protected) detect verifier tampering and produce blocking `verifier_tampered` findings; records `protectedPathsSource` (`"payload"` when the coordinator sent the field, `"default"` otherwise) — recorded by the adapter; not consumed by the coordinator; capture bounded logs. | VerificationResult records. |
+| `verify.run` | Separate worktree at the attempt revision; run the approved profile's checks; `protectedPaths` from the payload (package manifests, lock files, workspace file, tsconfig*, biome.json, .github/**, vitest/jest configs; test source files are not protected) detect verifier tampering and produce blocking `verifier_tampered` findings; records `protectedPathsSource` (`"payload"` when the coordinator sent the field, `"default"` otherwise) in the `integrity` output field. The coordinator's `onVerifyFinal` unions the adapter's `integrity.tamperedPaths` set with its own recomputed set, records both sides as JSON (`{ adapter, coordinator, protectedPathsSource }`) in finding evidence, and logs disagreement; `onAcceptFinal` loads blocking `verifier_tampered` findings and rejects with `VERIFIER_TAMPERED`. Covered by `apps/coordinator/test/integration/flow.integrity.test.ts` (three tests: adapter agrees, adapter omits, union case) and `trigger/test/verify-run-core.test.ts` (H-6: `protectedPathsSource` in output). Capture bounded logs. | VerificationResult records plus `integrity` field. |
 | `lead.review` | Read-only session over the diff and evidence; adversarial review. Reviewer identity is the invoked `payload.model`. | Review findings against exact versions. |
 | `lead.accept` | Judges criteria against evidence and review; coordinator's `evaluateAcceptance` reads `integrityFindings` from the attempt's `findings` table and rejects with `VERIFIER_TAMPERED` (one of 14 acceptance reason codes) when any blocking integrity finding is present. | Acceptance proposal with rationale. |
 | `integrate.merge` | After a recorded acceptance: merge to the target ref, compare-and-set on expected base, push with host credentials. | Resulting revision or conflict evidence. |
@@ -156,8 +156,14 @@ record on disk (`<runDir>/stop.ndjson`), not from run status alone — see the
   processes inherit the host's OpenCode credentials by design of the host
   profile; that exposure is recorded, not hidden.
 - The coordinator HTTP API binds to `AGENCYHQ_BIND_HOST` (default
-  `127.0.0.1`) and has no authentication; it must not be exposed beyond the
-  host. Bearer auth is planned but not yet implemented.
+  `127.0.0.1`). All `/api/*` routes except `/api/health` require an
+  `Authorization: Bearer <token>` header matching `AGENCYHQ_API_TOKEN`. When
+  `AGENCYHQ_API_TOKEN` is unset and the bind host is not loopback, the server
+  fails closed at startup. Loopback without a token is allowed but logs a
+  startup warning. The web client stores the token in
+  `localStorage["agencyhq.apiToken"]`, includes `Authorization: Bearer
+  <token>` on every `/api/*` call, and shows a token-entry form when the API
+  returns 401.
 - Every command is bound to actor, Project, contract version, attempt, and
   generation; Decisions and Approvals are immutable audit records.
 - Worker reports, repository content, Lead proposals, and run outputs are
