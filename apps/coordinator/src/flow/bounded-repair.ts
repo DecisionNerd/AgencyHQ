@@ -28,6 +28,7 @@ import {
   AcceptanceProposalSchema,
   criteriaDigestInput,
   digestOf,
+  IntegrateMergePayloadSchema,
   LeadAcceptPayloadSchema,
   LeadPlanPayloadSchema,
   LeadReviewPayloadSchema,
@@ -39,12 +40,20 @@ import {
   WorkerAttemptOutputSchema,
   WorkerAttemptPayloadSchema,
 } from "@agencyhq/contracts";
-import { applyObservation, claimCommand, completeCommand, type createPool } from "@agencyhq/db";
+import {
+  applyObservation,
+  claimCommand,
+  completeCommand,
+  type createPool,
+  insertIntegration,
+  insertWorkItemProjects,
+} from "@agencyhq/db";
 import {
   type AcceptanceFailureReason,
   type ApprovalLike,
   type ArtifactId,
   type AttemptId,
+  checkBoundarySupport,
   checkProposal,
   classifyObservation,
   type DecisionId,
@@ -65,6 +74,7 @@ import {
   type WorkItemId,
 } from "@agencyhq/domain";
 
+import { deriveTargetRef } from "./integrate.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +83,7 @@ import type { FlowDeps } from "./types.ts";
 
 interface ProjectRow {
   id: string;
+  remote: string | null;
   clone_path: string | null;
   worktree_base: string | null;
   authority: Authority;
@@ -107,6 +118,7 @@ interface StepContractRow {
   human_required: boolean;
   status: string;
   inputs: { intent: string; defect?: string };
+  target_ref: string | null;
 }
 
 interface AttemptRow {
@@ -609,6 +621,24 @@ export class BoundedRepairFlow {
         return;
       }
 
+      // R-016: reject proposals for boundaries the coordinator cannot execute.
+      // deploy is not yet implemented; merge is supported.
+      const boundarySupportViolation = checkBoundarySupport(bounds);
+      if (boundarySupportViolation) {
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO decisions (id, kind, actor, work_item_id, outcome, at)
+           VALUES ($1, 'plan', 'coordinator', $2, 'pending_human', $3)`,
+          [String(decisionId), workItemId, at],
+        );
+        await client.query("COMMIT");
+        await completeCommand(client, commandId, {
+          decisionId: String(decisionId),
+          violations: [boundarySupportViolation],
+        });
+        return;
+      }
+
       const catalog = Array.isArray(projectRow.profile_catalog)
         ? (projectRow.profile_catalog as string[])
         : [];
@@ -691,6 +721,10 @@ export class BoundedRepairFlow {
 
       const workerPayloadDigest = digestOf(workerPayload);
 
+      // For merge boundary: freeze target_ref from project's allowed_refs.
+      const mergeTargetRef =
+        bounds.boundary === "merge" ? deriveTargetRef(projectRow.allowed_refs) : null;
+
       // Commit Decision + StepContract + Attempt + DispatchIntent atomically (R-002)
       await client.query("BEGIN");
 
@@ -714,8 +748,8 @@ export class BoundedRepairFlow {
         `INSERT INTO step_contracts
            (id, work_item_id, project_id, version, base_revision, inputs, criteria,
             criteria_digest, profile_id, profile_digest, bounds, required_boundaries,
-            human_required, status)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11::jsonb, $12::jsonb, $13, 'active')`,
+            human_required, status, target_ref)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11::jsonb, $12::jsonb, $13, 'active', $14)`,
         [
           String(contractId),
           String(contract.workItemId),
@@ -730,8 +764,21 @@ export class BoundedRepairFlow {
           JSON.stringify(contract.bounds),
           JSON.stringify(contract.requiredBoundaries),
           contract.humanRequired,
+          mergeTargetRef,
         ],
       );
+
+      // For merge boundary: create work_item_projects row (implicit single-repo manifest).
+      if (bounds.boundary === "merge" && mergeTargetRef) {
+        await insertWorkItemProjects(client, workItemId, [
+          {
+            project_id: String(contract.projectId),
+            position: 0,
+            target_ref: mergeTargetRef,
+            expected_base_revision: contract.baseRevision,
+          },
+        ]);
+      }
 
       await client.query(
         `INSERT INTO attempts
@@ -1617,40 +1664,149 @@ export class BoundedRepairFlow {
       }
 
       if (acceptResult.ok) {
-        const revision = ctx.artifactRevision;
+        // Load contract to check boundary and target_ref.
+        const contractRow = await loadContract(pool, ctx.contractId);
+        const projectRow = await loadProject(pool, contractRow.project_id);
+        const boundary = contractRow.bounds.boundary;
 
-        await client.query("BEGIN");
-        await client.query(
-          `INSERT INTO decisions
-             (id, kind, actor, work_item_id, contract_id, contract_version, attempt_id, outcome, at)
-           VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'accepted', $6)`,
-          [
-            String(decisionId),
-            ctx.workItemId,
-            ctx.contractId,
-            ctx.contractVersion,
-            ctx.attemptId,
-            at,
-          ],
-        );
-        await client.query(
-          `UPDATE work_items
-           SET lifecycle = 'completed', boundary = 'artifact',
-               version = version + 1, updated_at = now()
-           WHERE id = $1`,
-          [ctx.workItemId],
-        );
-        // Close incoming accept intent (F-5).
-        await client.query(
-          "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
-          [intentRow.id],
-        );
-        await client.query("COMMIT");
-        await completeCommand(client, commandId, {
-          accepted: true,
-          decisionId: String(decisionId),
-          revision,
-        });
+        if (boundary === "merge") {
+          // Merge boundary: record acceptance, insert integration row and
+          // dispatch intent in ONE transaction, then trigger (R-002).
+          const targetRef = contractRow.target_ref ?? deriveTargetRef(projectRow.allowed_refs);
+          const expectedBaseRevision = contractRow.base_revision;
+          const artifactRevision = ctx.artifactRevision;
+
+          const attemptRow = await loadAttempt(pool, ctx.attemptId);
+          const integrationId = ids.next("intg");
+          const mergeIntentId = ids.next("di") as DispatchIntentId;
+          const mergeIdempotencyKey = `${String(mergeIntentId)}:g${String(attemptRow.generation)}`;
+
+          const mergePayload = IntegrateMergePayloadSchema.parse({
+            attemptId: ctx.attemptId,
+            generation: attemptRow.generation,
+            contractId: ctx.contractId,
+            contractVersion: ctx.contractVersion,
+            projectId: contractRow.project_id,
+            repoPath: projectRow.clone_path ?? this.deps.config.worktreeBase,
+            remote: projectRow.remote ?? "origin",
+            targetRef,
+            expectedBaseRevision,
+            attemptRevision: artifactRevision,
+            strategy: "merge_commit",
+          });
+
+          await client.query("BEGIN");
+          await client.query(
+            `INSERT INTO decisions
+               (id, kind, actor, work_item_id, contract_id, contract_version, attempt_id, outcome, at)
+             VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'accepted', $6)`,
+            [
+              String(decisionId),
+              ctx.workItemId,
+              ctx.contractId,
+              ctx.contractVersion,
+              ctx.attemptId,
+              at,
+            ],
+          );
+
+          // Insert integration row (idempotent on conflict).
+          await insertIntegration(client, {
+            id: String(integrationId),
+            attempt_id: ctx.attemptId,
+            contract_id: ctx.contractId,
+            contract_version: ctx.contractVersion,
+            target_ref: targetRef,
+            expected_base_revision: expectedBaseRevision,
+          });
+
+          // Insert dispatch intent for integrate.merge (R-002: committed before trigger).
+          await client.query(
+            `INSERT INTO dispatch_intents
+               (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
+             VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+            [
+              String(mergeIntentId),
+              TASK_IDS.integrateMerge,
+              String(digestOf(mergePayload)),
+              ctx.attemptId,
+              mergeIdempotencyKey,
+            ],
+          );
+
+          // Close incoming accept intent (F-5).
+          await client.query(
+            "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+            [intentRow.id],
+          );
+          await client.query("COMMIT");
+
+          // Trigger integrate.merge AFTER commit (R-002).
+          const { runId: mergeRunId } = await this.deps.runtime.trigger({
+            intentId: mergeIntentId,
+            task: TASK_IDS.integrateMerge,
+            payload: mergePayload,
+            options: {
+              idempotencyKey: mergeIdempotencyKey,
+              concurrencyKey: contractRow.project_id,
+              tags: [
+                `project:${contractRow.project_id}`,
+                `workItem:${ctx.workItemId}`,
+                `contract:${ctx.contractId}:${String(ctx.contractVersion)}`,
+                `attempt:${ctx.attemptId}`,
+              ],
+            },
+          });
+
+          await pool.query(
+            "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+            [String(mergeIntentId), mergeRunId],
+          );
+
+          await completeCommand(client, commandId, {
+            accepted: true,
+            decisionId: String(decisionId),
+            boundary: "merge",
+            mergeIntentId: String(mergeIntentId),
+            mergeRunId,
+          });
+        } else {
+          // Artifact boundary: complete work item immediately.
+          const revision = ctx.artifactRevision;
+
+          await client.query("BEGIN");
+          await client.query(
+            `INSERT INTO decisions
+               (id, kind, actor, work_item_id, contract_id, contract_version, attempt_id, outcome, at)
+             VALUES ($1, 'accept', 'coordinator', $2, $3, $4, $5, 'accepted', $6)`,
+            [
+              String(decisionId),
+              ctx.workItemId,
+              ctx.contractId,
+              ctx.contractVersion,
+              ctx.attemptId,
+              at,
+            ],
+          );
+          await client.query(
+            `UPDATE work_items
+             SET lifecycle = 'completed', boundary = 'artifact',
+                 version = version + 1, updated_at = now()
+             WHERE id = $1`,
+            [ctx.workItemId],
+          );
+          // Close incoming accept intent (F-5).
+          await client.query(
+            "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+            [intentRow.id],
+          );
+          await client.query("COMMIT");
+          await completeCommand(client, commandId, {
+            accepted: true,
+            decisionId: String(decisionId),
+            revision,
+          });
+        }
       } else {
         await client.query("BEGIN");
         await client.query(

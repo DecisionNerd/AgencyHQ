@@ -24,6 +24,7 @@ import { confirmStop, readStopEvidence } from "../commands/confirm-stop.ts";
 import { stopAttempt } from "../commands/stop.ts";
 import type { BoundedRepairFlow } from "./bounded-repair.ts";
 import { generationOfIntent as getIntentGen } from "./bounded-repair.ts";
+import { onIntegrateFinal } from "./integrate.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,8 @@ export class Reconciler {
             await this.flow.onReviewFinal(obs, commandId);
           } else if (intent.task === TASK_IDS.leadAccept) {
             await this.flow.onAcceptFinal(obs, commandId);
+          } else if (intent.task === TASK_IDS.integrateMerge) {
+            await onIntegrateFinal(obs, commandId, this.deps);
           } else if (intent.task === TASK_IDS.leadPlan) {
             const parsed =
               obs.status === "COMPLETED" && obs.output !== undefined && obs.output !== null
