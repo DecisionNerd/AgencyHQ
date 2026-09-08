@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   AuthorityView,
+  CapacityProviderEntry,
   DecisionEntry,
   DecisionsView,
   EvidenceView,
   Freshness,
   Item,
+  LeadMetricsView,
   OverviewView,
   PendingDecision,
   ReturnView as ReturnViewData,
@@ -16,6 +18,7 @@ import {
   fetchAuthority,
   fetchDecisions,
   fetchEvidence,
+  fetchLeadMetrics,
   fetchOverview,
   fetchReturnView,
   fetchWorkItem,
@@ -26,6 +29,7 @@ import {
 } from "./api.js";
 import {
   buildApproveBody,
+  buildCapacityRow,
   buildDecisionRow,
   buildDispositionRemediateBody,
   buildInvalidateAcceptanceBody,
@@ -33,13 +37,19 @@ import {
   buildPauseBody,
   buildRejectBody,
   buildResumeBody,
+  buildSetCapacityBody,
   buildStopBody,
+  capacityStatusLabel,
   conditionIcon,
   confirmMessage,
   formatAuthorityErrors,
+  formatPercentage,
+  formatRateTitle,
   formatTimestamp,
   lifecycleIcon,
   parseRoute,
+  type SinceWindow,
+  sinceWindowToISO,
 } from "./control-plane-helpers.js";
 import { ExecutionState } from "./ExecutionState.js";
 import {
@@ -183,6 +193,9 @@ function Nav({ currentHash }: { currentHash: string }) {
       </a>
       <a href="#/decisions" className={currentHash === "#/decisions" ? "nav-active" : ""}>
         Decisions
+      </a>
+      <a href="#/metrics" className={currentHash === "#/metrics" ? "nav-active" : ""}>
+        Metrics
       </a>
       <a href="#/return" className={currentHash === "#/return" ? "nav-active" : ""}>
         Return view
@@ -390,12 +403,178 @@ function ReturnViewPage({ hash, onUnauthorized }: { hash: string; onUnauthorized
   );
 }
 
+// ---- Capacity panel --------------------------------------------------------
+
+function CapacityPanel({
+  providers,
+  onSetCapacity,
+}: {
+  providers: CapacityProviderEntry[];
+  onSetCapacity: (params: {
+    provider: string;
+    model: string;
+    status: "ok" | "limited" | "down";
+    validUntil: string;
+  }) => void;
+}) {
+  const [cpProvider, setCpProvider] = useState("");
+  const [cpModel, setCpModel] = useState("");
+  const [cpStatus, setCpStatus] = useState<"ok" | "limited" | "down">("ok");
+  const [cpValidUntil, setCpValidUntil] = useState("");
+  const [cpError, setCpError] = useState<string | null>(null);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setCpError(null);
+    if (!cpProvider.trim() || !cpModel.trim() || !cpValidUntil.trim()) {
+      setCpError("Provider, model, and valid-until are required.");
+      return;
+    }
+    onSetCapacity({
+      provider: cpProvider.trim(),
+      model: cpModel.trim(),
+      status: cpStatus,
+      validUntil: cpValidUntil.trim(),
+    });
+    setCpProvider("");
+    setCpModel("");
+    setCpStatus("ok");
+    setCpValidUntil("");
+  };
+
+  return (
+    <section className="section" aria-labelledby="capacity-heading" data-testid="capacity-panel">
+      <h2 className="section-title" id="capacity-heading">
+        Capacity
+      </h2>
+      {providers.length === 0 ? (
+        <p className="empty-notice">No capacity observations.</p>
+      ) : (
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Model</th>
+              <th>Status</th>
+              <th>Effective</th>
+              <th>Concurrency</th>
+              <th>Validity</th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody>
+            {providers.map((p) => {
+              const row = buildCapacityRow(p);
+              const statusInfo = capacityStatusLabel(row.status);
+              const effectiveInfo = capacityStatusLabel(row.effective);
+              const key = `${p.provider}:${p.model}`;
+              return (
+                <tr key={key} data-testid={`capacity-row-${p.provider}-${p.model}`}>
+                  <td>{p.provider}</td>
+                  <td>{p.model}</td>
+                  <td>
+                    <span aria-hidden="true">{statusInfo.icon}</span> {statusInfo.text}
+                  </td>
+                  <td>
+                    <span aria-hidden="true">{effectiveInfo.icon}</span> {effectiveInfo.text}
+                  </td>
+                  <td>{row.concurrency !== null ? row.concurrency : "—"}</td>
+                  <td className={row.isStale ? "state-stale" : ""}>{row.validityLabel}</td>
+                  <td>{p.source}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+
+      <details style={{ marginTop: "1rem" }}>
+        <summary>Set capacity</summary>
+        <form
+          onSubmit={handleSubmit}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "0.5rem",
+            marginTop: "0.5rem",
+            maxWidth: "32rem",
+          }}
+        >
+          {cpError && (
+            <div className="error-box" role="alert">
+              {cpError}
+            </div>
+          )}
+          <label>
+            Provider
+            <input
+              type="text"
+              value={cpProvider}
+              onChange={(e) => {
+                setCpProvider(e.target.value);
+              }}
+              placeholder="e.g. anthropic"
+              style={{ display: "block", width: "100%" }}
+            />
+          </label>
+          <label>
+            Model
+            <input
+              type="text"
+              value={cpModel}
+              onChange={(e) => {
+                setCpModel(e.target.value);
+              }}
+              placeholder="e.g. claude-sonnet-4-6"
+              style={{ display: "block", width: "100%" }}
+            />
+          </label>
+          <label>
+            Status
+            <select
+              value={cpStatus}
+              onChange={(e) => {
+                setCpStatus(e.target.value as "ok" | "limited" | "down");
+              }}
+              style={{ display: "block", width: "100%" }}
+            >
+              <option value="ok">ok</option>
+              <option value="limited">limited</option>
+              <option value="down">down</option>
+            </select>
+          </label>
+          <label>
+            Valid until (ISO 8601)
+            <input
+              type="text"
+              value={cpValidUntil}
+              onChange={(e) => {
+                setCpValidUntil(e.target.value);
+              }}
+              placeholder="e.g. 2026-09-08T12:00:00Z"
+              style={{ display: "block", width: "100%" }}
+            />
+          </label>
+          <button type="submit" className="btn-primary" data-testid="capacity-set-btn">
+            Set capacity
+          </button>
+        </form>
+      </details>
+    </section>
+  );
+}
+
 // ---- Overview page ---------------------------------------------------------
 
 function OverviewPage({ hash, onUnauthorized }: { hash: string; onUnauthorized: () => void }) {
   const [view, setView] = useState<OverviewView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [capacityConfirm, setCapacityConfirm] = useState<null | {
+    message: string;
+    onConfirm: () => void;
+  }>(null);
+  const [capacityActionError, setCapacityActionError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -419,6 +598,30 @@ function OverviewPage({ hash, onUnauthorized }: { hash: string; onUnauthorized: 
     load();
   }, [load]);
 
+  const handleSetCapacity = (params: {
+    provider: string;
+    model: string;
+    status: "ok" | "limited" | "down";
+    validUntil: string;
+  }) => {
+    const msg = `Set capacity: ${params.provider} / ${params.model} → ${params.status}, valid until ${params.validUntil}?`;
+    setCapacityConfirm({
+      message: msg,
+      onConfirm: () => {
+        setCapacityConfirm(null);
+        setCapacityActionError(null);
+        const body = buildSetCapacityBody({ commandId: crypto.randomUUID(), ...params });
+        postCommand(body)
+          .then(() => {
+            load();
+          })
+          .catch((err: unknown) => {
+            setCapacityActionError(err instanceof Error ? err.message : String(err));
+          });
+      },
+    });
+  };
+
   return (
     <div className="layout">
       <div className="header">
@@ -436,8 +639,25 @@ function OverviewPage({ hash, onUnauthorized }: { hash: string; onUnauthorized: 
       )}
       {loading && <div className="loading">Loading...</div>}
 
+      {capacityConfirm && (
+        <ConfirmDialog
+          message={capacityConfirm.message}
+          onConfirm={capacityConfirm.onConfirm}
+          onCancel={() => {
+            setCapacityConfirm(null);
+          }}
+        />
+      )}
+      {capacityActionError && (
+        <div className="error-box" role="alert">
+          {capacityActionError}
+        </div>
+      )}
+
       {view && (
         <>
+          <CapacityPanel providers={view.capacity ?? []} onSetCapacity={handleSetCapacity} />
+
           <section
             className="section"
             aria-labelledby="campaigns-heading"
@@ -501,6 +721,7 @@ function OverviewPage({ hash, onUnauthorized }: { hash: string; onUnauthorized: 
                     <span className="project-id" data-testid={`project-id-${p.id}`}>
                       {p.id}
                     </span>
+                    <span className="project-meta">Active attempts: {p.activeAttempts ?? 0}</span>
                     <a
                       href={`#/projects/${encodeURIComponent(p.id)}/authority`}
                       data-testid={`authority-link-${p.id}`}
@@ -538,6 +759,16 @@ function OverviewPage({ hash, onUnauthorized }: { hash: string; onUnauthorized: 
                                 </a>
                                 {wi.mainEffort && (
                                   <span className="main-effort-tag"> Main effort</span>
+                                )}
+                                {wi.skipReason && (
+                                  <span
+                                    className="skip-reason"
+                                    data-testid={`skip-reason-${wi.id}`}
+                                    title={wi.skipReason}
+                                  >
+                                    {" "}
+                                    ({wi.skipReason})
+                                  </span>
                                 )}
                               </td>
                               <td data-testid={`lifecycle-${wi.id}`}>
@@ -1604,6 +1835,156 @@ function AuthorityPage({
   );
 }
 
+// ---- Metrics page ----------------------------------------------------------
+
+function MetricsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized: () => void }) {
+  const [metricsData, setMetricsData] = useState<LeadMetricsView | null | "not-available">(null);
+  const [since, setSince] = useState<SinceWindow>("30d");
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(
+    (w: SinceWindow) => {
+      setLoading(true);
+      setError(null);
+      const iso = sinceWindowToISO(w);
+      fetchLeadMetrics(iso)
+        .then((data) => {
+          setMetricsData(data === null ? "not-available" : data);
+          setLoading(false);
+        })
+        .catch((err: unknown) => {
+          if (err instanceof UnauthorizedError) {
+            onUnauthorized();
+          } else {
+            setError(err instanceof Error ? err.message : String(err));
+          }
+          setLoading(false);
+        });
+    },
+    [onUnauthorized],
+  );
+
+  useEffect(() => {
+    load(since);
+  }, [load, since]);
+
+  const handleWindowChange = (w: SinceWindow) => {
+    setSince(w);
+  };
+
+  return (
+    <div className="layout">
+      <div className="header">
+        <h1>AgencyHQ</h1>
+        <Nav currentHash={hash} />
+        <button
+          type="button"
+          className="btn-primary"
+          onClick={() => {
+            load(since);
+          }}
+          disabled={loading}
+        >
+          Refresh
+        </button>
+      </div>
+
+      <section className="section" aria-labelledby="metrics-heading">
+        <h2 className="section-title" id="metrics-heading">
+          Lead quality metrics
+        </h2>
+
+        <div style={{ marginBottom: "1rem", display: "flex", gap: "0.5rem", alignItems: "center" }}>
+          <span>Time window:</span>
+          {(["7d", "30d", "all"] as SinceWindow[]).map((w) => (
+            <button
+              key={w}
+              type="button"
+              className={since === w ? "btn-primary" : "btn-secondary"}
+              onClick={() => {
+                handleWindowChange(w);
+              }}
+            >
+              {w === "7d" ? "7 days" : w === "30d" ? "30 days" : "All time"}
+            </button>
+          ))}
+        </div>
+
+        {error && (
+          <div className="error-box" role="alert">
+            {error}
+          </div>
+        )}
+        {loading && <div className="loading">Loading...</div>}
+
+        {!loading && metricsData === "not-available" && (
+          <p className="empty-notice">Metrics not available.</p>
+        )}
+
+        {!loading && metricsData && metricsData !== "not-available" && (
+          <div>
+            {metricsData.projects.length === 0 ? (
+              <p className="empty-notice">No project metrics for this period.</p>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table className="data-table" data-testid="metrics-table">
+                  <thead>
+                    <tr>
+                      <th>Project</th>
+                      <th>Plans total</th>
+                      <th>Escalation rate</th>
+                      <th>Reversal rate</th>
+                      <th>Review yield</th>
+                      <th>Acceptances</th>
+                      <th>Invalidations</th>
+                      <th>Reviews total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {metricsData.projects.map((p) => (
+                      <tr key={p.project_id} data-testid={`metrics-row-${p.project_id}`}>
+                        <td>{p.project_id}</td>
+                        <td>{p.plans_total}</td>
+                        <td
+                          title={formatRateTitle(
+                            p.plans_escalated,
+                            p.plans_total,
+                            p.escalation_rate,
+                          )}
+                        >
+                          {formatPercentage(p.escalation_rate)}
+                        </td>
+                        <td
+                          title={formatRateTitle(p.invalidations, p.acceptances, p.reversal_rate)}
+                        >
+                          {formatPercentage(p.reversal_rate)}
+                        </td>
+                        <td
+                          title={formatRateTitle(
+                            p.reviews_with_findings,
+                            p.reviews_total,
+                            p.review_yield,
+                          )}
+                        >
+                          {formatPercentage(p.review_yield)}
+                        </td>
+                        <td>{p.acceptances}</td>
+                        <td>{p.invalidations}</td>
+                        <td>{p.reviews_total}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 // ---- Main App — hash router ------------------------------------------------
 
 export function App() {
@@ -1670,6 +2051,10 @@ export function App() {
     return (
       <AuthorityPage projectId={route.projectId} hash={hash} onUnauthorized={handleUnauthorized} />
     );
+  }
+
+  if (route.page === "metrics") {
+    return <MetricsPage hash={hash} onUnauthorized={handleUnauthorized} />;
   }
 
   // Default: overview

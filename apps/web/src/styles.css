@@ -167,6 +167,16 @@ button {
   cursor: not-allowed;
 }
 
+.btn-secondary {
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  background: var(--border);
+}
+
 /* Sections */
 .section {
   margin-bottom: 2rem;
@@ -276,6 +286,12 @@ button {
 
 .state-stale {
   color: var(--warning);
+}
+
+.skip-reason {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  font-style: italic;
 }
 
 /* Decision Card */
