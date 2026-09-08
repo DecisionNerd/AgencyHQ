@@ -318,8 +318,9 @@ export async function onIntegrateFinal(
       payload: obs,
       observedAt: new Date(obs.observedAt),
     });
-    if (obsResult === "duplicate") {
-      await completeCommand(client, commandId, { skipped: "duplicate" });
+    if (obsResult === "duplicate" || obsResult === "stale") {
+      // R-010: stale observations (revoked generation) are no-ops, same as duplicates.
+      await completeCommand(client, commandId, { skipped: obsResult });
       return;
     }
 
@@ -356,14 +357,38 @@ export async function onIntegrateFinal(
 
       const observedRevision = await lsRemote(remote, targetRef, repoPath);
 
+      // S-9: null lsRemote means the remote is unreachable — escalate immediately
+      // with a distinct reason rather than treating it as retry_cas (observed==expected).
+      if (observedRevision === null) {
+        await client.query("BEGIN");
+        await recordEscalation(client, {
+          integrationId: integrationRow.id,
+          attemptId,
+          workItemId: contractRow.work_item_id,
+          contractId: contractRow.id,
+          contractVersion: contractRow.version,
+          outcome: "remote_unreachable",
+          runId: obs.runId,
+          evidence: JSON.stringify({
+            reason: "remote_unreachable",
+            runStatus: obs.status,
+            expectedBaseRevision: expectedBase,
+          }),
+          ids,
+        });
+        await client.query("COMMIT");
+        await completeCommand(client, commandId, { escalated: "remote_unreachable" });
+        return;
+      }
+
       const containsAttempt =
-        observedRevision !== null && attemptRevision !== ""
+        attemptRevision !== ""
           ? await isAncestor(attemptRevision, remote, targetRef, repoPath)
           : false;
 
       decision = decideIntegrationOutcome({
         kind: "observed",
-        observedTargetRevision: observedRevision ?? expectedBase,
+        observedTargetRevision: observedRevision,
         expectedBaseRevision: expectedBase,
         attemptRevision,
         containsAttempt,
@@ -452,6 +477,7 @@ export async function onIntegrateFinal(
         task: string;
         payload: unknown;
         idempotencyKey: string;
+        projectId: string;
       } | null = null;
 
       if (allResolved(manifestEntries)) {
@@ -508,7 +534,9 @@ export async function onIntegrateFinal(
           payload: pendingLeadPlan.payload,
           options: {
             idempotencyKey: pendingLeadPlan.idempotencyKey,
-            tags: [`workItem:${contractRow.work_item_id}`],
+            // S-12: next-entry lead.plan carries both project: and workItem: tags
+            // (same convention as the plan command path, issue #8).
+            tags: [`project:${pendingLeadPlan.projectId}`, `workItem:${contractRow.work_item_id}`],
           },
         });
         await pool.query(
@@ -685,6 +713,7 @@ async function prepareNextEntryLeadPlan(
   task: string;
   payload: unknown;
   idempotencyKey: string;
+  projectId: string;
 }> {
   const { ids, config } = deps;
 
@@ -770,5 +799,5 @@ async function prepareNextEntryLeadPlan(
     [String(intentId), TASK_IDS.leadPlan, String(digestOf(payload)), idempotencyKey],
   );
 
-  return { intentId, task: TASK_IDS.leadPlan, payload, idempotencyKey };
+  return { intentId, task: TASK_IDS.leadPlan, payload, idempotencyKey, projectId: nextE.projectId };
 }

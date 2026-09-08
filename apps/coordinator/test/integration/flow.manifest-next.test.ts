@@ -752,3 +752,178 @@ test("manifest-next (d): allowed_refs guard — not advanced when stored != expe
     }
   });
 });
+
+// ===========================================================================
+// Test (e): S-6 — next-entry base refresh uses updated allowed_refs, not creation-time value
+// ===========================================================================
+
+test("manifest-next (e): S-6 — next-entry lead.plan baseRevision uses refreshed allowed_refs, not creation-time value", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const pool = makeSchemaPool(DATABASE_URL!, schema);
+    const fake = new FakeExecutionRuntime();
+    try {
+      const projectAId = newId("prj");
+      const projectBId = newId("prj");
+      const workItemId = newId("wi");
+
+      // Entry 1's project B starts with BASE_B at creation time.
+      await client.query(
+        `INSERT INTO projects (id, remote, clone_path, worktree_base, allowed_refs, authority, authority_version, profile_catalog)
+         VALUES ($1, NULL, '/repo-a', '/worktrees', $2::jsonb, $3::jsonb, '1', '["default"]'::jsonb)`,
+        [projectAId, JSON.stringify({ main: BASE_A }), JSON.stringify(MERGE_AUTHORITY)],
+      );
+      await client.query(
+        `INSERT INTO projects (id, remote, clone_path, worktree_base, allowed_refs, authority, authority_version, profile_catalog)
+         VALUES ($1, NULL, '/repo-b', '/worktrees', $2::jsonb, $3::jsonb, '1', '["default"]'::jsonb)`,
+        [projectBId, JSON.stringify({ main: BASE_B }), JSON.stringify(MERGE_AUTHORITY)],
+      );
+
+      await client.query(
+        `INSERT INTO work_items (id, project_id, rank, intent, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 1, 'Multi-repo fix', 'merge', 'active', 'healthy', true, 1)`,
+        [workItemId, projectAId],
+      );
+      await client.query(
+        `INSERT INTO work_item_projects (work_item_id, project_id, position, target_ref, expected_base_revision)
+         VALUES ($1, $2, 0, 'refs/heads/main', $3), ($1, $4, 1, 'refs/heads/main', $5)`,
+        [workItemId, projectAId, BASE_A, projectBId, BASE_B],
+      );
+
+      // S-6: Simulate that project B's allowed_refs advanced (externally) between
+      // the time the work item was created and entry 0's integration.
+      const ADVANCED_B = "bbbb999900000000000000000000000000000000";
+      await client.query(`UPDATE projects SET allowed_refs = $1::jsonb WHERE id = $2`, [
+        JSON.stringify({ main: ADVANCED_B }),
+        projectBId,
+      ]);
+
+      const deps = makeDeps(pool, fake);
+
+      // Integrate entry 0 (project A)
+      const contractAId = newId("sc");
+      const { fakeRunId: runA, fakeObs: obsA } = await seedEntry0Integration(client, {
+        workItemId,
+        projectAId,
+        projectBId,
+        contractId: contractAId,
+        contractVersion: 1,
+      });
+
+      // Capture the lead.plan payload for entry 1
+      let capturedLeadPlanPayload: unknown;
+      fake.script(TASK_IDS.leadPlan, (payload) => {
+        capturedLeadPlanPayload = payload;
+        return { status: "COMPLETED", output: { kind: "proposal", proposal: {} } };
+      });
+
+      await onIntegrateFinal(obsA, `cmd_obs_${runA}_1`, deps);
+
+      // Assert: lead.plan payload for entry 1 must use ADVANCED_B, not BASE_B
+      assert.ok(capturedLeadPlanPayload !== undefined, "entry 1 lead.plan payload captured");
+      const pp = capturedLeadPlanPayload as { baseRevision: string; projectId: string };
+      assert.equal(pp.projectId, projectBId, "lead.plan projectId = projectBId");
+      assert.equal(
+        pp.baseRevision,
+        ADVANCED_B,
+        "lead.plan baseRevision must be the refreshed value (ADVANCED_B), not the creation-time BASE_B",
+      );
+      assert.notEqual(
+        pp.baseRevision,
+        BASE_B,
+        "lead.plan baseRevision must NOT be the creation-time BASE_B",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ===========================================================================
+// Test (f): S-12 — next-entry lead.plan trigger carries both project: and workItem: tags
+// ===========================================================================
+
+test("manifest-next (f): S-12 — next-entry lead.plan trigger includes project: and workItem: tags", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const pool = makeSchemaPool(DATABASE_URL!, schema);
+    const fake = new FakeExecutionRuntime();
+    try {
+      const projectAId = newId("prj");
+      const projectBId = newId("prj");
+      const workItemId = newId("wi");
+
+      await client.query(
+        `INSERT INTO projects (id, remote, clone_path, worktree_base, allowed_refs, authority, authority_version, profile_catalog)
+         VALUES ($1, NULL, '/repo-a', '/worktrees', $2::jsonb, $3::jsonb, '1', '["default"]'::jsonb)`,
+        [projectAId, JSON.stringify({ main: BASE_A }), JSON.stringify(MERGE_AUTHORITY)],
+      );
+      await client.query(
+        `INSERT INTO projects (id, remote, clone_path, worktree_base, allowed_refs, authority, authority_version, profile_catalog)
+         VALUES ($1, NULL, '/repo-b', '/worktrees', $2::jsonb, $3::jsonb, '1', '["default"]'::jsonb)`,
+        [projectBId, JSON.stringify({ main: BASE_B }), JSON.stringify(MERGE_AUTHORITY)],
+      );
+      await client.query(
+        `INSERT INTO work_items (id, project_id, rank, intent, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 1, 'Multi-repo fix', 'merge', 'active', 'healthy', true, 1)`,
+        [workItemId, projectAId],
+      );
+      await client.query(
+        `INSERT INTO work_item_projects (work_item_id, project_id, position, target_ref, expected_base_revision)
+         VALUES ($1, $2, 0, 'refs/heads/main', $3), ($1, $4, 1, 'refs/heads/main', $5)`,
+        [workItemId, projectAId, BASE_A, projectBId, BASE_B],
+      );
+
+      const deps = makeDeps(pool, fake);
+
+      const contractAId = newId("sc");
+      const { fakeRunId: runA, fakeObs: obsA } = await seedEntry0Integration(client, {
+        workItemId,
+        projectAId,
+        projectBId,
+        contractId: contractAId,
+        contractVersion: 1,
+      });
+
+      fake.script(TASK_IDS.leadPlan, () => ({
+        status: "COMPLETED",
+        output: { kind: "proposal", proposal: {} },
+      }));
+
+      await onIntegrateFinal(obsA, `cmd_obs_${runA}_1`, deps);
+
+      // Find the trigger call for the lead.plan task
+      const leadPlanCalls = fake.calls.filter(
+        (c) =>
+          c.method === "trigger" && (c.args[0] as { task?: string })?.task === TASK_IDS.leadPlan,
+      );
+      assert.equal(leadPlanCalls.length, 1, "lead.plan triggered once for entry 1");
+
+      const triggerArgs = leadPlanCalls[0]!.args[0] as {
+        options?: { tags?: string[] };
+      };
+      const tags = triggerArgs.options?.tags ?? [];
+      assert.ok(Array.isArray(tags), "trigger options has tags array");
+      assert.ok(
+        tags.some((tag) => tag === `project:${projectBId}`),
+        `tags must include project:${projectBId}, got: ${JSON.stringify(tags)}`,
+      );
+      assert.ok(
+        tags.some((tag) => tag === `workItem:${workItemId}`),
+        `tags must include workItem:${workItemId}, got: ${JSON.stringify(tags)}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});

@@ -82,10 +82,19 @@ export async function approveWorkItem(
     }
 
     // 2. Load the pending accept decision for this work item.
+    // S-16: only match the pending_human decision when no approved/rejected decision
+    // already exists for the same attempt — a second approve with a fresh commandId
+    // must return state_mismatch rather than re-run finalizeAcceptedAttempt.
     const { rows: decisionRows } = await client.query<{ id: string; attempt_id: string | null }>(
-      `SELECT id, attempt_id FROM decisions
-       WHERE work_item_id = $1 AND kind = 'accept' AND outcome = 'pending_human'
-       ORDER BY at DESC LIMIT 1`,
+      `SELECT d.id, d.attempt_id FROM decisions d
+       WHERE d.work_item_id = $1 AND d.kind = 'accept' AND d.outcome = 'pending_human'
+         AND NOT EXISTS (
+           SELECT 1 FROM decisions d2
+           WHERE d2.attempt_id = d.attempt_id
+             AND d2.kind = 'accept'
+             AND d2.outcome IN ('approved', 'rejected')
+         )
+       ORDER BY d.at DESC LIMIT 1`,
       [workItemId],
     );
 

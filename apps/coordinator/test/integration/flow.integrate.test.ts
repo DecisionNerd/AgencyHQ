@@ -1157,3 +1157,328 @@ test("flow.integrate (7): two-entry manifest — entry 0 integrates → lead.pla
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// S-4: R-002 ordering — integrations row and intent exist BEFORE trigger fires
+// ---------------------------------------------------------------------------
+
+test("flow.integrate (S-4): R-002 ordering — integrations row and merge intent exist before trigger (auto path)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_AUTHORITY,
+      });
+
+      let orderingPassed = false;
+
+      const fake = new FakeExecutionRuntime();
+      fake.script(TASK_IDS.integrateMerge, () => ({
+        status: "COMPLETED",
+        output: {
+          outcome: "integrated",
+          resultingRevision: INTEGRATED_REVISION,
+          observedTargetRevision: BASE_REVISION,
+          evidence: [],
+        },
+      }));
+
+      // Wrap the runtime trigger to assert ordering for integrate.merge
+      const baseRuntime = fake;
+      const instrumentedRuntime = {
+        trigger: async (args: Parameters<typeof fake.trigger>[0]) => {
+          if (args.task === TASK_IDS.integrateMerge) {
+            // Assert: integrations row must already be committed
+            const { rows: intRows } = await pool.query(
+              "SELECT * FROM integrations WHERE attempt_id IN (SELECT id FROM attempts)",
+            );
+            assert.ok(intRows.length >= 1, "integrations row must exist BEFORE trigger");
+            // Assert: integrate.merge dispatch intent must already be committed
+            const { rows: intentRows } = await pool.query(
+              "SELECT * FROM dispatch_intents WHERE task = $1",
+              [TASK_IDS.integrateMerge],
+            );
+            assert.ok(intentRows.length >= 1, "integrate.merge intent must exist BEFORE trigger");
+            orderingPassed = true;
+          }
+          return baseRuntime.trigger(args);
+        },
+        cancel: baseRuntime.cancel.bind(baseRuntime),
+        retrieve: baseRuntime.retrieve.bind(baseRuntime),
+        createPublicToken: baseRuntime.createPublicToken.bind(baseRuntime),
+      };
+
+      const deps: FlowDeps = {
+        pool,
+        runtime: instrumentedRuntime as FlowDeps["runtime"],
+        clock,
+        ids,
+        profile: HOST_PROFILE,
+        config: {
+          worktreeBase: "/worktrees",
+          workerModel: "openai/gpt-5.6-terra",
+          leadModel: "openai/gpt-5.6-sol",
+          reviewerModel: "openai/gpt-5.6-sol",
+          verifierName: "agencyhq-verifier",
+        },
+        profileResolver: FAKE_PROFILE_RESOLVER,
+      };
+
+      await runFullFlowToAccept(client, pool, fake, workItemId, deps, { boundary: "merge" });
+
+      const flow = new BoundedRepairFlow(deps);
+      const { rows: acceptIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.leadAccept],
+      );
+      const acceptRunId = (acceptIntents[0] as Record<string, unknown>).run_id as string;
+      fake.advance(acceptRunId);
+      fake.advance(acceptRunId);
+      await flow.onAcceptFinal(await fake.retrieve(acceptRunId), newId("cmd"));
+
+      assert.ok(orderingPassed, "ordering check must have fired for integrate.merge trigger");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S-5: stale observation is a no-op (same as duplicate)
+// ---------------------------------------------------------------------------
+
+test("flow.integrate (S-5): stale observation (revoked generation) is a no-op", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_AUTHORITY,
+      });
+      const fake = new FakeExecutionRuntime();
+      fake.script(TASK_IDS.integrateMerge, () => ({
+        status: "COMPLETED",
+        output: {
+          outcome: "integrated",
+          resultingRevision: INTEGRATED_REVISION,
+          observedTargetRevision: BASE_REVISION,
+          evidence: [],
+        },
+      }));
+
+      const deps: FlowDeps = {
+        pool,
+        runtime: fake,
+        clock,
+        ids,
+        profile: HOST_PROFILE,
+        config: {
+          worktreeBase: "/worktrees",
+          workerModel: "openai/gpt-5.6-terra",
+          leadModel: "openai/gpt-5.6-sol",
+          reviewerModel: "openai/gpt-5.6-sol",
+          verifierName: "agencyhq-verifier",
+        },
+        profileResolver: FAKE_PROFILE_RESOLVER,
+      };
+
+      await runFullFlowToAccept(client, pool, fake, workItemId, deps, { boundary: "merge" });
+
+      const flow = new BoundedRepairFlow(deps);
+      const { rows: acceptIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.leadAccept],
+      );
+      const acceptRunId = (acceptIntents[0] as Record<string, unknown>).run_id as string;
+      fake.advance(acceptRunId);
+      fake.advance(acceptRunId);
+      await flow.onAcceptFinal(await fake.retrieve(acceptRunId), newId("cmd"));
+
+      const { rows: mergeIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.integrateMerge],
+      );
+      const mergeRunId = (mergeIntents[0] as Record<string, unknown>).run_id as string;
+
+      // Advance the attempt generation to make any next observation stale
+      const { rows: attemptRows } = await client.query<{ id: string }>(
+        "SELECT id FROM attempts ORDER BY created_at LIMIT 1",
+      );
+      const attemptId = attemptRows[0]!.id;
+      await client.query("UPDATE attempts SET generation = generation + 1 WHERE id = $1", [
+        attemptId,
+      ]);
+
+      // Build a stale observation: generation=1 but attempt is now on gen=2
+      const staleObs = {
+        runId: mergeRunId,
+        status: "COMPLETED" as const,
+        output: {
+          outcome: "integrated",
+          resultingRevision: INTEGRATED_REVISION,
+          observedTargetRevision: BASE_REVISION,
+          evidence: [],
+        },
+        observedAt: new Date().toISOString(),
+      };
+
+      // This should be a no-op (stale), not act on the observation
+      await onIntegrateFinal(staleObs, `cmd_obs_${mergeRunId}_stale`, deps);
+
+      // Work item must NOT be completed (stale was a no-op)
+      const { rows: wiRows } = await client.query("SELECT * FROM work_items WHERE id = $1", [
+        workItemId,
+      ]);
+      assert.equal(
+        (wiRows[0] as Record<string, unknown>).lifecycle,
+        "active",
+        "work item must stay active (stale observation is a no-op)",
+      );
+
+      // Integration row must still be pending (outcome null)
+      const { rows: integRows } = await client.query(
+        "SELECT * FROM integrations WHERE attempt_id = $1",
+        [attemptId],
+      );
+      assert.equal(integRows.length, 1, "exactly one integration row");
+      assert.equal(
+        (integRows[0] as Record<string, unknown>).outcome,
+        null,
+        "integration outcome still null (stale was no-op)",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S-9: lsRemote returning null → escalate as remote_unreachable (not retry_cas)
+// ---------------------------------------------------------------------------
+
+test("flow.integrate (S-9): non-COMPLETED run with lsRemote=null → escalate remote_unreachable", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client, {
+        boundary: "merge",
+        authority: MERGE_AUTHORITY,
+      });
+      const fake = new FakeExecutionRuntime();
+
+      // Script integrate.merge to CRASH (non-COMPLETED)
+      fake.script(TASK_IDS.integrateMerge, () => ({ status: "CRASHED" }));
+
+      // lsRemote returns null (remote unreachable)
+      const fakeLsRemote: LsRemoteFn = async () => null;
+      const fakeIsAncestor: IsAncestorFn = async () => false;
+
+      const deps: FlowDeps = {
+        pool,
+        runtime: fake,
+        clock,
+        ids,
+        profile: HOST_PROFILE,
+        config: {
+          worktreeBase: "/worktrees",
+          workerModel: "openai/gpt-5.6-terra",
+          leadModel: "openai/gpt-5.6-sol",
+          reviewerModel: "openai/gpt-5.6-sol",
+          verifierName: "agencyhq-verifier",
+          integrateRetries: 2,
+        },
+        profileResolver: FAKE_PROFILE_RESOLVER,
+        lsRemote: fakeLsRemote,
+        isAncestor: fakeIsAncestor,
+      };
+
+      await runFullFlowToAccept(client, pool, fake, workItemId, deps, { boundary: "merge" });
+
+      const flow = new BoundedRepairFlow(deps);
+      const { rows: acceptIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.leadAccept],
+      );
+      const acceptRunId = (acceptIntents[0] as Record<string, unknown>).run_id as string;
+      fake.advance(acceptRunId);
+      fake.advance(acceptRunId);
+      await flow.onAcceptFinal(await fake.retrieve(acceptRunId), newId("cmd"));
+
+      const { rows: mergeIntents } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.integrateMerge],
+      );
+      const mergeRunId = (mergeIntents[0] as Record<string, unknown>).run_id as string;
+      fake.advance(mergeRunId);
+      fake.advance(mergeRunId);
+      const mergeObs = await fake.retrieve(mergeRunId);
+      assert.equal(mergeObs.status, "CRASHED");
+
+      await onIntegrateFinal(mergeObs, `cmd_obs_${mergeObs.runId}_1`, deps);
+
+      // Must escalate immediately as remote_unreachable — no retry intent created
+      const { rows: mergeIntents2 } = await client.query(
+        "SELECT * FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.integrateMerge],
+      );
+      assert.equal(mergeIntents2.length, 1, "no retry intent created for remote_unreachable");
+
+      // integration row finalized with remote_unreachable outcome
+      const { rows: integRows } = await client.query(
+        "SELECT * FROM integrations WHERE attempt_id IN (SELECT id FROM attempts)",
+      );
+      assert.equal(integRows.length, 1, "one integration row");
+      assert.equal(
+        (integRows[0] as Record<string, unknown>).outcome,
+        "remote_unreachable",
+        "integration outcome = remote_unreachable",
+      );
+
+      // pending_human decision recorded (escalated)
+      const { rows: decRows } = await client.query(
+        "SELECT * FROM decisions WHERE kind = 'integrate'",
+      );
+      assert.equal(decRows.length, 1, "escalation decision recorded");
+      assert.equal((decRows[0] as Record<string, unknown>).outcome, "pending_human");
+
+      // integration_conflict finding
+      const { rows: findRows } = await client.query(
+        "SELECT * FROM findings WHERE kind = 'integration_conflict'",
+      );
+      assert.equal(findRows.length, 1, "integration_conflict finding created");
+
+      // Work item not completed
+      const { rows: wiRows } = await client.query("SELECT * FROM work_items WHERE id = $1", [
+        workItemId,
+      ]);
+      assert.equal((wiRows[0] as Record<string, unknown>).lifecycle, "active", "work item active");
+    } finally {
+      await pool.end();
+    }
+  });
+});

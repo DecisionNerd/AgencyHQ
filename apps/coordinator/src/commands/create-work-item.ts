@@ -47,19 +47,22 @@ export type CreateWorkItemResult = { ok: true; workItemId: string } | { ok: fals
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a base revision for a project from its stored `allowed_refs` object.
- * Returns the SHA stored under the `main` key (or the first key if not present).
+ * Resolve a base revision for a specific targetRef from a project's stored
+ * `allowed_refs` object.  Returns the SHA stored under `targetRef` (or its
+ * short form without the `refs/heads/` prefix), or null when the ref is absent.
+ *
+ * S-7: each entry's expectedBaseRevision must come from `allowed_refs[entry.targetRef]`,
+ * not from a fixed "main" key, so manifests targeting other refs freeze the
+ * correct base and unknown refs are rejected.
  */
-function baseRevisionFromAllowedRefs(allowedRefs: unknown): string | null {
+function baseRevisionFromAllowedRefs(allowedRefs: unknown, targetRef: string): string | null {
   if (!allowedRefs || typeof allowedRefs !== "object") return null;
   const refs = allowedRefs as Record<string, unknown>;
-  // Prefer "main" then any ref
-  const keys = Object.keys(refs);
-  for (const key of ["main", ...keys]) {
-    const v = refs[key];
-    if (typeof v === "string" && /^[0-9a-f]{40}$/.test(v)) {
-      return v;
-    }
+  // Try both the full ref and the short name (e.g. "refs/heads/main" and "main").
+  const shortRef = targetRef.replace(/^refs\/heads\//, "");
+  const v = refs[targetRef] ?? refs[shortRef];
+  if (typeof v === "string" && /^[0-9a-f]{40}$/.test(v)) {
+    return v;
   }
   return null;
 }
@@ -153,10 +156,13 @@ export async function createWorkItem(
           if (!projectRow) {
             throw new Error(`Project ${entry.projectId} not found during manifest insert`);
           }
-          const expectedBaseRevision = baseRevisionFromAllowedRefs(projectRow.allowed_refs);
+          const expectedBaseRevision = baseRevisionFromAllowedRefs(
+            projectRow.allowed_refs,
+            entry.targetRef,
+          );
           if (!expectedBaseRevision) {
             throw new Error(
-              `Project ${entry.projectId} has no valid base revision in allowed_refs`,
+              `targetRef '${entry.targetRef}' has no stored revision in allowed_refs for project ${entry.projectId}`,
             );
           }
           entries.push({
