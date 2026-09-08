@@ -82,6 +82,10 @@ export interface ManifestInfo {
 export interface Item {
   workItemId: string;
   intent: string;
+  /** Lifecycle phase of the work item (e.g. "proposed", "active", "completed"). */
+  lifecycle: string;
+  /** Readiness condition of the work item (e.g. "nominal", "blocked"). */
+  condition: string;
   contract: State;
   execution: State;
   verification: State;
