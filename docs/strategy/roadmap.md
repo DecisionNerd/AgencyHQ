@@ -60,7 +60,7 @@ on it.
   (f)` is the deterministic gate confirming `REVIEW_BLOCKING` rejection), item 7
   PASS (work item `89cfe999-9710-4388-8dd1-caf520d26d49` completed at artifact,
   no Approval, ~150 s end to end). 847 unit tests, 114 integration tests (as of
-  rework-3, 2026-09-07; earlier counts were 787 unit / 86 integration). Full
+  rework-4, 2026-09-08; unchanged from rework-3; earlier counts were 787 unit / 86 integration). Full
   record: [trials/2026-09-slice3.md](../engineering/trials/2026-09-slice3.md).
 
 ## Slice 4 — integration boundaries and multiple repositories (current)
