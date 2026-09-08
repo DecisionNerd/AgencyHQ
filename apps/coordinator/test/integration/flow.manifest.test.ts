@@ -540,7 +540,7 @@ test("manifest: onWorkerFinal includes manifest, manifestProjectId, manifestRepo
 
       fake.script(TASK_IDS.leadPlan, () => ({
         status: "COMPLETED",
-        output: goodPlanOutput(),
+        output: mergePlanOutput(),
       }));
       fake.script(TASK_IDS.workerAttempt, () => ({
         status: "COMPLETED",
@@ -557,7 +557,7 @@ test("manifest: onWorkerFinal includes manifest, manifestProjectId, manifestRepo
       const { intentId: planIntentId, runId: planRunId } = await flow.plan(workItemId, planCmdId);
       fake.advance(planRunId);
       fake.advance(planRunId);
-      await flow.onLeadPlanOutput(planIntentId, goodPlanOutput(), newId("cmd"));
+      await flow.onLeadPlanOutput(planIntentId, mergePlanOutput(), newId("cmd"));
 
       const { rows: workerIntents } = await client.query(
         "SELECT * FROM dispatch_intents WHERE task = $1",

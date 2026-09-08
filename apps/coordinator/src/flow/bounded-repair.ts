@@ -666,7 +666,7 @@ export async function finalizeAcceptedAttempt(
 
       await client.query(
         `UPDATE work_items
-         SET lifecycle = 'completed', boundary = 'artifact',
+         SET lifecycle = 'completed',
              version = version + 1, updated_at = now()
          WHERE id = $1`,
         [ctx.workItemId],
@@ -772,7 +772,10 @@ export class BoundedRepairFlow {
           ? (targetProjectRow.profile_catalog as string[])
           : [],
         ...(wiRow.defect ? { defect: wiRow.defect } : {}),
-        operatorIntent: wiRow.intent,
+        operatorIntent:
+          wiRow.boundary === "merge"
+            ? `${wiRow.intent}\n\nIntegration requirement: this work item completes at the merge boundary; propose boundary merge.`
+            : wiRow.intent,
         model: config.leadModel,
         ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
       });
@@ -947,6 +950,31 @@ export class BoundedRepairFlow {
         await completeCommand(client, commandId, {
           decisionId: String(decisionId),
           violations: [boundarySupportViolation],
+        });
+        return;
+      }
+
+      // R-001/R-015/R-018: reject proposals whose boundary is below the work item's
+      // requested boundary. A work item created with boundary="merge" (or with
+      // work_item_projects rows, which always implies merge) must be planned at
+      // boundary="merge"; an artifact proposal would skip integration entirely.
+      if ((wiRow.boundary === "merge" || wipRows.length > 0) && proposal.boundary !== "merge") {
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO decisions (id, kind, actor, work_item_id, outcome, at)
+           VALUES ($1, 'plan', 'coordinator', $2, 'pending_human', $3)`,
+          [String(decisionId), workItemId, at],
+        );
+        await client.query("COMMIT");
+        await completeCommand(client, commandId, {
+          decisionId: String(decisionId),
+          violations: [
+            {
+              code: "BOUNDARY_BELOW_REQUESTED",
+              path: "boundary",
+              detail: `proposed boundary '${String(proposal.boundary)}' is below the work item's requested boundary 'merge'`,
+            },
+          ],
         });
         return;
       }
