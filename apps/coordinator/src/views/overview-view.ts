@@ -43,11 +43,42 @@ export type OverviewProjectLike = {
   id: string;
 };
 
+/**
+ * Per-project count of active attempts (dispatched|running|stopping).
+ * Injected by the app layer from a DB query.
+ */
+export type OverviewActiveAttempt = {
+  projectId: string;
+  count: number;
+};
+
+/**
+ * Single-row capacity summary for the overview (one per provider/model pair).
+ * The effectiveStatus is pre-computed by the app layer using effectiveCapacity().
+ */
+export type OverviewCapacitySummary = {
+  provider: string;
+  model: string;
+  /** Raw recorded status (ok|limited|down). */
+  status: "ok" | "limited" | "down";
+  /** Effective status after staleness check (ok|limited|down|unknown). */
+  effectiveStatus: "ok" | "limited" | "down" | "unknown";
+  /** Maximum concurrency for this effective status (null = unbounded). */
+  concurrency: number | null;
+  observedAt: string;
+  validUntil: string;
+  source: "adapter" | "operator";
+};
+
 export type OverviewInput = {
   campaigns: OverviewCampaignLike[];
   projects: OverviewProjectLike[];
   workItems: OverviewWorkItemLike[];
   decisions: OverviewDecisionLike[];
+  /** Active attempt counts per project (dispatched|running|stopping). */
+  activeAttempts?: OverviewActiveAttempt[];
+  /** Current provider capacity summary rows. */
+  capacity?: OverviewCapacitySummary[];
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +99,8 @@ export type OverviewWorkItemEntry = {
 
 export type OverviewProjectEntry = {
   id: string;
+  /** Count of active attempts (dispatched|running|stopping) for this project. */
+  activeAttempts: number;
   workItems: OverviewWorkItemEntry[];
 };
 
@@ -80,6 +113,8 @@ export type OverviewCampaignEntry = {
 export type OverviewView = {
   campaigns: OverviewCampaignEntry[];
   projects: OverviewProjectEntry[];
+  /** Per-provider/model capacity summary (empty when no observations exist). */
+  capacity: OverviewCapacitySummary[];
 };
 
 // ---------------------------------------------------------------------------
@@ -103,6 +138,12 @@ export function buildOverviewView(input: OverviewInput): OverviewView {
     }
   }
 
+  // Build active-attempts map
+  const activeByProject = new Map<string, number>();
+  for (const aa of input.activeAttempts ?? []) {
+    activeByProject.set(aa.projectId, aa.count);
+  }
+
   const projectEntries: OverviewProjectEntry[] = projects.map((p) => {
     const projectWorkItems = workItems
       .filter((wi) => wi.projectId === p.id)
@@ -121,7 +162,11 @@ export function buildOverviewView(input: OverviewInput): OverviewView {
         }),
       );
 
-    return { id: p.id, workItems: projectWorkItems };
+    return {
+      id: p.id,
+      activeAttempts: activeByProject.get(p.id) ?? 0,
+      workItems: projectWorkItems,
+    };
   });
 
   const campaignEntries: OverviewCampaignEntry[] = campaigns.map((c) => ({
@@ -130,5 +175,9 @@ export function buildOverviewView(input: OverviewInput): OverviewView {
     mainEffortWorkItemId: c.mainEffortWorkItemId,
   }));
 
-  return { campaigns: campaignEntries, projects: projectEntries };
+  return {
+    campaigns: campaignEntries,
+    projects: projectEntries,
+    capacity: input.capacity ?? [],
+  };
 }

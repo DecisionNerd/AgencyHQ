@@ -158,6 +158,7 @@ export const DispatchIntentRowSchema = z
     status: z.string(),
     run_id: NullableText,
     idempotency_key: z.string(),
+    skip_reason: NullableText.optional(),
   })
   .merge(Timestamps);
 

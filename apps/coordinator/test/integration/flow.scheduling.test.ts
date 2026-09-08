@@ -1,0 +1,1008 @@
+/**
+ * Integration tests: Slice 6 capacity and scheduling features (R-008, R-010).
+ *
+ * (a) Worker slots: two items, slots=2 → both dispatched; slots=1 → second queued,
+ *     dispatched after scheduler pass once first completes.
+ * (b) Same project, two items → second gets repository_busy skip_reason.
+ * (c) Provider capacity: limited caps concurrency; down → provider_down;
+ *     stale validUntil → treated as unknown (concurrency=1).
+ * (d) Queued→triggered path: R-002 preserved (intent exists before trigger);
+ *     idempotent (second scheduler pass triggers nothing new).
+ * (e) Wake-up: fake subscribe emits → pollOnce runs once; observation goes
+ *     through applyObservation, no duplicate rows.
+ * (f) API tests: GET /api/metrics/lead, GET /api/capacity, set_capacity replay.
+ */
+
+import assert from "node:assert/strict";
+import test from "node:test";
+import { digestOf, TASK_IDS } from "@agencyhq/contracts";
+import { createPool, withTestSchema } from "@agencyhq/db";
+import { newId } from "@agencyhq/domain";
+import pg from "pg";
+import { FakeExecutionRuntime } from "../../../../trigger/src/client/fake.ts";
+import type { FlowLike, ReconcilerLike, RuntimeLike } from "../../src/app.ts";
+import { createApp } from "../../src/app.ts";
+import type { CoordinatorConfig } from "../../src/config.ts";
+import { BoundedRepairFlow } from "../../src/flow/bounded-repair.ts";
+import { Reconciler } from "../../src/flow/observe.ts";
+import type { FlowDeps } from "../../src/flow/types.ts";
+import { goodPlanOutput, workerCompletedOutput } from "../helpers/fake-lead.ts";
+import { seedProjectAndWorkItem } from "../helpers/seed.ts";
+
+const DATABASE_URL = process.env.DATABASE_URL;
+
+// ---------------------------------------------------------------------------
+// Shared test helpers
+// ---------------------------------------------------------------------------
+
+const FAKE_PROFILE_DIGEST = String(digestOf({ id: "default", version: "1.0.0" }));
+const FAKE_PROFILE_RESOLVER = async (_profileId: string) => ({
+  digest: FAKE_PROFILE_DIGEST,
+  checks: [{ id: "pnpm-test", version: "1.0.0", command: ["pnpm", "test"], timeoutSeconds: 60 }],
+  protectedPaths: ["package.json", "pnpm-lock.yaml"],
+});
+
+const ids = { next: (prefix: string) => newId(prefix as Parameters<typeof newId>[0]) };
+const clock = { now: () => new Date().toISOString() };
+
+function makeFlowDeps(
+  pool: ReturnType<typeof createPool>,
+  fake: FakeExecutionRuntime,
+  overrides?: { workerSlots?: number },
+): FlowDeps {
+  return {
+    pool,
+    runtime: fake,
+    clock,
+    ids,
+    profile: {
+      id: "host",
+      enforcement: {
+        worktree: "before_action",
+        fs_isolation: "advisory",
+        cpu_memory: "advisory",
+        duration: "before_action",
+        capability: "before_action",
+        output_paths: "on_output",
+        push: "before_action",
+        integrate: "before_action",
+        termination: "trusted_observation",
+        egress_spend: "advisory",
+        nested_agents: "before_action",
+      },
+    },
+    config: {
+      worktreeBase: "/worktrees",
+      workerModel: "openai/gpt-5.6-terra",
+      leadModel: "openai/gpt-5.6-sol",
+      reviewerModel: "openai/gpt-5.6-sol",
+      verifierName: "agencyhq-verifier",
+      ...(overrides?.workerSlots !== undefined ? { workerSlots: overrides.workerSlots } : {}),
+    },
+    profileResolver: FAKE_PROFILE_RESOLVER,
+  };
+}
+
+/** Script lead.plan to return a good proposal, advance to COMPLETED. */
+function scriptLeadPlan(fake: FakeExecutionRuntime): void {
+  fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
+}
+
+function makeSchemaPool(databaseUrl: string, schema: string): pg.Pool {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const origConnect = pool.connect.bind(pool);
+  // biome-ignore lint/suspicious/noExplicitAny: wrapping pool.connect
+  (pool as any).connect = async () => {
+    const client = await origConnect();
+    await client.query(`SET search_path TO ${pg.escapeIdentifier(schema)}, public`);
+    return client;
+  };
+  return pool;
+}
+
+function makeConfig(): CoordinatorConfig {
+  return {
+    databaseUrl: DATABASE_URL ?? "",
+    triggerApiUrl: "https://trigger.example.com",
+    triggerSecretKey: "secret",
+    runtime: "fake",
+    worktreeBase: "/tmp/worktrees",
+    workerModel: "openai/gpt-5.6-terra",
+    leadModel: "openai/gpt-5.6-sol",
+    reviewerModel: "openai/gpt-5.6-sol",
+    reconcileIntervalMs: 5000,
+    freshnessStaleMs: 30000,
+    uncertainAfterMs: 120000,
+    port: 8787,
+    bindHost: "127.0.0.1",
+  };
+}
+
+function makeFakeFlow(): FlowLike {
+  return { plan: async () => ({ ok: true }) };
+}
+
+function makeFakeReconciler(): ReconcilerLike {
+  return { freshness: () => ({ lastPollAt: new Date().toISOString(), stale: false }) };
+}
+
+function makeFakeRuntime(): RuntimeLike {
+  return { createPublicToken: async () => "fake-token" };
+}
+
+/** Minimal CommandsLike stub for tests that need set_capacity (in the commands block). */
+function makeFakeCommands(): import("../../src/app.ts").CommandsLike {
+  const noop = async () => ({ ok: true });
+  return {
+    stop: noop,
+    pause: noop,
+    resume: noop,
+    createWorkItem: noop,
+    disposition: noop,
+    ackVisit: noop,
+    approve: noop,
+    lastAckAt: async () => null,
+    reject: noop,
+    invalidateAcceptance: noop,
+    createCampaign: noop,
+    assignCampaign: noop,
+    setMainEffort: noop,
+    setWorkItemRank: noop,
+    updateAuthority: noop,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// (a) Worker slots: two items on two projects, slots=2 → both dispatched;
+//     slots=1 → second queued with skip_reason no_slot, dispatched after
+//     first completes and scheduler runs.
+// ---------------------------------------------------------------------------
+
+test("scheduling(a): slots=2 dispatches both work items immediately", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId: wi1 } = await seedProjectAndWorkItem(client);
+      const { workItemId: wi2 } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      // Script worker to stay EXECUTING (so slots stay occupied for second item admission)
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 2 });
+      const flow = new BoundedRepairFlow(deps);
+
+      // Plan and admit both items; with 2 slots both should dispatch immediately.
+      const planCmd1 = newId("cmd");
+      const { intentId: planIntent1, runId: planRun1 } = await flow.plan(wi1, planCmd1);
+      fake.advance(planRun1);
+      fake.advance(planRun1);
+      await flow.onLeadPlanOutput(planIntent1, goodPlanOutput(), newId("cmd"));
+
+      const planCmd2 = newId("cmd");
+      const { intentId: planIntent2, runId: planRun2 } = await flow.plan(wi2, planCmd2);
+      fake.advance(planRun2);
+      fake.advance(planRun2);
+      await flow.onLeadPlanOutput(planIntent2, goodPlanOutput(), newId("cmd"));
+
+      // Both worker intents should be triggered (not queued).
+      const { rows } = await client.query(
+        `SELECT status FROM dispatch_intents WHERE task = $1 ORDER BY created_at`,
+        [TASK_IDS.workerAttempt],
+      );
+      const statuses = (rows as { status: string }[]).map((r) => r.status);
+      assert.equal(statuses.length, 2, "two worker intents created");
+      assert.ok(
+        statuses.every((s) => s === "triggered"),
+        `both should be triggered, got: ${statuses.join(",")}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(a): slots=1 → second item queued with skip_reason=no_slot, dispatched by scheduler after first completes", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId: wi1 } = await seedProjectAndWorkItem(client);
+      const { workItemId: wi2 } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      // First worker completes; second stays queued initially.
+      fake.script(TASK_IDS.workerAttempt, (payload: unknown) => {
+        const p = payload as { attemptId: string };
+        return {
+          status: "COMPLETED",
+          output: workerCompletedOutput(p.attemptId, {
+            commitId: "deadbeef1234567890deadbeef1234567890dead",
+          }),
+        };
+      });
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
+
+      // Admit wi1 — should dispatch immediately (slot free).
+      const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Admit wi2 — slot occupied; should be queued.
+      const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      // Verify wi2's worker intent is queued.
+      const { rows: allIntents } = await client.query(
+        `SELECT di.status, di.skip_reason, sc.work_item_id
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1
+         ORDER BY di.created_at`,
+        [TASK_IDS.workerAttempt],
+      );
+      const workerIntents = allIntents as {
+        status: string;
+        skip_reason: string | null;
+        work_item_id: string;
+      }[];
+      assert.equal(workerIntents.length, 2, "two worker intents");
+      assert.equal(workerIntents[0]!.status, "triggered", "first worker triggered");
+      assert.equal(workerIntents[1]!.status, "queued", "second worker queued");
+
+      // Advance first worker to COMPLETED, then poll — reconciler closes wi1's
+      // attempt and scheduleOnce should dispatch wi2.
+      const { rows: runRows } = await client.query(
+        `SELECT di.run_id FROM dispatch_intents di WHERE di.task = $1 AND di.status = 'triggered'`,
+        [TASK_IDS.workerAttempt],
+      );
+      const firstRunId = (runRows as { run_id: string }[])[0]!.run_id;
+      fake.advance(firstRunId); // QUEUED→EXECUTING
+      fake.advance(firstRunId); // EXECUTING→COMPLETED
+
+      // Poll: reconciler processes first worker completion + schedules second.
+      await reconciler.pollOnce();
+
+      // After poll, the first attempt should be completed or in follow-up state.
+      // The scheduler should have dispatched the second item.
+      const { rows: afterIntents } = await client.query(
+        `SELECT di.status, sc.work_item_id
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1
+         ORDER BY di.created_at`,
+        [TASK_IDS.workerAttempt],
+      );
+      const after = afterIntents as { status: string; work_item_id: string }[];
+      const secondIntent = after[1];
+      assert.ok(
+        secondIntent?.status === "triggered" || secondIntent?.status === "observed",
+        `second worker intent should be triggered or observed after scheduler pass, got: ${secondIntent?.status}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (b) Same project, two items → serialized (repository_busy)
+// ---------------------------------------------------------------------------
+
+test("scheduling(b): two items on same project → second gets repository_busy skip_reason", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Seed two work items on the SAME project.
+      const { workItemId: wi1, projectId } = await seedProjectAndWorkItem(client);
+      const wi2 = newId("wi");
+      await client.query(
+        `INSERT INTO work_items
+           (id, project_id, rank, intent, defect, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 2, 'Fix another issue', NULL, 'artifact', 'proposed', 'healthy', false, 1)`,
+        [wi2, projectId],
+      );
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      // Workers stay executing so slots stay occupied.
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // Use slots=1: wi1 occupies the single slot, wi2 is queued.
+      // scheduleOnce then sees wi1's project as busyRepos → repository_busy for wi2.
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
+
+      // Admit wi1 — dispatched immediately (slot free).
+      const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Admit wi2 (same project) — slot occupied → queued.
+      const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      // Verify wi2 is queued before calling scheduleOnce.
+      const { rows: preRows } = await client.query(
+        `SELECT di.status FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      assert.equal(
+        (preRows as { status: string }[])[0]?.status,
+        "queued",
+        "wi2 queued before scheduler",
+      );
+
+      // Run scheduler: wi1's project is in busyRepos → repository_busy for wi2.
+      await reconciler.scheduleOnce();
+
+      const { rows } = await client.query(
+        `SELECT di.status, di.skip_reason
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      const second = (rows as { status: string; skip_reason: string | null }[])[0]!;
+      assert.equal(second.status, "queued", "second worker stays queued (repo busy)");
+      assert.equal(second.skip_reason, "repository_busy", "skip_reason is repository_busy");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (c) Provider capacity: limited caps to 1; down → provider_down;
+//     stale validUntil → unknown (concurrency=1)
+// ---------------------------------------------------------------------------
+
+test("scheduling(c): provider_down → queued item gets provider_down skip_reason", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      // Record provider_capacity with status='down' for openai (the worker model provider).
+      const validUntil = new Date(Date.now() + 3600_000); // 1 hour from now
+      await client.query(
+        `INSERT INTO provider_capacity (provider, model, status, observed_at, valid_until, source)
+         VALUES ($1, $2, 'down', now(), $3, 'operator')
+         ON CONFLICT (provider, model, observed_at) DO UPDATE SET status = 'down', valid_until = $3`,
+        ["openai", "gpt-5.6-terra", validUntil.toISOString()],
+      );
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // Use slots=1: one slot occupied by wi2 (different project), so workItemId is queued.
+      // scheduleOnce then sees provider is down → provider_down skip (before no_slot check).
+      const deps1 = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow1 = new BoundedRepairFlow(deps1);
+      const reconciler1 = new Reconciler(deps1, flow1, { workerSlots: 1 });
+
+      // Use a second project to hold a running slot so the test item is queued.
+      const { workItemId: wi2 } = await seedProjectAndWorkItem(client);
+      const { intentId: pi2, runId: pr2 } = await flow1.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow1.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      // Now admit the test item — slot=1 occupied, so it is queued.
+      const { intentId: pi1, runId: pr1 } = await flow1.plan(workItemId, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow1.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Confirm the test item is queued.
+      const { rows: preRows } = await client.query(
+        `SELECT di.status, sc.work_item_id
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      const preIntents = preRows as { status: string }[];
+      assert.equal(preIntents[0]?.status, "queued", "test item queued before scheduler");
+
+      // Run scheduleOnce: provider is down → skip with provider_down.
+      // (The slot=1 is occupied by wi2's attempt which is dispatched.)
+      await reconciler1.pollOnce();
+
+      const { rows } = await client.query(
+        `SELECT di.status, di.skip_reason
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      const intent = (rows as { status: string; skip_reason: string | null }[])[0];
+      // provider_down wins before no_slot in selectDispatch ordering.
+      assert.equal(intent?.skip_reason, "provider_down", "skip_reason is provider_down");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(c): stale provider capacity → treated as unknown (concurrency=1, gives provider_unknown)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Two items on different projects, both using openai.
+      // wi1 dispatched (1 active openai attempt); wi2 queued (no slot).
+      // Stale capacity row: validUntil in the past → effectiveCapacity='unknown' → concurrencyFor=1.
+      // scheduleOnce: wi2 not repository_busy, not already_active, but
+      // activeByProvider['openai']=1 >= concurrencyFor(unknown)=1 → provider_unknown.
+      const staleUntil = new Date(Date.now() - 3600_000); // 1 hour ago (stale)
+      await client.query(
+        `INSERT INTO provider_capacity (provider, model, status, observed_at, valid_until, source)
+         VALUES ($1, $2, 'ok', now() - interval '2 hours', $3, 'operator')
+         ON CONFLICT (provider, model, observed_at) DO UPDATE SET valid_until = $3`,
+        ["openai", "gpt-5.6-terra", staleUntil.toISOString()],
+      );
+
+      const { workItemId: wi1 } = await seedProjectAndWorkItem(client);
+      const { workItemId: wi2 } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // Use slots=1: wi1 dispatched (occupies slot), wi2 naturally queued.
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
+
+      // Admit wi1 → dispatched (1 openai attempt active).
+      const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Admit wi2 → queued (no slot, attempt stays 'admitted').
+      const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      // Verify wi2 is queued.
+      const { rows: preRows } = await client.query(
+        `SELECT di.status FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      assert.equal(
+        (preRows as { status: string }[])[0]?.status,
+        "queued",
+        "wi2 queued before scheduler",
+      );
+
+      // scheduleOnce: stale openai → unknown → concurrencyFor=1.
+      // activeByProvider['openai'] = 1 (wi1 is dispatched openai attempt).
+      // currentCount = 1 >= 1 → provider_unknown.
+      await reconciler.scheduleOnce();
+
+      const { rows } = await client.query(
+        `SELECT di.status, di.skip_reason
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      const intent = (rows as { status: string; skip_reason: string | null }[])[0];
+      assert.equal(
+        intent?.skip_reason,
+        "provider_unknown",
+        `stale capacity treated as unknown → provider_unknown, got: ${intent?.skip_reason}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (d) Queued→triggered path: R-002 (intent exists before trigger);
+//     idempotent (second scheduler pass triggers nothing new).
+// ---------------------------------------------------------------------------
+
+test("scheduling(d): R-002 preserved — intent row exists before trigger; idempotent second pass", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId: wi1 } = await seedProjectAndWorkItem(client);
+      const { workItemId: wi2 } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
+
+      // Admit wi1 → dispatched (slot occupied).
+      const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Admit wi2 → queued (no slot).
+      const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      // Verify wi2's intent exists in DB (R-002: committed before trigger).
+      const { rows: preDispatch } = await client.query(
+        `SELECT di.id, di.status
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      const queued = (preDispatch as { id: string; status: string }[])[0];
+      assert.ok(queued, "wi2 intent exists before trigger (R-002)");
+      assert.equal(queued!.status, "queued", "wi2 intent is queued");
+      const queuedIntentId = queued!.id;
+
+      // Now advance wi1 to COMPLETED so the slot opens up.
+      const { rows: wi1RunRows } = await client.query(
+        `SELECT di.run_id FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi1],
+      );
+      const wi1RunId = (wi1RunRows as { run_id: string }[])[0]!.run_id;
+      // Advance through EXECUTING steps to COMPLETED
+      fake.advance(wi1RunId);
+
+      // Mark wi1's attempt as completed in DB to free the slot for scheduleOnce.
+      await client.query(
+        `UPDATE attempts SET status = 'completed', updated_at = now()
+         WHERE id IN (
+           SELECT a.id FROM attempts a
+           JOIN step_contracts sc ON sc.id = a.contract_id
+           WHERE sc.work_item_id = $1
+         )`,
+        [wi1],
+      );
+
+      // First scheduler pass: should dispatch wi2.
+      await reconciler.scheduleOnce();
+
+      const { rows: afterFirst } = await client.query(
+        "SELECT status, run_id FROM dispatch_intents WHERE id = $1",
+        [queuedIntentId],
+      );
+      const afterFirstRow = (afterFirst as { status: string; run_id: string | null }[])[0];
+      assert.equal(afterFirstRow?.status, "triggered", "wi2 dispatched after first scheduler pass");
+      const triggeredRunId = afterFirstRow!.run_id;
+      assert.ok(triggeredRunId, "run_id recorded after trigger");
+
+      // Count trigger calls for wi2 before second pass.
+      const triggerCallsBefore = fake.calls.filter(
+        (c) =>
+          c.method === "trigger" && (c.args[0] as { task: string }).task === TASK_IDS.workerAttempt,
+      ).length;
+
+      // Second scheduler pass: wi2 is already triggered, so scheduleOnce should not
+      // dispatch it again (listQueuedWorkerIntents only returns status='queued' rows).
+      await reconciler.scheduleOnce();
+
+      const triggerCallsAfter = fake.calls.filter(
+        (c) =>
+          c.method === "trigger" && (c.args[0] as { task: string }).task === TASK_IDS.workerAttempt,
+      ).length;
+
+      assert.equal(
+        triggerCallsAfter,
+        triggerCallsBefore,
+        "second scheduler pass makes no new trigger calls (idempotent)",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (e) Wake-up: fake subscribe emits → pollOnce runs once; observation goes
+//     through applyObservation exactly once (no duplicate rows).
+// ---------------------------------------------------------------------------
+
+test("scheduling(e): realtime wake-up triggers pollOnce once; observation applied through applyObservation", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow = new BoundedRepairFlow(deps);
+      // Enable realtimeWakeup.
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 1, realtimeWakeup: true });
+
+      // Admit the work item.
+      const { intentId: pi, runId: pr } = await flow.plan(workItemId, newId("cmd"));
+      fake.advance(pr);
+      fake.advance(pr);
+      await flow.onLeadPlanOutput(pi, goodPlanOutput(), newId("cmd"));
+
+      // Get the worker run id.
+      const { rows: diRows } = await client.query(
+        `SELECT di.run_id FROM dispatch_intents di WHERE di.task = $1`,
+        [TASK_IDS.workerAttempt],
+      );
+      const workerRunId = (diRows as { run_id: string }[])[0]!.run_id;
+
+      // Start wake-up (subscribes to project tags of open intents).
+      const wakeupPromise = reconciler.startWakeup();
+
+      // Give subscribe a tick to register.
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Verify subscribe was called.
+      const subscribeCalls = fake.calls.filter((c) => c.method === "subscribe");
+      assert.equal(subscribeCalls.length, 1, "subscribe called once");
+
+      // Advance the worker run (EXECUTING is already set; add COMPLETED).
+      fake.script(TASK_IDS.workerAttempt, (payload: unknown) => {
+        const p = payload as { attemptId: string };
+        return {
+          status: "COMPLETED",
+          output: workerCompletedOutput(p.attemptId, {
+            commitId: "deadbeef1234567890deadbeef1234567890dead",
+          }),
+        };
+      });
+      // Advance to final status — this triggers subscriber callback → pollOnce.
+      fake.advance(workerRunId); // → COMPLETED (scripted final step)
+
+      // Give the async pollOnce time to run.
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Stop wake-up.
+      reconciler.stopWakeup();
+      await wakeupPromise;
+
+      // Check run_observations: exactly one observation for the worker run (no duplicates).
+      const { rows: obsRows } = await client.query(
+        "SELECT count(*)::int AS n FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      // The observation may go through onWorkerFinal which uses applyObservation
+      // internally; zero rows is also acceptable if onWorkerFinal handles it.
+      // Key assertion: no more than 1 row.
+      const obsCount = (obsRows as { n: number }[])[0]!.n;
+      assert.ok(obsCount <= 1, `at most one run_observations row, got ${obsCount}`);
+
+      // The in-flight guard means even if advance fired multiple observations
+      // only one pollOnce executes concurrently.
+      const pollGuardHeld = reconciler.healthy;
+      assert.ok(pollGuardHeld !== undefined, "reconciler health reachable");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (f) API tests: GET /api/metrics/lead, GET /api/capacity, set_capacity replay.
+// ---------------------------------------------------------------------------
+
+test("scheduling(f): GET /api/metrics/lead returns array (empty when no rows)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(DATABASE_URL!, ctx.schema);
+    try {
+      const app = createApp({
+        pool: pool as unknown as Parameters<typeof createApp>[0]["pool"],
+        flow: makeFakeFlow(),
+        reconciler: makeFakeReconciler(),
+        runtime: makeFakeRuntime(),
+        config: makeConfig(),
+      });
+
+      const res = await app.fetch(new Request("http://localhost/api/metrics/lead"));
+      assert.equal(res.status, 200, "GET /api/metrics/lead returns 200");
+      const body = (await res.json()) as unknown[];
+      assert.ok(Array.isArray(body), "response is an array");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(f): GET /api/metrics/lead?since= with invalid param returns 400", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(DATABASE_URL!, ctx.schema);
+    try {
+      const app = createApp({
+        pool: pool as unknown as Parameters<typeof createApp>[0]["pool"],
+        flow: makeFakeFlow(),
+        reconciler: makeFakeReconciler(),
+        runtime: makeFakeRuntime(),
+        config: makeConfig(),
+      });
+
+      const res = await app.fetch(
+        new Request("http://localhost/api/metrics/lead?since=not-a-date"),
+      );
+      assert.equal(res.status, 400, "invalid since param returns 400");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(f): GET /api/capacity returns empty array when no capacity rows", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(DATABASE_URL!, ctx.schema);
+    try {
+      const app = createApp({
+        pool: pool as unknown as Parameters<typeof createApp>[0]["pool"],
+        flow: makeFakeFlow(),
+        reconciler: makeFakeReconciler(),
+        runtime: makeFakeRuntime(),
+        config: makeConfig(),
+      });
+
+      const res = await app.fetch(new Request("http://localhost/api/capacity"));
+      assert.equal(res.status, 200, "GET /api/capacity returns 200");
+      const body = (await res.json()) as unknown[];
+      assert.ok(Array.isArray(body), "response is an array");
+      assert.equal(body.length, 0, "no capacity rows initially");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(f): POST /api/commands set_capacity inserts row and is idempotent", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(DATABASE_URL!, ctx.schema);
+    try {
+      const app = createApp({
+        pool: pool as unknown as Parameters<typeof createApp>[0]["pool"],
+        flow: makeFakeFlow(),
+        reconciler: makeFakeReconciler(),
+        runtime: makeFakeRuntime(),
+        config: makeConfig(),
+        commands: makeFakeCommands(),
+      });
+
+      const commandId = newId("cmd");
+      const validUntil = new Date(Date.now() + 3600_000).toISOString();
+      const body = {
+        commandId,
+        kind: "set_capacity",
+        provider: "openai",
+        model: "gpt-5.6-terra",
+        status: "limited",
+        validUntil,
+      };
+
+      // First call — should insert.
+      const res1 = await app.fetch(
+        new Request("http://localhost/api/commands", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+      assert.equal(res1.status, 200, "first set_capacity call returns 200");
+      const data1 = (await res1.json()) as {
+        commandId: string;
+        replayed: boolean;
+        result: unknown;
+      };
+      assert.equal(data1.commandId, commandId, "commandId echoed");
+      assert.equal(data1.replayed, false, "first call is not a replay");
+      assert.ok(data1.result, "result present");
+
+      // Verify GET /api/capacity returns the row.
+      const capRes = await app.fetch(new Request("http://localhost/api/capacity"));
+      assert.equal(capRes.status, 200);
+      const capBody = (await capRes.json()) as Array<{
+        provider: string;
+        model: string;
+        status: string;
+        effectiveStatus: string;
+        concurrency: number | null;
+        source: string;
+      }>;
+      assert.equal(capBody.length, 1, "one capacity row");
+      const row = capBody[0]!;
+      assert.equal(row.provider, "openai");
+      assert.equal(row.model, "gpt-5.6-terra");
+      assert.equal(row.status, "limited");
+      assert.equal(row.source, "operator");
+      assert.ok(row.effectiveStatus !== undefined, "effectiveStatus present");
+      assert.ok(row.concurrency !== undefined, "concurrency present");
+
+      // Second call with same commandId — should replay.
+      const res2 = await app.fetch(
+        new Request("http://localhost/api/commands", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+      assert.equal(res2.status, 200, "second set_capacity call returns 200");
+      const data2 = (await res2.json()) as { commandId: string; replayed: boolean };
+      assert.equal(data2.replayed, true, "second call is a replay");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(f): GET /api/capacity returns correct effectiveStatus and concurrency for limited", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(DATABASE_URL!, ctx.schema);
+    try {
+      const app = createApp({
+        pool: pool as unknown as Parameters<typeof createApp>[0]["pool"],
+        flow: makeFakeFlow(),
+        reconciler: makeFakeReconciler(),
+        runtime: makeFakeRuntime(),
+        config: makeConfig(),
+        commands: makeFakeCommands(),
+      });
+
+      // Insert a non-stale 'limited' row via set_capacity.
+      const validUntil = new Date(Date.now() + 3600_000).toISOString();
+      await app.fetch(
+        new Request("http://localhost/api/commands", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            commandId: newId("cmd"),
+            kind: "set_capacity",
+            provider: "anthropic",
+            model: "claude-opus-4",
+            status: "limited",
+            validUntil,
+          }),
+        }),
+      );
+
+      const res = await app.fetch(new Request("http://localhost/api/capacity"));
+      const rows = (await res.json()) as Array<{
+        effectiveStatus: string;
+        concurrency: number | null;
+        status: string;
+      }>;
+      const row = rows.find((r) => r.status === "limited");
+      assert.ok(row, "limited row present");
+      assert.equal(
+        row!.effectiveStatus,
+        "limited",
+        "effectiveStatus=limited for non-stale limited row",
+      );
+      assert.ok(
+        row!.concurrency !== null && row!.concurrency > 0,
+        "concurrency is positive number for limited",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});

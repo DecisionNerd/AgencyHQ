@@ -73,6 +73,13 @@ export interface FlowConfig {
    * Default: 2.
    */
   integrateRetries?: number | undefined;
+  /**
+   * Number of concurrent worker slots.  Admission in onLeadPlanOutput queues
+   * the worker intent (status='queued') when all slots are occupied; the
+   * scheduler dispatches queued intents when a slot becomes free.
+   * Default: 1.
+   */
+  workerSlots?: number | undefined;
 }
 
 // ---------------------------------------------------------------------------
