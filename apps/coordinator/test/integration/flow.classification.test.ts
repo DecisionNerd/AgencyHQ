@@ -159,6 +159,29 @@ test("flow.classification: timed_out with budget 2 → second attempt created (a
           c.method === "trigger" && (c.args[0] as { task: string }).task === TASK_IDS.workerAttempt,
       );
       assert.equal(workerTriggers.length, 2, "worker.attempt triggered twice");
+
+      // CR-5: failures row inserted for old attempt (autoNewAttempt path)
+      const { rows: failureRows } = await client.query<{
+        class: string;
+        phase: string;
+        attempt_id: string;
+        cause: string;
+      }>("SELECT class, phase, attempt_id, cause FROM failures");
+      assert.equal(failureRows.length, 1, "(CR-5) one failures row for the old attempt");
+      assert.equal(failureRows[0]?.class, "execution", "(CR-5) failure class is execution");
+      assert.equal(failureRows[0]?.phase, "final", "(CR-5) failure phase is final");
+      assert.equal(
+        failureRows[0]?.attempt_id,
+        attemptRows[0].id,
+        "(CR-5) failure linked to first attempt",
+      );
+
+      // First attempt has failure_id set
+      const { rows: failedAttempt } = await client.query<{ failure_id: string | null }>(
+        "SELECT failure_id FROM attempts WHERE id = $1",
+        [attemptRows[0].id],
+      );
+      assert.ok(failedAttempt[0]?.failure_id !== null, "(CR-5) first attempt has failure_id set");
     } finally {
       await pool.end();
     }

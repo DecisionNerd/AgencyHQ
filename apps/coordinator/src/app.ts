@@ -54,7 +54,7 @@ export type PoolLike = {
 /** Minimal interface for the bounded-repair flow module. */
 export type FlowLike = {
   plan(workItemId: string, commandId: string): Promise<unknown>;
-  retryDispatch?(workItemId: string, commandId: string): Promise<unknown>;
+  retryDispatch?(intentId: string, commandId: string): Promise<unknown>;
 };
 
 /** Minimal interface for the reconciler. */
@@ -440,16 +440,16 @@ export function createApp(deps: AppDeps): Hono {
     }
 
     if (kind === "retry_dispatch") {
-      const workItemId = body.workItemId;
-      if (!workItemId || typeof workItemId !== "string") {
-        return c.json({ error: "workItemId required for retry_dispatch" }, 400);
+      const intentId = body.intentId;
+      if (!intentId || typeof intentId !== "string") {
+        return c.json({ error: "intentId required for retry_dispatch" }, 400);
       }
       if (!flow.retryDispatch) {
         return c.json({ error: "retry_dispatch not supported by flow" }, 400);
       }
       // retry_dispatch also managed by the flow internally
       if (commands) {
-        const result = await flow.retryDispatch(workItemId, commandId);
+        const result = await flow.retryDispatch(intentId, commandId);
         return c.json({ commandId, replayed: false, result }, 200);
       }
       {
@@ -464,7 +464,7 @@ export function createApp(deps: AppDeps): Hono {
               200,
             );
           }
-          const result = await flow.retryDispatch(workItemId, commandId);
+          const result = await flow.retryDispatch(intentId, commandId);
           await completeCommand(pgClient, commandId, result);
           return c.json({ commandId, replayed: false, result }, 200);
         } finally {

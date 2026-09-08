@@ -77,6 +77,7 @@ function makeConfig() {
     freshnessStaleMs: 30000,
     uncertainAfterMs: 120000,
     port: 0,
+    bindHost: "127.0.0.1",
   };
 }
 

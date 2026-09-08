@@ -20,6 +20,7 @@ export type CoordinatorConfig = {
   uncertainAfterMs: number;
   webDist?: string;
   port: number;
+  bindHost: string;
 };
 
 export class ConfigError extends Error {
@@ -121,6 +122,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
   const uncertainAfterMs = integer("AGENCYHQ_UNCERTAIN_AFTER_MS", 120_000);
   const webDist = optional("WEB_DIST");
   const port = portNum("PORT", 8787);
+  const bindHost = optional("AGENCYHQ_BIND_HOST") ?? "127.0.0.1";
 
   if (missing.length > 0 || invalid.length > 0) {
     throw new ConfigError(missing, invalid);
@@ -140,6 +142,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     freshnessStaleMs,
     uncertainAfterMs,
     port,
+    bindHost,
   };
 
   if (webDist !== undefined) {
