@@ -414,6 +414,69 @@ This starts `trigger dev` connected to the Trigger.dev cloud (requires `.env` wi
 pnpm --filter @agencyhq/trigger test
 ```
 
+## `integrate.merge` task (`src/tasks/integrate-merge.ts`)
+
+Implements R-015 and R-010: integrates an attempt commit into the coordinator-owned
+clone and pushes to the remote. This is the **only** task that may push; adapter tasks
+commit locally only (ARCHITECTURE.md lines 85-110).
+
+- Task id: `integrate.merge`, `maxDuration: 300`, single-concurrency `integrate` queue,
+  `retry: { maxAttempts: 1 }` (effectively no retry on failure).
+- Validates the payload locally (contracts import pending; swap noted in `types.ts`).
+  Throws `AbortTaskRunError` for missing `repoPath` or invalid payload — not retried.
+- Runs with the **host environment** (credential helper available for pushes), not the
+  scrubbed worker env.  `GIT_TERMINAL_PROMPT=0` is added to every git call.
+- Publishes phases `validating` → `setup` → `integrating` → `done` plus `outcome` to
+  run metadata.
+
+### Outcomes
+
+| Outcome | Meaning |
+|---|---|
+| `integrated` | Merge commit pushed; `resultingRevision` is the merge SHA. |
+| `already_integrated` | `attemptRevision` is already an ancestor of the remote ref. |
+| `base_moved` | Remote ref advanced past `expectedBaseRevision` before this run; nothing pushed. |
+| `conflict` | Merge produced content conflicts; `conflictingPaths` lists the affected files; nothing pushed. |
+| `push_rejected` | Force-with-lease failed (race); `observedTargetRevision` holds the current remote SHA. |
+
+### Pure core (`src/tasks/integrate-merge-core.ts`)
+
+Factors out every piece that does not need the Trigger SDK — no Trigger SDK import,
+no direct child_process or fs calls:
+
+- `IntegrateMergeDeps`: injected interface for `fetchRef`, `lsRemote`, `isAncestor`,
+  `worktreeAdd`, `worktreeRemove`, `mergeInWorktree`, `pushForceWithLease`.
+- `resolveMergeWorktreePath(runDir)`: `<runDir>/merge-wt`.
+- `runIntegrateMerge(payload, deps, runDir)`: implements the full algorithm; always
+  removes the merge worktree in `finally`; builds an `evidence` array of git commands
+  run with their exit codes (no secrets).
+
+### Git helpers (`src/lib/git.ts` — additive)
+
+`fetchRef`, `lsRemote`, `isAncestor`, `mergeInWorktree`, `pushForceWithLease` — all
+set `GIT_TERMINAL_PROMPT=0` on network-facing calls; never prompt for credentials.
+
+### Invariants
+
+- Only `integrate.merge` pushes to a remote; all other tasks commit locally (grep
+  assertion in `test/push-boundary.test.ts`).
+- `integrate-merge-core.ts` contains no Trigger SDK import (C5).
+- The merge worktree is always removed in a `finally` block.
+- Evidence lists commands with exit codes and does not include credential strings.
+
+### Tests (`test/integrate-merge-core.test.ts`, `test/push-boundary.test.ts`)
+
+Seven tests per the packet spec:
+1. `merge_commit` happy path → `integrated`; remote advanced; merge commit has two parents.
+2. `fast_forward` happy path → `integrated`; remote advanced to attempt SHA directly.
+3. Base moved (concurrent push before run) → `base_moved`; nothing pushed.
+4. Content conflict → `conflict`; `conflictingPaths` includes the file; nothing pushed; worktree removed.
+5. Replay after success → `already_integrated`; remote unchanged.
+6. Lease rejection (remote advances between fetch and push, injected via deps) → `push_rejected`;
+   `observedTargetRevision` equals the new remote SHA.
+7. Grep assertion: no file in `trigger/src` except `integrate-merge*` and `lib/git.ts`
+   (and the known `lib/env.ts` dry-run check) contains `"push"`.
+
 ### Tasks connected to the coordinator
 
 Each task is imported by the coordinator and wired through static imports. The `verify.run` task uses `@agencyhq/verification` directly. The `lead.plan`, `lead.review`, and `lead.accept` tasks use `leadPrompt` from `trigger/src/opencode/sdk.ts`.

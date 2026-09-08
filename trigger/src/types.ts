@@ -172,3 +172,41 @@ export type LeadPlanVariant = {
   /** Model variant (e.g. "low", "high"). Defaults to AGENCYHQ_LEAD_VARIANT env or "low". */
   variant?: string | undefined;
 };
+// Appended for the integrate.merge task (Packet 4.1.d, R-015, R-010).
+// Once @agencyhq/contracts publishes IntegrateMergePayloadSchema / IntegrateMergeOutputSchema and
+// TASK_IDS.integrateMerge these local types should be replaced by that import.
+
+/** Payload for the `integrate.merge` task. */
+export type IntegrateMergePayload = {
+  attemptId: string;
+  generation: number;
+  contractId: string;
+  contractVersion: string;
+  projectId: string;
+  /** Absolute path to the coordinator-owned git clone used for all git operations. */
+  repoPath: string;
+  /** Remote name configured in repoPath (e.g. "origin"). */
+  remote: string;
+  /** Branch name on the remote to integrate into (e.g. "main"). */
+  targetRef: string;
+  /** The SHA the coordinator last observed as the remote's targetRef HEAD. */
+  expectedBaseRevision: string;
+  /** SHA of the attempt commit to integrate. Must exist in repoPath. */
+  attemptRevision: string;
+  /** Integration strategy: merge_commit always creates a merge commit; fast_forward fails if FF is not possible. */
+  strategy: "merge_commit" | "fast_forward";
+};
+
+/** Output of the `integrate.merge` task. */
+export type IntegrateMergeOutput = {
+  /** How the integration attempt resolved. */
+  outcome: "integrated" | "already_integrated" | "base_moved" | "conflict" | "push_rejected";
+  /** SHA of the resulting commit on the remote (present for integrated / already_integrated). */
+  resultingRevision?: string;
+  /** The remote targetRef SHA observed at the time of the fetch (or after the push on rejection). */
+  observedTargetRevision: string;
+  /** Git commands run with their exit codes. No secrets included. */
+  evidence: string[];
+  /** Files with unresolved merge conflicts (present when outcome is conflict). */
+  conflictingPaths?: string[];
+};
