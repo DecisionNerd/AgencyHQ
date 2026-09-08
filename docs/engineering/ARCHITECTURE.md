@@ -48,9 +48,12 @@ execution, verification, acceptance, integration — plus an evidence panel and
 operator actions), `#/projects/:id/authority` (JSON authority editor with
 version history and confirm dialog), `#/return` (return-after-interruption
 view). Work-item actions (approve, reject, stop, invalidate, pause) each show
-a `ConfirmDialog` naming the project and work item; approve, reject, and
-invalidate also name the contract version. The authority editor's Save button
-shows a confirm naming the project and the proposed new authority version.
+a `ConfirmDialog` naming the action and its consequence, the project, the
+work item, the attempt (when there is one), and the contract version
+(`apps/web/src/control-plane-helpers.ts` `confirmMessage`, asserted by the
+approve, reject, and stop journeys). The authority editor's Save button shows
+a confirm naming the project, the proposed new authority version, and that
+frozen contracts are unaffected.
 Bearer-auth token stored in
 `localStorage["agencyhq.apiToken"]`; all `/api/*` calls include
 `Authorization: Bearer <token>`; a 401 response clears the token and shows a
@@ -61,13 +64,19 @@ coordinator.
 
 **Decisions view semantics.** A `pending_human` decision is *open* when no
 later decision of a resolving outcome (`approved`, `rejected`, `accepted`,
-`invalidated`) exists for the same attempt. After the operator approves or
-rejects, the coordinator appends a resolving decision for that attempt; the
-decisions view re-filters and the entry disappears without deleting any row.
-This is the behavior observed and fixed during the Slice 5 browser journey
-(`apps/coordinator/src/views/pending.ts`, `isOpenPending`). A pending decision
-without an attempt id cannot be resolved by inference and stays open until a
-command updates it.
+`invalidated`) closes it. Two resolution modes (implemented in
+`apps/coordinator/src/views/pending.ts`, `isOpenPending`, `openPendingDecisions`):
+attempt-scoped decisions (attemptId non-null) are closed by a resolving decision
+with the same attemptId; plan and review decisions written without an attempt
+(attemptId null) are closed by a resolving decision with the same work item, kind,
+and contract version. `approval_mismatch` is not a resolving outcome, so an
+`APPROVAL_VERSION_MISMATCH` response does not close the pending decision — the
+entry stays visible for a corrected approve. After the operator approves or
+rejects, the coordinator appends a resolving decision; the decisions view
+re-filters and the entry disappears without deleting any row. The `reject` command
+is state-guarded like `approve`: rejecting a decision that already has a resolving
+outcome returns `state_mismatch`. `openPendingDecisions` is the sole source for
+the decisions view and for the work-item page's operator action buttons.
 
 **Decisions view fields.** Each entry exposes: `obstacle` (violation codes or
 decision kind); `recommendation` (the Lead proposal's `rationale` field when
@@ -99,7 +108,7 @@ All routes require `Authorization: Bearer <token>`.
 | `assign_campaign` | Sets `campaign_id` on a work item |
 | `set_main_effort` | Sets `main_effort_work_item_id` on a campaign; work item must belong to the campaign (`not_a_member` otherwise) |
 | `set_rank` | Optimistic CAS on work item `version`; returns `stale_version` on mismatch |
-| `update_authority` | Schema-validated; integer-major version must increase; `SELECT FOR UPDATE` row lock + CAS on `authority_version`; backfills initial version history on first update; appends to `authority_versions`; inserts `authority_update` decision; frozen contract bounds untouched (R-018) |
+| `update_authority` | Schema-validated; integer-major version must increase; `SELECT FOR UPDATE` row lock + CAS on `authority_version`; concurrent same-base update returns `version_not_increasing`; backfills initial version history on first update attributed to actor `backfill` at the project's `created_at`; appends to `authority_versions`; inserts `authority_update` decision; frozen contract bounds untouched (R-018) |
 
 ### Coordinator
 

@@ -105,10 +105,14 @@ on it.
   and `campaignRankOrder`; `create_campaign`, `assign_campaign`, `set_main_effort`,
   `set_rank` commands wired in the coordinator API. Overview view (campaigns +
   ranked work items), decisions view (open pending only — no later resolving
-  decision for the same attempt), evidence view, authority view with version
-  history. `reject` command transitions work item to `halted`; `invalidate_acceptance`
-  inserts a new decision of kind `invalidate` and transitions to `reopened`
-  without touching historical rows (R-017). `update_authority` validates with
+  decision for the same attempt — or for the same work item, kind, and contract
+  version for plan/review decisions without an attempt), evidence view, authority
+  view with version history. `reject` command is state-guarded (returns
+  `state_mismatch` on a resolved decision) and transitions work item to `halted`;
+  `invalidate_acceptance` references the historical accept decision with outcome
+  `approved` (human approval) or `accepted` (coordinator acceptance), inserts a
+  new decision of kind `invalidate`, and transitions to `reopened` without touching
+  historical rows (R-017). `update_authority` validates with
   `AuthoritySchema`, requires strictly increasing version, appends to
   `authority_versions`, inserts an `authority_update` decision; frozen contract
   bounds are never modified (R-018). `selectDispatch` is implemented and
