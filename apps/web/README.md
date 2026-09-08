@@ -29,6 +29,10 @@ Run the Vite dev server (`pnpm dev`) while the coordinator runs on port 8787. Th
 
 Run `pnpm build`. The coordinator serves `apps/web/dist` as static files. The Vite config outputs to `dist/` (already in `.gitignore`).
 
+## Browser tests (Playwright)
+
+`e2e/` contains Playwright Chromium journeys run with `pnpm test:browser`. The `playwright.config.ts` builds the web app, seeds the coordinator database (`apps/coordinator/scripts/seed-control-plane.ts`), and starts the coordinator with `RUNTIME=fake` and `AGENCYHQ_API_TOKEN=browser-test-token` before Chromium drives the tests. 16 journeys cover: return view sections, five work-item state cards, approve from decisions page, reject to halted, authority editor (invalid JSON error + valid save), stop confirm dialog. CI job `browser` in `.github/workflows/check.yml` runs the full suite on ubuntu-latest with a Postgres 17.6 service.
+
 ## Note on @vitejs/plugin-react
 
 `@vitejs/plugin-react@6.x` requires `vite@^8`, but this workspace pins `vite@^7`. The `vite.config.ts` therefore uses Vite 7's built-in `esbuild` JSX transform (`jsx: "automatic", jsxImportSource: "react"`) instead of the plugin; React Fast Refresh is not active in the dev server as a result. This constraint resolves when the workspace upgrades to vite@8.

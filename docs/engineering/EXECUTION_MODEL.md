@@ -123,6 +123,44 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    record a `pending_human` or backlog decision without mutating the contract.
    Covered by `apps/coordinator/test/integration/flow.remediate.test.ts`.
 
+10. **Reject.** The `reject` command (`POST /api/commands` with `kind: "reject"`,
+    fields `workItemId`, `decisionId`, `reason`) updates the pending decision
+    outcome to `"rejected"` and sets the work item lifecycle to `"halted"` in
+    one transaction. The operator must supply a non-empty reason. The command is
+    idempotent by `commandId`. A rejected work item is not automatically
+    re-planned; a new plan requires an explicit operator command.
+
+11. **Invalidate acceptance.** The `invalidate_acceptance` command (`POST /api/commands`
+    with `kind: "invalidate_acceptance"`, fields `workItemId`, `attemptId`,
+    `reason`) verifies the attempt belongs to the work item and has a recorded
+    accepted decision, then in one transaction: inserts a new decision of kind
+    `"invalidate"` referencing the historical accept decision; sets the work
+    item lifecycle to `"reopened"`; appends a transition audit row. The
+    historical accept decision row is never modified (R-017). The contract row
+    is never modified (R-018). A new plan is permitted after reopening. The
+    command is idempotent by `commandId`.
+
+12. **Update authority.** The `update_authority` command (`PUT /api/projects/:id/authority`
+    or `POST /api/commands` with `kind: "update_authority"`) validates the
+    proposed authority with `AuthoritySchema`; the numeric version must be
+    strictly greater than the current project version. In one transaction:
+    updates `projects.authority` and `projects.authority_version`; appends a
+    row to `authority_versions` (idempotent on `(project_id, version)`); inserts
+    a decision of kind `"authority_update"` for the audit trail. Frozen
+    `step_contracts` rows are never modified — their bounds and digests are fixed
+    at freeze time and govern only the attempt for which they were frozen
+    (R-018). Future Lead proposals are governed by the new authority.
+
+13. **Campaign and rank commands.** `create_campaign` inserts a campaign and
+    returns its id. `assign_campaign` sets `campaign_id` on a work item.
+    `set_main_effort` sets `main_effort_work_item_id` on a campaign (work item
+    must belong to the campaign). `set_rank` updates a work item's rank with
+    optimistic CAS on the work item's `version` column; returns
+    `{ ok: false, reason: "stale_version" }` on mismatch. All are idempotent by
+    `commandId`.
+
+**Campaign-aware dispatch ordering.** The coordinator has no batch scheduler; `selectDispatch` is called on each reconciler pass. When a work item belongs to a campaign, campaign members cluster at their campaign main effort's rank in the dispatch order: the designated main effort sorts first within the campaign group, then remaining members by `(rank asc, createdAt asc, id asc)`. Items without a `campaignId` keep the existing global `(rank, id)` order. No new skip reason is introduced — the main effort is prioritised through sort order alone. The global main effort (highest-ranked item passing eligibility rules 1–2) is still recorded for the UI even when a campaign main effort is blocked or its repository is busy.
+
 Lead and human decisions happen between runs. No run waits on a human; a
 waiting self-hosted run holds its process or container and a concurrency slot.
 
