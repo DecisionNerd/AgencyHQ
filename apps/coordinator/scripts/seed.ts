@@ -105,7 +105,7 @@ try {
     const remote = await resolveRemote(repo);
 
     projectId = newId("prj");
-    const headRevision = execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+    const headRevision = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
       encoding: "utf8",
     }).trim();
     await insertProject(client, {
