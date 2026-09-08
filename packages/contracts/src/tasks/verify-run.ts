@@ -31,7 +31,17 @@ export const VerifyRunPayloadSchema = z.object({
 });
 export type VerifyRunPayload = z.infer<typeof VerifyRunPayloadSchema>;
 
+export const VerifyRunIntegritySchema = z.object({
+  tamperedPaths: z.array(z.string()),
+  protectedPathsSource: z.enum(["payload", "default"]),
+});
+export type VerifyRunIntegrity = z.infer<typeof VerifyRunIntegritySchema>;
+
 export const VerifyRunOutputSchema = z.object({
   results: z.array(VerificationResultSchema),
+  /** Integrity metadata from tamper detection. Optional so older outputs
+   * (before H-6) still parse; the coordinator treats absence as a pre-H-6
+   * run with no tamper findings. */
+  integrity: VerifyRunIntegritySchema.optional(),
 });
 export type VerifyRunOutput = z.infer<typeof VerifyRunOutputSchema>;
