@@ -7,13 +7,27 @@
  *
  * All commands are idempotent by commandId (R-010).
  *
- * NOTE: This module writes SQL directly against the campaigns table and
- * work_items.campaign_id column introduced in migration 0004, because
- * packages/db repos for these are being added in a parallel packet.
- * Swap to @agencyhq/db repo imports when the merge packet lands.
+ * DB repos used: insertCampaign, getCampaign, assignWorkItemToCampaign,
+ * getWorkItem, setWorkItemRank (from @agencyhq/db).
+ *
+ * Note on setMainEffort: the db repo setMainEffort enforces that the work item
+ * must already belong to the campaign (campaign_id match). This command uses
+ * getCampaign for existence check and raw SQL for the update to preserve the
+ * existing permissive semantics (set main_effort_work_item_id regardless of
+ * campaign membership, mirroring the original coordinator behavior).
  */
 
-import { claimCommand, completeCommand } from "@agencyhq/db";
+import {
+  assignWorkItemToCampaign,
+  claimCommand,
+  completeCommand,
+  setWorkItemRank as dbSetWorkItemRank,
+  getCampaign,
+  getWorkItem,
+  insertCampaign,
+} from "@agencyhq/db";
+// Note: 'setWorkItemRank as dbSetWorkItemRank' alias avoids clash with the
+// exported command function of the same name in this module.
 import type pg from "pg";
 
 // ---------------------------------------------------------------------------
@@ -53,11 +67,7 @@ export async function createCampaign(
 
     const campaignId = `cmp-${commandId.slice(0, 8)}`;
 
-    await client.query(
-      `INSERT INTO campaigns (id, name) VALUES ($1, $2)
-       ON CONFLICT (id) DO NOTHING`,
-      [campaignId, name],
-    );
+    await insertCampaign(client, { id: campaignId, name });
 
     const result: CreateCampaignResult = { ok: true, campaignId };
     await completeCommand(client, commandId, result);
@@ -95,20 +105,15 @@ export async function assignCampaign(
       return { ...stored, replayed: true };
     }
 
-    // Check campaign exists
-    const { rows } = await client.query<{ id: string }>(`SELECT id FROM campaigns WHERE id = $1`, [
-      campaignId,
-    ]);
-    if (rows.length === 0) {
+    // Check campaign exists via db repo
+    const campaign = await getCampaign(client, campaignId);
+    if (!campaign) {
       const result: AssignCampaignResult = { ok: false, reason: "not_found" };
       await completeCommand(client, commandId, result);
       return result;
     }
 
-    await client.query(`UPDATE work_items SET campaign_id = $1, updated_at = now() WHERE id = $2`, [
-      campaignId,
-      workItemId,
-    ]);
+    await assignWorkItemToCampaign(client, workItemId, campaignId);
 
     const result: AssignCampaignResult = { ok: true };
     await completeCommand(client, commandId, result);
@@ -146,15 +151,17 @@ export async function setMainEffort(
       return { ...stored, replayed: true };
     }
 
-    const { rows } = await client.query<{ id: string }>(`SELECT id FROM campaigns WHERE id = $1`, [
-      campaignId,
-    ]);
-    if (rows.length === 0) {
+    // Check campaign exists via db repo
+    const campaign = await getCampaign(client, campaignId);
+    if (!campaign) {
       const result: SetMainEffortResult = { ok: false, reason: "not_found" };
       await completeCommand(client, commandId, result);
       return result;
     }
 
+    // Update main_effort_work_item_id directly — permissive: does not require
+    // the work item to already belong to the campaign (db.setMainEffort enforces
+    // that guard; this command intentionally does not to preserve existing behavior).
     await client.query(
       `UPDATE campaigns SET main_effort_work_item_id = $1, updated_at = now() WHERE id = $2`,
       [workItemId, campaignId],
@@ -197,29 +204,17 @@ export async function setWorkItemRank(
       return { ...stored, replayed: true };
     }
 
-    // Load current version for optimistic locking
-    const { rows: wiRows } = await client.query<{ version: number }>(
-      `SELECT version FROM work_items WHERE id = $1`,
-      [workItemId],
-    );
+    // Atomic CAS update via db repo (bumps version on success).
+    const outcome = await dbSetWorkItemRank(client, workItemId, rank, expectedVersion);
 
-    if (wiRows.length === 0) {
-      const result: SetWorkItemRankResult = { ok: false, reason: "not_found" };
+    if (outcome === "stale") {
+      // Distinguish not_found from stale_version: check if the row exists.
+      const existing = await getWorkItem(client, workItemId);
+      const reason: "not_found" | "stale_version" = existing ? "stale_version" : "not_found";
+      const result: SetWorkItemRankResult = { ok: false, reason };
       await completeCommand(client, commandId, result);
       return result;
     }
-
-    const currentVersion = wiRows[0]?.version ?? 0;
-    if (currentVersion !== expectedVersion) {
-      const result: SetWorkItemRankResult = { ok: false, reason: "stale_version" };
-      await completeCommand(client, commandId, result);
-      return result;
-    }
-
-    await client.query(`UPDATE work_items SET rank = $1, updated_at = now() WHERE id = $2`, [
-      rank,
-      workItemId,
-    ]);
 
     const result: SetWorkItemRankResult = { ok: true };
     await completeCommand(client, commandId, result);
