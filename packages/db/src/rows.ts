@@ -401,3 +401,19 @@ export const AuthorityVersionRowSchema = z.object({
 });
 
 export type AuthorityVersionRow = z.infer<typeof AuthorityVersionRowSchema>;
+
+// ---------------------------------------------------------------------------
+// provider_capacity
+// ---------------------------------------------------------------------------
+
+export const ProviderCapacityRowSchema = z.object({
+  provider: z.string(),
+  model: z.string(),
+  status: z.enum(["ok", "limited", "down"]),
+  observed_at: z.date(),
+  valid_until: z.date(),
+  source: z.enum(["adapter", "operator"]),
+  run_id: z.string().nullable(),
+});
+
+export type ProviderCapacityRow = z.infer<typeof ProviderCapacityRowSchema>;
