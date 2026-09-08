@@ -75,6 +75,7 @@ model (ADR-0007): no Trigger SDK usage, node built-ins only.
   uses, and a text tail. See the file's header comment for the OpenCode
   CLI/config/permission facts this encodes and their source dates, and for
   what the required smoke run actually observed.
+- `manifest.ts`: pure helpers for combined verification across manifest entries. `siblingEntries(entries, projectId)` returns all entries except the one belonging to the given projectId. `manifestEnv(entries, paths, digest)` builds the environment variable map for checks: each sibling entry at position N produces `AGENCYHQ_MANIFEST_<N>` pointing to its materialized worktree path, plus `AGENCYHQ_MANIFEST_DIGEST` set to the manifest plan digest.
 
 `scripts/opencode-smoke.ts` exercises `opencode.ts` end to end against a
 disposable temp fixture repo and worktree: an allowed edit, three
@@ -256,9 +257,10 @@ Implements ADR-0007 item 5: verification runs as its own Trigger task in a separ
 `src/tasks/verify-run-core.ts` factors out every piece that does not need the Trigger SDK:
 
 - `VerificationRunner` interface: `runProfile(input) => Promise<VerificationResult[]>` plus optional `abort()`.
-- `VerifyRunDeps`: injected git ops, runner, optional fingerprint, and `now()`.
+- `VerifyRunDeps`: injected git ops, runner, optional fingerprint, `now()`, plus optional `manifestProjectId` (the projectId of the project currently under verification) and `manifestRepoPaths` (map from projectId to absolute path of coordinator-owned clones of sibling repositories). Both manifest fields are required when `payload.manifest` is present.
 - `resolveVerifyWorktreePath`: `<worktreeBase>/verify/<attemptId>-<generation>`.
-- `runVerification(payload, deps)`: creates the verify worktree at `attemptRevision`; reproduces `diffDigest` against `baseRevision` before any check runs; on mismatch returns one `result: "error"` per check with `stderrTail: "integrity_mismatch: expected <a> got <b>"` and does NOT call the runner; on match runs `detectVerifierTampering` on the changed paths (reporting `tamperedPaths` in output but not changing results), then calls `runner.runProfile`; always removes the verify worktree in `finally`; re-stamps `profileDigest`/`criteriaDigest` from the payload on every result (frozen digests, never recomputed from the worktree); parses every result with `VerificationResultSchema`.
+- `resolveManifestWorktreeDir`: `<worktreeBase>/manifest-<attemptId>-<generation>` — base directory for sibling worktrees materialized during combined verification.
+- `runVerification(payload, deps)`: creates the verify worktree at `attemptRevision`; reproduces `diffDigest` against `baseRevision` before any check runs; on mismatch returns one `result: "error"` per check with `stderrTail: "integrity_mismatch: expected <a> got <b>"` and does NOT call the runner; on match runs `detectVerifierTampering` on the changed paths (reporting `tamperedPaths` in output but not changing results). When `payload.manifest` is present and `deps.manifestProjectId`/`deps.manifestRepoPaths` are supplied, materializes each sibling entry as a detached worktree under `<manifestDir>/<position>` using `siblingEntries` and passes `manifestEnv` (`AGENCYHQ_MANIFEST_<N>` and `AGENCYHQ_MANIFEST_DIGEST`) into the check environment. All sibling worktrees are removed in `finally` before the main verify worktree. Each `VerificationResult` record receives the `manifest` field (plan digest and per-sibling revision info) when sibling repos were materialized. Then calls `runner.runProfile`; always removes the verify worktree in `finally`; re-stamps `profileDigest`/`criteriaDigest` from the payload on every result (frozen digests, never recomputed from the worktree); parses every result with `VerificationResultSchema`.
 
 Evidence integrity invariants enforced (TESTING.md §67-73): the worktree is at `attemptRevision`; the digests are frozen before the worker runs and copied from the payload unchanged; the worker's report of checks run is context, not evidence (the file never references `report` or `checksRun`); the verify worktree is disposed after the run.
 
@@ -447,10 +449,8 @@ no direct child_process or fs calls:
 - `IntegrateMergeDeps`: injected interface for `fetchRef`, `lsRemote`, `isAncestor`,
   `worktreeAdd`, `worktreeRemove`, `mergeInWorktree`, `pushForceWithLease`.
 - `resolveMergeWorktreePath(runDir)`: `<runDir>/merge-wt`.
-- `runIntegrateMerge(payload, deps, runDir)`: implements the full algorithm; always
-  removes the merge worktree in `finally`; builds an `evidence` array of git commands
-  run with their exit codes and, on failures, scrubbed stderr excerpts (first 500 chars,
-  credentials redacted).
+- `normalizeTargetRef(ref)`: strips a `refs/heads/` prefix from `ref` if present, so both `"main"` and `"refs/heads/main"` resolve to the same branch name. Applied to `payload.targetRef` at the start of `runIntegrateMerge` — the coordinator freezes the long form for single-repo contracts; manifests use the short form.
+- `runIntegrateMerge(payload, deps, runDir)`: normalizes `targetRef` via `normalizeTargetRef`, then implements the full algorithm; always removes the merge worktree in `finally`; builds an `evidence` array of git commands run with their exit codes and, on failures, scrubbed stderr excerpts (first 500 chars, credentials redacted). On `push_rejected`, classifies the failure kind (`lease_broken`, `auth`, `network`, or `other`) from git stderr and re-reads the remote ref for `observedTargetRevision`.
 
 ### Git helpers (`src/lib/git.ts` — additive)
 

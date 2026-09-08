@@ -45,7 +45,7 @@ The following Zod schemas are exported from this package:
 - `CriterionSchema` / `Criterion` — One acceptance criterion with `id`, `text`, `source`, and optional `citation`.
 - `ContractBoundsSchema` / `ContractBounds` — The concrete bounds frozen into a StepContract at creation: paths, capabilities, boundary, budget, review profile, change class, and single-model worker/reviewer identifiers.
 - `DigestStringSchema` — `z.string().regex(...)` version of the digest validator. JSON-Schema-representable (unlike `DigestSchema`). Used in task payload and output schemas.
-- `StepContractSchema` / `StepContract` — Immutable contract version. Includes base revision, criteria with digest, profile with digest, bounds, required boundaries, human-approval flag, and status. Supersede, never rebind (R-018).
+- `StepContractSchema` / `StepContract` — Immutable contract version. The `inputs` object carries `intent`, optional `defect`, optional `targetRef` (required for merge/deploy boundary contracts; absent for artifact-only contracts), and optional `manifestDigest` (for multi-repository work items). Also includes base revision, criteria with digest, profile with digest, bounds, required boundaries, human-approval flag, and status. Supersede, never rebind (R-018).
 - `criteriaDigestInput(criteria)` — Returns the canonical `{id, text, source}[]` object that `packages/domain` passes to `digestOf` to produce `criteriaDigest`. Citation is excluded for digest stability.
 
 ## Task schemas
@@ -59,8 +59,11 @@ Each task pair lives in `src/tasks/<name>.ts` and exports `XPayloadSchema` / `XO
 | `verify.run` | `VerifyRunPayloadSchema` | `VerifyRunOutputSchema` |
 | `lead.review` | `LeadReviewPayloadSchema` | `ReviewOutputSchema` |
 | `lead.accept` | `LeadAcceptPayloadSchema` | `AcceptanceProposalSchema` |
+| `integrate.merge` | `IntegrateMergePayloadSchema` | `IntegrateMergeOutputSchema` |
 
-`TASK_IDS` is a `as const` map of task string identifiers (`lead.plan`, `worker.attempt`, `verify.run`, `lead.review`, `lead.accept`).
+`TASK_IDS` is a `as const` map of task string identifiers (`lead.plan`, `worker.attempt`, `verify.run`, `lead.review`, `lead.accept`, `integrate.merge`).
+
+`IntegrateMergePayloadSchema` carries `attemptId`, `generation`, `contractId`, `contractVersion`, `projectId`, `repoPath`, `remote`, `targetRef`, `expectedBaseRevision`, `attemptRevision`, and `strategy` (`"merge_commit" | "fast_forward"`). `IntegrateMergeOutputSchema` returns `outcome` (`"integrated" | "already_integrated" | "base_moved" | "conflict" | "push_rejected"`), optional `resultingRevision`, `observedTargetRevision`, `evidence` strings, and optional `conflictingPaths`.
 
 Supporting schemas:
 
@@ -68,7 +71,9 @@ Supporting schemas:
 - `WorkerReportSchema` — worker self-report; context only, never evidence (TESTING.md §67-73).
 - `VerificationResultSchema` — minimum verification record with every field from TESTING.md §89-94.
 
-`LeadPlanPayloadSchema.authority` is `AuthoritySchema`; `narrowing` is `AuthorityNarrowingSchema.optional()`. `WorkerAttemptPayloadSchema.bounds` is `ContractBoundsSchema`; `permissionRules` is `PermissionRulesetSchema`.
+`LeadPlanPayloadSchema.authority` is `AuthoritySchema`; `narrowing` is `AuthorityNarrowingSchema.optional()`; `manifest` is `RevisionManifestSchema.optional()` — supplied for multi-repository WorkItems so the Lead understands scope and target refs. `WorkerAttemptPayloadSchema.bounds` is `ContractBoundsSchema`; `permissionRules` is `PermissionRulesetSchema`. `VerifyRunPayloadSchema.manifest` is `RevisionManifestSchema.optional()` — supplied when sibling repositories must be materialized for combined verification.
+
+`WorkerAttemptOutputSchema.opencode.denials` is an array of `{ tool: string; pattern: z.string().nullable().optional(); message: string }`. The `pattern` field is nullable (the runtime serializes an absent value as `null` on a tool denial without a command).
 
 `LeadReviewPayloadSchema` contains no session id or transcript fields (ADR-0006 independence invariant, asserted in tests).
 
@@ -77,6 +82,15 @@ Supporting schemas:
 `src/opencode/json-schema.ts` exports `jsonSchemaFor(schema)` (wraps `z.toJSONSchema` with `target: "draft-2020-12"` and `unrepresentable: "throw"`) and `LEAD_OUTPUT_JSON_SCHEMAS` (pre-built schemas for `LeadPlanOutput`, `ReviewOutput`, and `AcceptanceProposal` for use with OpenCode structured output).
 
 ## Modules
+
+### `manifest`
+
+Revision manifest schemas for multi-repository WorkItems.
+
+- `HexRevision40Schema` — 40 lower-case hex characters; used in manifest entry fields.
+- `ManifestEntrySchema` / `ManifestEntry` — one entry per repository: `position` (0-based integer, must form an unbroken 0..n-1 sequence), `projectId`, `targetRef`, `expectedBaseRevision` (`HexRevision40Schema`), `resultRevision` (nullable; absent from the digest).
+- `manifestDigest(entries)` — computes a stable `sha256:<hex>` digest over entries sorted by position with `resultRevision` excluded. The same plan always yields the same digest regardless of integration progress.
+- `RevisionManifestSchema` / `RevisionManifest` — wraps `entries` and `digest`; validates that positions are exactly 0..n-1 with no duplicates and that `digest === manifestDigest(entries)`.
 
 ### `digest`
 
