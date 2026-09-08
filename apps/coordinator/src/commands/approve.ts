@@ -120,7 +120,19 @@ export async function approveWorkItem(
     );
 
     // run_observations.payload is the full RunObservation JSON; output is inside it.
-    const obsPayload = obsRows[0]?.payload as { output?: unknown } | undefined;
+    let obsPayload = obsRows[0]?.payload as { output?: unknown } | undefined;
+    if (obsPayload === undefined) {
+      // Ledger has no row for this run (observed 2026-09-08 on a ledger
+      // written before the reconciler recorded Lead observations): read the
+      // run's final output from the runtime instead. The acceptance rule
+      // still decides; this only recovers the proposal text.
+      try {
+        const live = await deps.runtime.retrieve(intentRow.run_id);
+        obsPayload = { output: live.output };
+      } catch {
+        obsPayload = undefined;
+      }
+    }
     const proposalResult = AcceptanceProposalSchema.safeParse(obsPayload?.output);
     if (!proposalResult.success) {
       // Stored observation missing a valid proposal.

@@ -155,6 +155,17 @@ export class Reconciler {
         const dispatchedGen = getIntentGen(intent);
         const commandId = `cmd_obs_${runId}_${dispatchedGen}` as CommandId;
 
+        // R-010: every final observation is recorded, not only worker runs.
+        // worker.attempt and integrate.merge record theirs inside their own
+        // transaction (their handlers act on the "applied" result), so only
+        // the Lead and verify runs are recorded here. Duplicates are no-ops.
+        // Observed 2026-09-08 (Slice 4 live session): the approve command
+        // reads the lead.accept proposal from run_observations, which was
+        // empty for every non-worker task.
+        if (intent.task !== TASK_IDS.workerAttempt && intent.task !== TASK_IDS.integrateMerge) {
+          await this.recordFinalObservation(obs, intent, dispatchedGen);
+        }
+
         try {
           if (intent.task === TASK_IDS.workerAttempt) {
             await this.flow.onWorkerFinal(obs, commandId);
@@ -319,6 +330,31 @@ export class Reconciler {
       }
 
       return "done";
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Record a final observation for a task whose handler does not record it
+   * itself (lead.plan, verify.run, lead.review, lead.accept). Never throws:
+   * recording is history, routing must still happen. */
+  private async recordFinalObservation(
+    obs: RunObservation,
+    intent: Awaited<ReturnType<typeof listOpenDispatchIntents>>[number],
+    generation: number,
+  ): Promise<void> {
+    const client = await this.deps.pool.connect();
+    try {
+      await applyObservation(client, {
+        runId: obs.runId,
+        generation,
+        attemptId: intent.attempt_id ?? "",
+        status: obs.status,
+        payload: obs,
+        observedAt: new Date(obs.observedAt),
+      });
+    } catch (err) {
+      console.error("[reconciler] record observation failed", intent.id, err);
     } finally {
       client.release();
     }
