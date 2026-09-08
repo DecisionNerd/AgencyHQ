@@ -163,4 +163,72 @@ export class RealExecutionRuntime implements ExecutionRuntime {
       throw new RuntimeError(err);
     }
   }
+
+  /**
+   * Subscribe to real-time run updates for runs carrying any of `input.tags`.
+   *
+   * Uses `runs.subscribeToRunsWithTag(tag)` for each tag (SDK 4.5.16 async
+   * iterator).  All per-tag subscriptions run concurrently; an error in any
+   * one of them is logged and aborts the rest (the caller falls back to
+   * polling).  The returned promise resolves once all iterators have ended
+   * (either because the signal was aborted or because of the error path).
+   *
+   * This is a wake-up hint — polling via `retrieve` remains the path of record.
+   */
+  async subscribe(
+    input: { tags: string[]; signal: AbortSignal },
+    onObservation: (obs: RunObservation) => void,
+  ): Promise<void> {
+    // Internal controller: aborted when input.signal fires OR when any tag
+    // subscription errors, so all iterators stop together.
+    const ac = new AbortController();
+    const onSignalAbort = () => ac.abort();
+    input.signal.addEventListener("abort", onSignalAbort, { once: true });
+
+    const tagPromises = input.tags.map(async (tag) => {
+      try {
+        // subscribeToRunsWithTag is part of `typeof runs` (SDK 4.5.16).
+        // Casting to unknown → AsyncIterable because TypeScript's structural
+        // check on the generic RunSubscription type requires a concrete task
+        // type; we only need the shape below.
+        const sub = this._sdk.runs.subscribeToRunsWithTag(tag, undefined, {
+          signal: ac.signal,
+        }) as unknown as AsyncIterable<{
+          id: string;
+          status: string;
+          output?: unknown;
+          metadata?: Record<string, unknown>;
+          error?: { message: string; name?: string };
+        }>;
+        for await (const run of sub) {
+          if (ac.signal.aborted) break;
+          const obs: RunObservation = {
+            runId: run.id,
+            status: run.status as TriggerRunStatus,
+            observedAt: new Date().toISOString(),
+          };
+          if (run.output !== undefined) obs.output = run.output;
+          if (run.metadata !== undefined) obs.metadata = run.metadata;
+          if (run.error !== undefined) {
+            obs.error =
+              run.error.name !== undefined
+                ? { message: run.error.message, name: run.error.name }
+                : { message: run.error.message };
+          }
+          onObservation(obs);
+        }
+      } catch (err: unknown) {
+        if (!ac.signal.aborted) {
+          console.error(`[RealExecutionRuntime] subscribe: tag "${tag}" error, ending:`, err);
+          ac.abort();
+        }
+      }
+    });
+
+    try {
+      await Promise.all(tagPromises);
+    } finally {
+      input.signal.removeEventListener("abort", onSignalAbort);
+    }
+  }
 }

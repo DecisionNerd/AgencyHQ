@@ -28,7 +28,7 @@
 // violations, commit the remainder. No other policy lives in this file.
 import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
-
+import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
 import { scrubbedChildEnv } from "../lib/env.ts";
 import {
   changedPaths,
@@ -334,6 +334,17 @@ export const workerAttempt = task({
       denials = summary.denials;
       errors = summary.errors;
       textTail = summary.textTail;
+
+      // Classify provider capacity from error events and publish as metadata.
+      // metadata.set is a best-effort write; failure here must not abort the run.
+      const capacity = classifyCapacity(events, {
+        provider: providerFromModel(model),
+        model,
+        now: new Date(),
+      });
+      if (capacity !== null) {
+        metadata.set("capacity", capacity);
+      }
     } catch (error: unknown) {
       metadata.set("phase", "opencode_error");
       const message = error instanceof Error ? error.message : String(error);
