@@ -288,3 +288,167 @@ test("fake.ts source contains no @trigger.dev import statement", () => {
     `fake.ts must not import @trigger.dev packages, but found: ${triggerDevImports.join(", ")}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// subscribe() — FakeExecutionRuntime
+// ---------------------------------------------------------------------------
+
+test("subscribe() records call in calls log", async () => {
+  const fake = new FakeExecutionRuntime();
+  const ac = new AbortController();
+  ac.abort();
+  await fake.subscribe({ tags: ["attempt:1"], signal: ac.signal }, () => {});
+  assert.ok(fake.calls.some((c) => c.method === "subscribe"));
+});
+
+test("subscribe() resolves immediately when signal is already aborted", async () => {
+  const fake = new FakeExecutionRuntime();
+  const ac = new AbortController();
+  ac.abort();
+  await fake.subscribe({ tags: ["t:1"], signal: ac.signal }, () => {});
+});
+
+test("subscribe() resolves when signal is aborted after registration", async () => {
+  const fake = new FakeExecutionRuntime();
+  const ac = new AbortController();
+  const p = fake.subscribe({ tags: ["attempt:1"], signal: ac.signal }, () => {});
+  ac.abort();
+  await p;
+});
+
+test("subscribe() calls onObservation when a tagged run advances", async () => {
+  const fake = new FakeExecutionRuntime();
+  const observations: unknown[] = [];
+
+  const ac = new AbortController();
+  const subPromise = fake.subscribe({ tags: ["attempt:abc"], signal: ac.signal }, (obs) =>
+    observations.push(obs),
+  );
+
+  const { runId } = await fake.trigger({
+    intentId: "i1",
+    task: "worker.attempt",
+    payload: {},
+    options: { idempotencyKey: "k-sub-1", tags: ["attempt:abc"] },
+  });
+
+  fake.advance(runId); // QUEUED → EXECUTING
+  assert.equal(observations.length, 1);
+  assert.equal((observations[0] as { runId: string }).runId, runId);
+  assert.equal((observations[0] as { status: string }).status, "EXECUTING");
+
+  fake.advance(runId); // EXECUTING → (no more steps)
+  assert.equal(observations.length, 1);
+
+  ac.abort();
+  await subPromise;
+});
+
+test("subscribe() does NOT emit for runs whose tags do not match", async () => {
+  const fake = new FakeExecutionRuntime();
+  const observations: unknown[] = [];
+
+  const ac = new AbortController();
+  const subPromise = fake.subscribe({ tags: ["attempt:xyz"], signal: ac.signal }, (obs) =>
+    observations.push(obs),
+  );
+
+  const { runId } = await fake.trigger({
+    intentId: "i2",
+    task: "worker.attempt",
+    payload: {},
+    options: { idempotencyKey: "k-sub-2", tags: ["attempt:other"] },
+  });
+
+  fake.advance(runId);
+  assert.equal(observations.length, 0, "should not emit for non-matching tag");
+
+  ac.abort();
+  await subPromise;
+});
+
+test("subscribe() does NOT emit for runs with no tags", async () => {
+  const fake = new FakeExecutionRuntime();
+  const observations: unknown[] = [];
+
+  const ac = new AbortController();
+  const subPromise = fake.subscribe({ tags: ["attempt:1"], signal: ac.signal }, (obs) =>
+    observations.push(obs),
+  );
+
+  const { runId } = await fake.trigger({
+    intentId: "i3",
+    task: "worker.attempt",
+    payload: {},
+    options: { idempotencyKey: "k-sub-3" },
+  });
+
+  fake.advance(runId);
+  assert.equal(observations.length, 0, "should not emit for run with no tags");
+
+  ac.abort();
+  await subPromise;
+});
+
+test("subscribe() stops emitting after signal is aborted", async () => {
+  const fake = new FakeExecutionRuntime();
+  const observations: unknown[] = [];
+
+  const ac = new AbortController();
+  const subPromise = fake.subscribe({ tags: ["t:1"], signal: ac.signal }, (obs) =>
+    observations.push(obs),
+  );
+
+  const { runId } = await fake.trigger({
+    intentId: "i4",
+    task: "worker.attempt",
+    payload: {},
+    options: { idempotencyKey: "k-sub-4", tags: ["t:1"] },
+  });
+
+  fake.advance(runId); // QUEUED → EXECUTING
+  assert.equal(observations.length, 1);
+
+  ac.abort();
+  await subPromise;
+
+  // After abort, advance again — subscription is gone, no further emit
+  fake.advance(runId);
+  assert.equal(observations.length, 1, "should not emit after abort");
+});
+
+test("subscribe() supports multiple concurrent subscriptions on different tags", async () => {
+  const fake = new FakeExecutionRuntime();
+  const obsA: unknown[] = [];
+  const obsB: unknown[] = [];
+
+  const acA = new AbortController();
+  const acB = new AbortController();
+  const pA = fake.subscribe({ tags: ["tag:a"], signal: acA.signal }, (o) => obsA.push(o));
+  const pB = fake.subscribe({ tags: ["tag:b"], signal: acB.signal }, (o) => obsB.push(o));
+
+  const { runId: rA } = await fake.trigger({
+    intentId: "iA",
+    task: "t",
+    payload: {},
+    options: { idempotencyKey: "kA", tags: ["tag:a"] },
+  });
+  const { runId: rB } = await fake.trigger({
+    intentId: "iB",
+    task: "t",
+    payload: {},
+    options: { idempotencyKey: "kB", tags: ["tag:b"] },
+  });
+
+  fake.advance(rA);
+  fake.advance(rB);
+
+  assert.equal(obsA.length, 1);
+  assert.equal(obsB.length, 1);
+  assert.equal((obsA[0] as { runId: string }).runId, rA);
+  assert.equal((obsB[0] as { runId: string }).runId, rB);
+
+  acA.abort();
+  acB.abort();
+  await Promise.all([pA, pB]);
+});

@@ -97,6 +97,24 @@ export interface ExecutionRuntime {
 
   /** Create a short-lived public access token filtered to the given tags. */
   createPublicToken(input: { tags: string[]; expiresIn: string }): Promise<string>;
+
+  /**
+   * Subscribe to real-time run updates for runs carrying any of the given tags.
+   *
+   * This is a **wake-up hint** — the coordinator still polls as the authoritative
+   * path; subscribe just accelerates delivery of state changes.  The returned
+   * promise resolves when the signal is aborted or an error ends the subscription.
+   * On error the subscription ends silently; the caller falls back to polling.
+   *
+   * `onObservation` is called with the same `RunObservation` shape as `retrieve`.
+   *
+   * Optional: implementations that do not support real-time delivery may omit this
+   * method.  The coordinator checks for its presence before calling.
+   */
+  subscribe?(
+    input: { tags: string[]; signal: AbortSignal },
+    onObservation: (obs: RunObservation) => void,
+  ): Promise<void>;
 }
 
 export * from "./fake.ts";

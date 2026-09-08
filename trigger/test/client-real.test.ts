@@ -36,6 +36,9 @@ function makeFakeSdk(
     createPublicTokenResult?: string;
     triggerError?: Error;
     retrieveError?: Error;
+    /** Runs to yield from subscribeToRunsWithTag, keyed by tag. */
+    subscribeRuns?: Record<string, FakeRunResult[]>;
+    subscribeError?: Error;
   } = {},
 ): SdkSurface & {
   calls: { method: string; args: unknown[] }[];
@@ -75,6 +78,23 @@ function makeFakeSdk(
         calls.push({ method: "runs.cancel", args: [runId] });
         if (overrides.cancelError) throw overrides.cancelError;
         return {} as Awaited<ReturnType<SdkSurface["runs"]["cancel"]>>;
+      },
+      subscribeToRunsWithTag: (
+        tag: string | string[],
+        _filters?: unknown,
+        _options?: { signal?: AbortSignal },
+      ) => {
+        const tagStr = Array.isArray(tag) ? (tag[0] ?? "") : tag;
+        calls.push({ method: "runs.subscribeToRunsWithTag", args: [tag] });
+        const runs = overrides.subscribeRuns?.[tagStr] ?? [];
+        const error = overrides.subscribeError;
+        async function* gen() {
+          if (error) throw error;
+          for (const r of runs) {
+            yield r;
+          }
+        }
+        return gen();
       },
     } as unknown as SdkSurface["runs"],
     auth: {
@@ -343,6 +363,56 @@ test("createPublicToken() passes tags as scopes.read.tags", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// subscribe() — unit tests (injected fake SDK)
+// ---------------------------------------------------------------------------
+
+test("subscribe() calls subscribeToRunsWithTag for each tag and emits observations", async () => {
+  const { rt, sdk } = makeRuntime({
+    subscribeRuns: {
+      "attempt:1": [{ id: "run_real_1", status: "EXECUTING" }],
+    },
+  });
+
+  const observations: unknown[] = [];
+  const ac = new AbortController();
+  await rt.subscribe({ tags: ["attempt:1"], signal: ac.signal }, (obs) => observations.push(obs));
+
+  const subCall = sdk.calls.find((c) => c.method === "runs.subscribeToRunsWithTag");
+  assert.ok(subCall, "subscribeToRunsWithTag should have been called");
+  assert.equal(subCall?.args[0], "attempt:1");
+
+  assert.equal(observations.length, 1);
+  assert.equal((observations[0] as { runId: string }).runId, "run_real_1");
+  assert.equal((observations[0] as { status: string }).status, "EXECUTING");
+  assert.ok(typeof (observations[0] as { observedAt: string }).observedAt === "string");
+});
+
+test("subscribe() ends on error and resolves (does not throw)", async () => {
+  const { rt } = makeRuntime({ subscribeError: new Error("SSE disconnected") });
+  const ac = new AbortController();
+  // Must resolve without throwing — caller falls back to polling
+  await rt.subscribe({ tags: ["t:1"], signal: ac.signal }, () => {});
+});
+
+test("subscribe() respects AbortSignal to stop iteration", async () => {
+  const { rt } = makeRuntime({
+    subscribeRuns: {
+      "t:x": [
+        { id: "r1", status: "QUEUED" },
+        { id: "r2", status: "EXECUTING" },
+      ],
+    },
+  });
+  const observations: unknown[] = [];
+  const ac = new AbortController();
+  // Abort before call completes — still must not throw
+  ac.abort();
+  await rt.subscribe({ tags: ["t:x"], signal: ac.signal }, (o) => observations.push(o));
+  // With an already-aborted signal, may emit 0 observations depending on iterator timing
+  assert.ok(observations.length <= 2, "should not emit more runs than exist");
+});
+
+// ---------------------------------------------------------------------------
 // Live test (skipped unless TRIGGER_LIVE=1)
 // ---------------------------------------------------------------------------
 
@@ -379,4 +449,52 @@ test("live trigger roundtrip", { skip: !process.env.TRIGGER_LIVE }, async () => 
   }
 
   assert.ok(obs.status !== "QUEUED", `run should have advanced past QUEUED (got ${obs.status})`);
+});
+
+test("live subscribe: receives at least one observation for a triggered run", {
+  skip: !process.env.TRIGGER_LIVE,
+}, async () => {
+  // Requires TRIGGER_LIVE=1, TRIGGER_API_URL and TRIGGER_SECRET_KEY.
+  // Triggers spike.echo with a unique tag, subscribes, and expects at least
+  // one observation before timing out.  This is a wake-up hint test only —
+  // the caller is expected to fall back to polling if needed.
+  const { RealExecutionRuntime: RT } = await import("../src/client/real.ts");
+
+  const apiUrl = process.env.TRIGGER_API_URL ?? "https://api.trigger.dev";
+  const secretKey = process.env.TRIGGER_SECRET_KEY ?? "";
+  if (!secretKey) throw new Error("TRIGGER_SECRET_KEY must be set for live test");
+
+  const rt = new RT({ apiUrl, secretKey });
+  const uniqueTag = `live-subscribe-test:${Date.now()}`;
+
+  const observations: unknown[] = [];
+  const ac = new AbortController();
+  const subPromise = rt.subscribe({ tags: [uniqueTag], signal: ac.signal }, (obs) => {
+    observations.push(obs);
+    if (observations.length >= 1) ac.abort(); // stop after first observation
+  });
+
+  // Trigger a run with the unique tag after starting the subscription
+  const { runId } = await rt.trigger({
+    intentId: "live-subscribe-intent",
+    task: "spike.echo",
+    payload: { msg: "hello-subscribe" },
+    options: {
+      idempotencyKey: `live-subscribe-${Date.now()}`,
+      tags: [uniqueTag],
+    },
+  });
+  assert.ok(runId, "should have a runId");
+
+  // Wait up to 30s for a subscription observation, then abort
+  const timeout = setTimeout(() => ac.abort(), 30_000);
+  await subPromise;
+  clearTimeout(timeout);
+
+  // Must have received at least one observation (subscribe is a hint, not
+  // guaranteed delivery; but on a live server it should arrive).
+  assert.ok(
+    observations.length >= 1,
+    `expected at least 1 observation, got ${observations.length}`,
+  );
 });

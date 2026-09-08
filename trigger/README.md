@@ -160,13 +160,15 @@ The trial script is `scripts/trial.ts`; run one item at a time with
 
 ### `ExecutionRuntime` interface (`src/client/index.ts`)
 
-Defines the four operations every execution-runtime adapter must provide:
+Defines the five operations every execution-runtime adapter must provide:
 
 - `trigger(input)` — start a task run with a global-scope idempotency key,
   an optional concurrency key (serialises per repository), and tags.
 - `cancel(runId)` — cancel an in-flight run; resolves even if already final.
 - `retrieve(runId)` — fetch the current `RunObservation` for a run.
 - `createPublicToken(input)` — create a short-lived public access token.
+- `subscribe?(input, onObservation)` — **optional** real-time wake-up hint
+  (see below).
 
 `TriggerRunStatus` is the full 13-status v4 union.  `FINAL_RUN_STATUSES`
 lists the statuses a run never leaves.  `FAILURE_RUN_STATUSES` lists those
@@ -214,6 +216,75 @@ unit tests (so tests never need a live Trigger instance).
   `{ scopes: { read: { tags } }, expirationTime: expiresIn }`.
 - All SDK errors are wrapped in `RuntimeError { name, cause }` and re-thrown;
   no retries or error swallowing here.
+- `subscribe()` (R-008, R-010) — calls `runs.subscribeToRunsWithTag(tag)` for
+  each requested tag (SDK 4.5.16 async iterator); all per-tag subscriptions
+  run concurrently; on error the subscription ends and the promise resolves so
+  the caller falls back to polling.
+
+### Subscribe — wake-up hint semantics
+
+`subscribe?(input: { tags: string[]; signal: AbortSignal }, onObservation)`
+
+Callers use `subscribe` to receive real-time run-state notifications without
+polling.  **Polling via `retrieve` remains the authoritative path of record;
+`subscribe` is an acceleration hint only.**
+
+- The returned promise resolves when `signal` is aborted or an error ends the
+  subscription.
+- `onObservation` is called with the same `RunObservation` shape as `retrieve`,
+  including `runId`, `status`, `output`, `metadata`, `error`, and `observedAt`.
+- On error the subscription ends silently; no exception is propagated to the
+  caller.
+- The method is optional (`?`) — implementations that do not support real-time
+  delivery may omit it; the coordinator checks for its presence before calling.
+
+`FakeExecutionRuntime.subscribe` emits one observation per `advance()` call
+for runs whose tags intersect the subscriber's tag set, enabling coordinator
+tests to drive the subscribe path without a live Trigger.dev server.
+
+### Capacity metadata (`src/lib/capacity.ts`)
+
+`classifyCapacity(events, { provider, model, now })` scans an OpenCode event
+stream for error signals and returns a `CapacityClassification` or `null`.
+
+Classification rules (first match wins):
+
+| Signal | Status | `validUntil` |
+|---|---|---|
+| HTTP 401/403 · "invalid api key" · "insufficient credits" | `"down"` | +30 min |
+| HTTP 429 · "rate limit" · "quota" · "overloaded" | `"limited"` | +5 min |
+| HTTP 5xx · "unavailable" | `"limited"` | +2 min |
+| no match | *(null — returned)* | — |
+
+**Metadata key**: `"capacity"` on the Trigger run.
+
+**Shape**:
+
+```ts
+{
+  provider: string;        // e.g. "openai"
+  model: string;           // full "provider/model" string
+  status: "limited" | "down";
+  observedAt: string;      // ISO-8601
+  validUntil: string;      // ISO-8601; re-evaluate after this time
+  evidence: string;        // ≤200-char excerpt from the triggering event
+}
+```
+
+Tasks that run a model (`worker.attempt`, `lead.plan`, `lead.review`,
+`lead.accept`) call `classifyCapacity` after the model run and, when non-null,
+call `metadata.set("capacity", ...)`.
+
+- For `worker.attempt` the full NDJSON event list is passed directly.
+- For lead tasks (OpenCode SDK server mode, no NDJSON stream) a synthetic
+  `{ type: "error", error: { message: reason } }` event is constructed from
+  the `invalid_output.reason` string and classified the same way.
+
+`providerFromModel(model)` extracts the provider segment from a
+`"provider/model"` string (e.g. `"openai/gpt-4"` → `"openai"`).
+
+Neither `capacity.ts` nor any `*-core.ts` file imports the Trigger SDK
+(asserted by C5 in the packet and the architecture baseline tests).
 
 ## Worktree retention policy (`src/retention.ts`)
 
