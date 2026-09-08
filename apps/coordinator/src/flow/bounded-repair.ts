@@ -26,6 +26,7 @@ import type {
 } from "@agencyhq/contracts";
 import {
   AcceptanceProposalSchema,
+  manifestDigest as contractManifestDigest,
   criteriaDigestInput,
   digestOf,
   IntegrateMergePayloadSchema,
@@ -47,6 +48,7 @@ import {
   type createPool,
   insertIntegration,
   insertWorkItemProjects,
+  listWorkItemProjects,
 } from "@agencyhq/db";
 import {
   type AcceptanceFailureReason,
@@ -64,6 +66,8 @@ import {
   type FailureId,
   type FindingId,
   freezeContract,
+  type ManifestEntry,
+  nextEntry,
   type ProjectId,
   type ReviewId,
   type RunObservation,
@@ -468,22 +472,52 @@ export class BoundedRepairFlow {
       }
 
       const wiRow = await loadWorkItem(pool, workItemId);
-      const projectRow = await loadProject(pool, wiRow.project_id);
-      const baseRevision = await baseRevisionFromProject(projectRow);
+
+      // Check if this is a manifest work item: load work_item_projects rows.
+      const wipRows = await listWorkItemProjects(client, workItemId);
+      let targetProjectRow: ProjectRow;
+      let manifestForPayload: { entries: ManifestEntry[]; digest: string } | undefined;
+
+      if (wipRows.length > 0) {
+        // Manifest item: build entries and target the first unresolved entry.
+        const manifestEntries: ManifestEntry[] = wipRows.map((row) => ({
+          position: row.position,
+          projectId: row.project_id,
+          targetRef: row.target_ref,
+          expectedBaseRevision: row.expected_base_revision,
+          resultRevision: row.result_revision,
+        }));
+        const firstEntry = nextEntry(manifestEntries);
+        if (!firstEntry) {
+          // All entries already resolved — nothing to plan.
+          await completeCommand(client, commandId, { skipped: "all_resolved" });
+          return { intentId: "", runId: "" };
+        }
+        targetProjectRow = await loadProject(pool, firstEntry.projectId);
+        manifestForPayload = {
+          entries: manifestEntries,
+          digest: String(contractManifestDigest(manifestEntries)),
+        };
+      } else {
+        targetProjectRow = await loadProject(pool, wiRow.project_id);
+      }
+
+      const baseRevision = await baseRevisionFromProject(targetProjectRow);
 
       const payload = LeadPlanPayloadSchema.parse({
         workItemId: wiRow.id,
-        projectId: projectRow.id,
-        repoPath: projectRow.clone_path ?? config.worktreeBase,
+        projectId: targetProjectRow.id,
+        repoPath: targetProjectRow.clone_path ?? config.worktreeBase,
         baseRevision,
         worktreeBase: config.worktreeBase,
-        authority: projectRow.authority,
-        profileCatalog: Array.isArray(projectRow.profile_catalog)
-          ? (projectRow.profile_catalog as string[])
+        authority: targetProjectRow.authority,
+        profileCatalog: Array.isArray(targetProjectRow.profile_catalog)
+          ? (targetProjectRow.profile_catalog as string[])
           : [],
         ...(wiRow.defect ? { defect: wiRow.defect } : {}),
         operatorIntent: wiRow.intent,
         model: config.leadModel,
+        ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
       });
 
       const intentId = ids.next("di") as DispatchIntentId;
@@ -505,7 +539,7 @@ export class BoundedRepairFlow {
         payload,
         options: {
           idempotencyKey,
-          tags: [`project:${projectRow.id}`, `workItem:${wiRow.id}`],
+          tags: [`project:${targetProjectRow.id}`, `workItem:${wiRow.id}`],
         },
       });
 
@@ -551,7 +585,28 @@ export class BoundedRepairFlow {
       if (!workItemId) throw new Error(`Cannot recover workItemId from intent ${intentId}`);
 
       const wiRow = await loadWorkItem(pool, workItemId);
-      const projectRow = await loadProject(pool, wiRow.project_id);
+
+      // For manifest work items, use the next unresolved entry's project.
+      const wipRows = await listWorkItemProjects(client, workItemId);
+      let projectRow: ProjectRow;
+      let activeEntryTargetRef: string | null = null;
+      let manifestDigestValue: string | null = null;
+      if (wipRows.length > 0) {
+        const manifestEntries: ManifestEntry[] = wipRows.map((row) => ({
+          position: row.position,
+          projectId: row.project_id,
+          targetRef: row.target_ref,
+          expectedBaseRevision: row.expected_base_revision,
+          resultRevision: row.result_revision,
+        }));
+        const activeEntry = nextEntry(manifestEntries);
+        projectRow = await loadProject(pool, activeEntry?.projectId ?? wiRow.project_id);
+        activeEntryTargetRef = activeEntry?.targetRef ?? null;
+        manifestDigestValue = String(contractManifestDigest(manifestEntries));
+      } else {
+        projectRow = await loadProject(pool, wiRow.project_id);
+      }
+
       const at = new Date();
       const decisionId = ids.next("dec") as DecisionId;
 
@@ -721,9 +776,12 @@ export class BoundedRepairFlow {
 
       const workerPayloadDigest = digestOf(workerPayload);
 
-      // For merge boundary: freeze target_ref from project's allowed_refs.
+      // For merge boundary: freeze target_ref.
+      // Prefer target_ref from manifest (stored in work_item_projects); fall back to derived.
       const mergeTargetRef =
-        bounds.boundary === "merge" ? deriveTargetRef(projectRow.allowed_refs) : null;
+        bounds.boundary === "merge"
+          ? (activeEntryTargetRef ?? deriveTargetRef(projectRow.allowed_refs))
+          : null;
 
       // Commit Decision + StepContract + Attempt + DispatchIntent atomically (R-002)
       await client.query("BEGIN");
@@ -748,8 +806,8 @@ export class BoundedRepairFlow {
         `INSERT INTO step_contracts
            (id, work_item_id, project_id, version, base_revision, inputs, criteria,
             criteria_digest, profile_id, profile_digest, bounds, required_boundaries,
-            human_required, status, target_ref)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11::jsonb, $12::jsonb, $13, 'active', $14)`,
+            human_required, status, target_ref, manifest_digest)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11::jsonb, $12::jsonb, $13, 'active', $14, $15)`,
         [
           String(contractId),
           String(contract.workItemId),
@@ -765,11 +823,13 @@ export class BoundedRepairFlow {
           JSON.stringify(contract.requiredBoundaries),
           contract.humanRequired,
           mergeTargetRef,
+          manifestDigestValue,
         ],
       );
 
-      // For merge boundary: create work_item_projects row (implicit single-repo manifest).
-      if (bounds.boundary === "merge" && mergeTargetRef) {
+      // For merge boundary with no pre-existing manifest rows: create single-repo work_item_projects.
+      // When work_item_projects already exist (from create_work_item with manifest), skip insert.
+      if (bounds.boundary === "merge" && mergeTargetRef && wipRows.length === 0) {
         await insertWorkItemProjects(client, workItemId, [
           {
             project_id: String(contract.projectId),
@@ -1015,6 +1075,46 @@ export class BoundedRepairFlow {
         }
 
         const verifyIntentId = ids.next("di") as DispatchIntentId;
+
+        // For manifest work items: load siblings and build manifest ext fields.
+        const verifyWipRows = await listWorkItemProjects(client, contractRow.work_item_id);
+        let verifyManifestPayload: { entries: ManifestEntry[]; digest: string } | undefined;
+        let verifyManifestExt: {
+          manifestProjectId?: string;
+          manifestRepoPaths?: Record<string, string>;
+        } = {};
+        if (verifyWipRows.length > 0) {
+          const verifyManifestEntries: ManifestEntry[] = verifyWipRows.map((row) => ({
+            position: row.position,
+            projectId: row.project_id,
+            targetRef: row.target_ref,
+            expectedBaseRevision: row.expected_base_revision,
+            resultRevision: row.result_revision,
+          }));
+          verifyManifestPayload = {
+            entries: verifyManifestEntries,
+            digest: String(contractManifestDigest(verifyManifestEntries)),
+          };
+          // Build sibling project paths (all entries except the current project)
+          const siblingPaths: Record<string, string> = {};
+          for (const wip of verifyWipRows) {
+            if (wip.project_id !== contractRow.project_id) {
+              const { rows: sibRows } = await client.query<{ clone_path: string | null }>(
+                "SELECT clone_path FROM projects WHERE id = $1",
+                [wip.project_id],
+              );
+              const clonePath = sibRows[0]?.clone_path;
+              if (clonePath) {
+                siblingPaths[wip.project_id] = clonePath;
+              }
+            }
+          }
+          verifyManifestExt = {
+            manifestProjectId: contractRow.project_id,
+            manifestRepoPaths: siblingPaths,
+          };
+        }
+
         const verifyPayload = VerifyRunPayloadSchema.parse({
           attemptId: attemptRow.id,
           generation: attemptRow.generation,
@@ -1029,7 +1129,11 @@ export class BoundedRepairFlow {
           diffDigest,
           checks: resolvedProfile.checks,
           protectedPaths: resolvedProfile.protectedPaths, // F-6
+          ...(verifyManifestPayload ? { manifest: verifyManifestPayload } : {}),
         });
+
+        // Combine parsed payload with extension fields (manifest ext is not in the schema).
+        const verifyTriggerPayload = { ...verifyPayload, ...verifyManifestExt };
 
         await client.query(
           `INSERT INTO dispatch_intents
@@ -1055,7 +1159,7 @@ export class BoundedRepairFlow {
         const { runId: verifyRunId } = await runtime.trigger({
           intentId: verifyIntentId,
           task: TASK_IDS.verifyRun,
-          payload: verifyPayload,
+          payload: verifyTriggerPayload,
           options: {
             idempotencyKey: String(verifyIntentId),
             maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,

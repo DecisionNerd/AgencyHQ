@@ -103,6 +103,7 @@ const commands = commandHandlers({
   clock,
   config: {
     workerModel: config.workerModel,
+    worktreeBase: config.worktreeBase,
     uncertainAfterMs: config.uncertainAfterMs,
   },
 });

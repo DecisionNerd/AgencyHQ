@@ -4,29 +4,65 @@
  * Inserts a WorkItem with lifecycle "admitted" and condition "healthy".
  * Idempotent by commandId: replaying the same command returns the original
  * workItemId without inserting a duplicate.
+ *
+ * When `manifest` is supplied the boundary must be "merge". Each entry's
+ * expectedBaseRevision is resolved from the project's stored allowed_refs
+ * (`allowed_refs.main` SHA); positions follow array order.
  */
 
 import { randomUUID } from "node:crypto";
-import { claimCommand, completeCommand, insertDecision, insertWorkItem } from "@agencyhq/db";
+import {
+  claimCommand,
+  completeCommand,
+  insertDecision,
+  insertWorkItem,
+  insertWorkItemProjects,
+} from "@agencyhq/db";
 import type { CommandDeps } from "./stop.ts";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+export type ManifestEntryInput = {
+  projectId: string;
+  targetRef: string;
+};
+
 export type CreateWorkItemInput = {
   commandId: string;
   projectId: string;
   intent: string;
   defect?: string;
-  boundary: "artifact";
+  boundary: "artifact" | "merge";
   rank: number;
+  /** Optional revision manifest for multi-repository work items. */
+  manifest?: { entries: ManifestEntryInput[] };
 };
 
-export type CreateWorkItemResult = {
-  ok: true;
-  workItemId: string;
-};
+export type CreateWorkItemResult = { ok: true; workItemId: string } | { ok: false; reason: string };
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a base revision for a project from its stored `allowed_refs` object.
+ * Returns the SHA stored under the `main` key (or the first key if not present).
+ */
+function baseRevisionFromAllowedRefs(allowedRefs: unknown): string | null {
+  if (!allowedRefs || typeof allowedRefs !== "object") return null;
+  const refs = allowedRefs as Record<string, unknown>;
+  // Prefer "main" then any ref
+  const keys = Object.keys(refs);
+  for (const key of ["main", ...keys]) {
+    const v = refs[key];
+    if (typeof v === "string" && /^[0-9a-f]{40}$/.test(v)) {
+      return v;
+    }
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // createWorkItem
@@ -45,6 +81,45 @@ export async function createWorkItem(
       return claim.result as CreateWorkItemResult;
     }
 
+    // Validate manifest constraints before beginning the transaction
+    if (input.manifest) {
+      if (boundary !== "merge") {
+        const result: CreateWorkItemResult = {
+          ok: false,
+          reason: "boundary must be 'merge' when manifest is provided",
+        };
+        await completeCommand(client, commandId, result);
+        return result;
+      }
+
+      // Validate each manifest entry: project must exist and targetRef must be in allowed_refs
+      for (const entry of input.manifest.entries) {
+        const { rows } = await client.query("SELECT id, allowed_refs FROM projects WHERE id = $1", [
+          entry.projectId,
+        ]);
+        const projectRow = rows[0] as { id: string; allowed_refs: unknown } | undefined;
+        if (!projectRow) {
+          const result: CreateWorkItemResult = {
+            ok: false,
+            reason: `Project ${entry.projectId} not found`,
+          };
+          await completeCommand(client, commandId, result);
+          return result;
+        }
+        // Check targetRef is in allowed_refs
+        const allowedRefs = projectRow.allowed_refs as Record<string, unknown> | undefined;
+        const allowedKeys = allowedRefs ? Object.keys(allowedRefs) : [];
+        if (!allowedKeys.includes(entry.targetRef)) {
+          const result: CreateWorkItemResult = {
+            ok: false,
+            reason: `targetRef '${entry.targetRef}' is not in allowed_refs for project ${entry.projectId}`,
+          };
+          await completeCommand(client, commandId, result);
+          return result;
+        }
+      }
+    }
+
     await client.query("BEGIN");
     let workItemId: string;
     try {
@@ -56,12 +131,43 @@ export async function createWorkItem(
         rank,
         intent,
         defect: input.defect ?? null,
-        boundary,
+        boundary: boundary as "artifact" | "merge" | "deploy",
         lifecycle: "admitted",
         condition: "healthy",
         main_effort: false,
         version: 1,
       });
+
+      // Insert manifest entries if provided
+      if (input.manifest && input.manifest.entries.length > 0) {
+        const entries: import("@agencyhq/db").WorkItemProjectEntry[] = [];
+        for (let i = 0; i < input.manifest.entries.length; i++) {
+          // biome-ignore lint/style/noNonNullAssertion: loop index always in bounds
+          const entry = input.manifest.entries[i]!;
+          // Load project to get allowed_refs for base revision
+          const { rows } = await client.query(
+            "SELECT id, allowed_refs FROM projects WHERE id = $1",
+            [entry.projectId],
+          );
+          const projectRow = rows[0] as { id: string; allowed_refs: unknown } | undefined;
+          if (!projectRow) {
+            throw new Error(`Project ${entry.projectId} not found during manifest insert`);
+          }
+          const expectedBaseRevision = baseRevisionFromAllowedRefs(projectRow.allowed_refs);
+          if (!expectedBaseRevision) {
+            throw new Error(
+              `Project ${entry.projectId} has no valid base revision in allowed_refs`,
+            );
+          }
+          entries.push({
+            project_id: entry.projectId,
+            position: i,
+            target_ref: entry.targetRef,
+            expected_base_revision: expectedBaseRevision,
+          });
+        }
+        await insertWorkItemProjects(client, workItemId, entries);
+      }
 
       // Record a decision capturing the create action
       await insertDecision(client, {
