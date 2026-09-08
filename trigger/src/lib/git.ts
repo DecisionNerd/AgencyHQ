@@ -148,6 +148,28 @@ export async function diffDigest(args: { worktreePath: string; baseRev: string }
 }
 
 // ---------------------------------------------------------------------------
+// Credential scrubbing and push-failure classification
+// ---------------------------------------------------------------------------
+
+/** Remove embedded credentials from a git error string before storing it in evidence. */
+export function scrubCredentials(s: string): string {
+  return s
+    .replace(/https?:\/\/[^:@\s/]+:[^@\s/]+@/gi, "https://[REDACTED]@")
+    .replace(/(Authorization:\s*)[^\r\n]+/gi, "$1[REDACTED]");
+}
+
+type PushFailureKind = "lease_broken" | "auth" | "network" | "other";
+
+function classifyPushStderr(stderr: string): PushFailureKind {
+  if (/stale info/i.test(stderr)) return "lease_broken";
+  if (/Authentication failed|could not read Username|Permission to .* denied|\b403\b/i.test(stderr))
+    return "auth";
+  if (/Could not resolve host|Connection refused|timed out|unable to access/i.test(stderr))
+    return "network";
+  return "other";
+}
+
+// ---------------------------------------------------------------------------
 // integrate.merge helpers — additive, no Trigger SDK usage.
 // Every function sets GIT_TERMINAL_PROMPT=0 on network-facing calls so the
 // git process never blocks waiting for credentials.
@@ -250,10 +272,22 @@ export async function mergeInWorktree(args: {
   }
 }
 
+/** Structured result for pushForceWithLease. */
+export type PushResult =
+  | { ok: true }
+  | { ok: false; kind: "lease_broken" | "auth" | "network" | "other"; stderr: string };
+
 /**
  * Push sha to refs/heads/targetRef on remote using --force-with-lease
- * guarded by expectedBaseSha.  Returns { ok: true } on success, { ok: false }
- * when git exits non-zero (lease broken, network error, etc.).
+ * guarded by expectedBaseSha.
+ *
+ * Returns { ok: true } on success.
+ * Returns { ok: false, kind, stderr } on any non-zero git exit — never throws.
+ * The kind classifies the failure: lease_broken (stale lease), auth (credential
+ * error), network (host unreachable / timeout), or other.
+ * stderr is the first 500 characters of git's stderr with credentials scrubbed.
+ *
+ * Setup errors (e.g. missing repoPath) still throw.
  */
 export async function pushForceWithLease(args: {
   repoPath: string;
@@ -262,7 +296,7 @@ export async function pushForceWithLease(args: {
   targetRef: string;
   expectedBaseSha: string;
   env?: NodeJS.ProcessEnv;
-}): Promise<{ ok: boolean }> {
+}): Promise<PushResult> {
   const env: NodeJS.ProcessEnv = { ...(args.env ?? process.env), GIT_TERMINAL_PROMPT: "0" };
   try {
     await git(
@@ -275,8 +309,12 @@ export async function pushForceWithLease(args: {
       { cwd: args.repoPath, env },
     );
     return { ok: true };
-  } catch {
-    return { ok: false };
+  } catch (err: unknown) {
+    const execError = err as { stderr?: string };
+    const rawStderr = execError.stderr ?? "";
+    const kind = classifyPushStderr(rawStderr);
+    const stderr = scrubCredentials(rawStderr).slice(0, 500);
+    return { ok: false, kind, stderr };
   }
 }
 

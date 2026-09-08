@@ -6,6 +6,7 @@
 // injected dependencies. Deps are injected so the logic can be unit-tested
 // without a live Trigger instance or real git remote.
 
+import { scrubCredentials } from "../lib/git.ts";
 import type { IntegrateMergeOutput, IntegrateMergePayload } from "../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -40,7 +41,8 @@ export type IntegrateMergeDeps = {
   }): Promise<{ ok: boolean; mergeSha?: string; conflictingPaths?: string[] }>;
   /**
    * Push sha to refs/heads/targetRef on remote with --force-with-lease
-   * guarded by expectedBaseSha.  Returns { ok: false } on any non-zero exit.
+   * guarded by expectedBaseSha.  Never throws on non-zero git exit; returns
+   * a structured failure with kind and scrubbed stderr instead.
    */
   pushForceWithLease(args: {
     repoPath: string;
@@ -48,7 +50,10 @@ export type IntegrateMergeDeps = {
     sha: string;
     targetRef: string;
     expectedBaseSha: string;
-  }): Promise<{ ok: boolean }>;
+  }): Promise<
+    | { ok: true }
+    | { ok: false; kind: "lease_broken" | "auth" | "network" | "other"; stderr: string }
+  >;
 };
 
 // ---------------------------------------------------------------------------
@@ -102,7 +107,12 @@ export async function runIntegrateMerge(
       `git fetch ${payload.remote} ${payload.targetRef}: exit 0, observed=${observedTargetRevision}`,
     );
   } catch (err) {
-    evidence.push(`git fetch ${payload.remote} ${payload.targetRef}: error`);
+    const execError = err as { code?: number | string; stderr?: string };
+    const code = execError.code ?? "?";
+    const stderr = scrubCredentials(execError.stderr ?? "").slice(0, 500);
+    evidence.push(
+      `git fetch ${payload.remote} ${payload.targetRef}: exit ${code}, stderr: ${stderr}`,
+    );
     throw err;
   }
 
@@ -179,14 +189,26 @@ export async function runIntegrateMerge(
 
     // Step 7 — push rejected; re-read the remote.
     if (!pushResult.ok) {
-      evidence.push(`git push --force-with-lease ${payload.remote} ${payload.targetRef}: rejected`);
-      const newObserved = await deps.lsRemote({
-        repoPath: payload.repoPath,
-        remote: payload.remote,
-        ref: payload.targetRef,
-      });
-      if (newObserved !== null) {
-        evidence.push(`git ls-remote ${payload.remote} ${payload.targetRef}: ${newObserved}`);
+      evidence.push(
+        `git push --force-with-lease ${payload.remote} ${payload.targetRef}: rejected (${pushResult.kind}) — ${pushResult.stderr}`,
+      );
+      let newObserved: string | null = null;
+      try {
+        newObserved = await deps.lsRemote({
+          repoPath: payload.repoPath,
+          remote: payload.remote,
+          ref: payload.targetRef,
+        });
+        if (newObserved !== null) {
+          evidence.push(`git ls-remote ${payload.remote} ${payload.targetRef}: ${newObserved}`);
+        }
+      } catch (lsErr) {
+        const execError = lsErr as { code?: number | string; stderr?: string };
+        const code = execError.code ?? "?";
+        const stderr = scrubCredentials(execError.stderr ?? "").slice(0, 500);
+        evidence.push(
+          `git ls-remote ${payload.remote} ${payload.targetRef}: exit ${code}, stderr: ${stderr}`,
+        );
       }
       return {
         outcome: "push_rejected",

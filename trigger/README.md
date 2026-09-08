@@ -437,7 +437,7 @@ commit locally only (ARCHITECTURE.md lines 85-110).
 | `already_integrated` | `attemptRevision` is already an ancestor of the remote ref. |
 | `base_moved` | Remote ref advanced past `expectedBaseRevision` before this run; nothing pushed. |
 | `conflict` | Merge produced content conflicts; `conflictingPaths` lists the affected files; nothing pushed. |
-| `push_rejected` | Force-with-lease failed (race); `observedTargetRevision` holds the current remote SHA. |
+| `push_rejected` | Force-with-lease rejected; evidence records the classified failure kind (`lease_broken`, `auth`, `network`, or `other`) and a scrubbed stderr excerpt; `observedTargetRevision` holds the current remote SHA re-read after rejection. |
 
 ### Pure core (`src/tasks/integrate-merge-core.ts`)
 
@@ -449,12 +449,18 @@ no direct child_process or fs calls:
 - `resolveMergeWorktreePath(runDir)`: `<runDir>/merge-wt`.
 - `runIntegrateMerge(payload, deps, runDir)`: implements the full algorithm; always
   removes the merge worktree in `finally`; builds an `evidence` array of git commands
-  run with their exit codes (no secrets).
+  run with their exit codes and, on failures, scrubbed stderr excerpts (first 500 chars,
+  credentials redacted).
 
 ### Git helpers (`src/lib/git.ts` — additive)
 
 `fetchRef`, `lsRemote`, `isAncestor`, `mergeInWorktree`, `pushForceWithLease` — all
 set `GIT_TERMINAL_PROMPT=0` on network-facing calls; never prompt for credentials.
+`pushForceWithLease` returns `{ ok: true }` on success or `{ ok: false, kind, stderr }`
+on failure (never throws for a non-zero exit); `kind` is one of `lease_broken`, `auth`,
+`network`, or `other`, classified from git's stderr; `stderr` is the first 500 characters
+with credentials scrubbed via `scrubCredentials`. `scrubCredentials` redacts
+`https://user:token@` patterns and `Authorization:` header values.
 
 ### Invariants
 
@@ -466,7 +472,7 @@ set `GIT_TERMINAL_PROMPT=0` on network-facing calls; never prompt for credential
 
 ### Tests (`test/integrate-merge-core.test.ts`, `test/push-boundary.test.ts`)
 
-Seven tests per the packet spec:
+Tests per the packet spec:
 1. `merge_commit` happy path → `integrated`; remote advanced; merge commit has two parents.
 2. `fast_forward` happy path → `integrated`; remote advanced to attempt SHA directly.
 3. Base moved (concurrent push before run) → `base_moved`; nothing pushed.
@@ -476,6 +482,11 @@ Seven tests per the packet spec:
    `observedTargetRevision` equals the new remote SHA.
 7. Grep assertion: no file in `trigger/src` except `integrate-merge*` and `lib/git.ts`
    (and the known `lib/env.ts` dry-run check) contains `"push"`.
+
+`test/git.test.ts` additionally tests `pushForceWithLease` structured failures:
+stale lease → `kind=lease_broken`; unresolvable host → `kind=network` with stderr
+excerpt; `scrubCredentials` removes `https://user:token@` credentials and
+`Authorization:` header values.
 
 ### Tasks connected to the coordinator
 

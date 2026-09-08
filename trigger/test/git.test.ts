@@ -10,7 +10,9 @@ import {
   changedPaths,
   commitTree,
   diffDigest,
+  pushForceWithLease,
   revertPaths,
+  scrubCredentials,
   updateRef,
   worktreeAdd,
   worktreeRemove,
@@ -150,4 +152,126 @@ test("revertPaths restores tracked files and deletes untracked ones", async () =
     await rm(repoPath, { recursive: true, force: true });
     await rm(worktreePath, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// pushForceWithLease structured failure tests (S4-fix-push-evidence)
+// ---------------------------------------------------------------------------
+
+test("pushForceWithLease: returns kind=lease_broken when remote has advanced", async () => {
+  const remotePath = await mkdtemp(join(tmpdir(), "agencyhq-push-remote-"));
+  const initPath = await mkdtemp(join(tmpdir(), "agencyhq-push-init-"));
+  let repoPath: string | undefined;
+  let clone2: string | undefined;
+  try {
+    await git(["init", "--bare", "--initial-branch=main"], remotePath);
+    await git(["init", "--initial-branch=main"], initPath);
+    await writeFile(join(initPath, "README.md"), "base\n");
+    await git(["add", "-A"], initPath);
+    await git(["-c", "user.name=t", "-c", "user.email=t@t.com", "commit", "-m", "base"], initPath);
+    await git(["remote", "add", "origin", remotePath], initPath);
+    await git(["push", "origin", "main"], initPath);
+    const baseRev = (await git(["rev-parse", "HEAD"], initPath)).trim();
+
+    // Clone as coordinator repo.
+    repoPath = join(
+      tmpdir(),
+      `agencyhq-push-repo-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    await execFileAsync("git", ["clone", remotePath, repoPath], { cwd: tmpdir() });
+
+    // Make a new commit to attempt to push.
+    await writeFile(join(repoPath, "new.txt"), "new\n");
+    await git(["add", "-A"], repoPath);
+    await git(["-c", "user.name=t", "-c", "user.email=t@t.com", "commit", "-m", "new"], repoPath);
+    const newSha = (await git(["rev-parse", "HEAD"], repoPath)).trim();
+
+    // Advance the remote via a second clone (breaks the lease).
+    clone2 = join(
+      tmpdir(),
+      `agencyhq-push-clone2-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    await execFileAsync("git", ["clone", remotePath, clone2], { cwd: tmpdir() });
+    await writeFile(join(clone2, "racing.txt"), "race\n");
+    await git(["add", "-A"], clone2);
+    await git(["-c", "user.name=t", "-c", "user.email=t@t.com", "commit", "-m", "race"], clone2);
+    await git(["push", "origin", "main"], clone2);
+
+    const result = await pushForceWithLease({
+      repoPath,
+      remote: "origin",
+      sha: newSha,
+      targetRef: "main",
+      expectedBaseSha: baseRev, // now stale
+    });
+
+    assert.equal(result.ok, false, "push must fail");
+    if (!result.ok) {
+      assert.equal(
+        result.kind,
+        "lease_broken",
+        `expected lease_broken, got ${result.kind}: ${result.stderr}`,
+      );
+      assert.ok(typeof result.stderr === "string", "stderr must be a string");
+    }
+  } finally {
+    await rm(remotePath, { recursive: true, force: true }).catch(() => undefined);
+    await rm(initPath, { recursive: true, force: true }).catch(() => undefined);
+    if (repoPath) await rm(repoPath, { recursive: true, force: true }).catch(() => undefined);
+    if (clone2) await rm(clone2, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+test("pushForceWithLease: returns kind=network for unreachable remote host", {
+  timeout: 30000,
+}, async () => {
+  const repoPath = await mkdtemp(join(tmpdir(), "agencyhq-push-net-"));
+  try {
+    await git(["init", "--initial-branch=main"], repoPath);
+    await writeFile(join(repoPath, "README.md"), "base\n");
+    await git(["add", "-A"], repoPath);
+    await git(["-c", "user.name=t", "-c", "user.email=t@t.com", "commit", "-m", "base"], repoPath);
+    const sha = (await git(["rev-parse", "HEAD"], repoPath)).trim();
+
+    const result = await pushForceWithLease({
+      repoPath,
+      remote: "https://nonexistent.invalid/x.git",
+      sha,
+      targetRef: "main",
+      expectedBaseSha: sha,
+    });
+
+    assert.equal(result.ok, false, "push to unreachable host must fail");
+    if (!result.ok) {
+      assert.equal(
+        result.kind,
+        "network",
+        `expected network, got ${result.kind}: ${result.stderr}`,
+      );
+      assert.ok(result.stderr.length > 0, "stderr must be non-empty");
+    }
+  } finally {
+    await rm(repoPath, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+test("scrubCredentials removes https://user:token@ credentials from stderr", () => {
+  const raw =
+    "fatal: unable to access 'https://myuser:supersecret@github.com/org/repo.git/': " +
+    "The requested URL returned error: 403";
+  const scrubbed = scrubCredentials(raw);
+  assert.ok(!scrubbed.includes("supersecret"), "scrubbed output must not contain the token");
+  assert.ok(!scrubbed.includes("myuser:"), "scrubbed output must not contain user:token pattern");
+  assert.ok(scrubbed.includes("[REDACTED]"), "scrubbed output must include [REDACTED]");
+  assert.ok(scrubbed.includes("github.com"), "scrubbed output must preserve the host");
+});
+
+test("scrubCredentials removes Authorization header values", () => {
+  const raw = "Authorization: Bearer ghp_supersecrettoken123\nfatal: auth failed";
+  const scrubbed = scrubCredentials(raw);
+  assert.ok(
+    !scrubbed.includes("ghp_supersecrettoken123"),
+    "scrubbed output must not contain the token",
+  );
+  assert.ok(scrubbed.includes("[REDACTED]"), "scrubbed output must include [REDACTED]");
 });
