@@ -110,7 +110,7 @@ Match Findings by subject and cause before creating another.
 
 | Change | Transition |
 | --- | --- |
-| Output needs correction; contract valid | New Attempt under the same contract once the prior run is final. |
+| Output needs correction; contract valid | New Attempt under the same contract once the prior run is final. A Failure record for the superseded attempt is committed in the same transaction before the new attempt is inserted. |
 | Inputs, scope, or criteria change | Supersede the StepContract; new version, new Attempt; prior Attempt's generation revoked. |
 | Evidence may carry forward | Link prior Artifacts with provenance. Reuse a VerificationResult only when criteria, profile, inputs, and revision match exactly; otherwise rerun. |
 

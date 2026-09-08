@@ -31,6 +31,14 @@ Migration `migrations/0001_ledger.sql` creates the following tables in the `agen
 | `commands` | Idempotency table for operator commands keyed by `command_id`. |
 | `run_observations` | Trigger run events deduped by `(run_id, generation)` primary key. |
 
+Migration `migrations/0002_ledger_not_null.sql` adds `NOT NULL` constraints
+to columns that every coordinator insert site already supplies:
+`findings.{severity, kind, description}`, `decisions.{kind, actor}`,
+`failures.{class, phase, cause}`, `reviews.{reviewer_model, profile}`, and
+`commands.kind`. Each `ALTER TABLE` statement is guarded by an
+`information_schema` check so the migration is idempotent. Migrations are
+append-only; applied files are never modified.
+
 Row schemas with inferred TypeScript types live in `src/rows.ts`. `mapRow` helpers parse jsonb columns (`authority`, `bounds`, `criteria`, `record`) through their contracts Zod schemas.
 
 ## Fencing and idempotency

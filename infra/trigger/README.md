@@ -36,6 +36,11 @@ All host ports above are bound to `127.0.0.1` (or `${WEBAPP_PUBLISH_IP}` for
 the webapp) by the defaults in `.env.example`, so nothing here is reachable
 off the host.
 
+The AgencyHQ coordinator API (default port 8787, bound to
+`AGENCYHQ_BIND_HOST` which defaults to `127.0.0.1`) runs on the same host
+and has no authentication; it must not be exposed beyond the host. Bearer
+auth for the coordinator API is planned but not yet implemented.
+
 ## Operator procedure
 
 Run these from the repository root.
