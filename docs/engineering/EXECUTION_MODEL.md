@@ -62,12 +62,8 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    `contractVersion`, `attemptRevision`) writes an `approvals` row and
    re-runs acceptance via `evaluateAcceptanceForAttempt`; the command is
    idempotent by `commandId`. `APPROVAL_VERSION_MISMATCH` leaves the item
-   `pending_human`. `lead.plan` runs are tagged `project:<id>` and
-   `workItem:<id>` (tested by `flow.options: lead.plan trigger includes
-   project: and workItem: tags` in
-   `apps/coordinator/test/integration/flow.options.test.ts`); realtime
-   subscription by tag is the observation mechanism. Covered by `flow.parking
-   (b)` (`apps/coordinator/test/integration/flow.parking.test.ts`) and
+   `pending_human`. Covered by `flow.parking (b)`
+   (`apps/coordinator/test/integration/flow.parking.test.ts`) and
    `apps/coordinator/test/integration/approve.test.ts`.
 9. **Integrate** (merge or deploy boundaries only). `integrate.merge` runs with
    an operation-scoped credential, serialized per repository, idempotent by
