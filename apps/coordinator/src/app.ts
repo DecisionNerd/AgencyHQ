@@ -570,6 +570,32 @@ export function createApp(deps: AppDeps): Hono {
         }
       }
 
+      // Load integration events and work_item_projects so that the Integration
+      // card and manifest progress are populated (mirrors defaultLoadSnapshot).
+      const integrations: import("./views/return-view.ts").IntegrationLike[] = [];
+      const workItemProjects: import("./views/return-view.ts").WorkItemProjectLike[] = [];
+      for (const a of attempts) {
+        const attemptIntegrations = await listIntegrationsByAttempt(pgClient, a.id);
+        for (const integ of attemptIntegrations) {
+          integrations.push({
+            id: integ.id,
+            attemptId: a.id,
+            targetRef: integ.target_ref,
+            outcome: integ.outcome ?? null,
+            resultingRevision: integ.resulting_revision ?? null,
+            at: integ.at instanceof Date ? integ.at.toISOString() : String(integ.at),
+          });
+        }
+      }
+      const wipRows = await listWorkItemProjects(pgClient, id);
+      for (const wip of wipRows) {
+        workItemProjects.push({
+          workItemId: id,
+          position: wip.position,
+          resultRevision: wip.result_revision ?? null,
+        });
+      }
+
       const input: ReturnViewInput = {
         now: new Date().toISOString(),
         lastAckAt: null,
@@ -582,6 +608,8 @@ export function createApp(deps: AppDeps): Hono {
         results,
         reviews,
         findings,
+        integrations,
+        workItemProjects,
       };
 
       const view = buildReturnView(input);

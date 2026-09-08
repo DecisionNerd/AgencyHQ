@@ -34,8 +34,10 @@ import {
   buildRejectBody,
   buildResumeBody,
   buildStopBody,
+  conditionIcon,
   formatAuthorityErrors,
   formatTimestamp,
+  lifecycleIcon,
   parseRoute,
 } from "./control-plane-helpers.js";
 import { ExecutionState } from "./ExecutionState.js";
@@ -1092,6 +1094,11 @@ function WorkItemPage({
               {item.workItemId}
             </h2>
             <p data-testid="work-item-intent">{item.intent}</p>
+            <p data-testid="work-item-lifecycle">
+              <span aria-hidden="true">{lifecycleIcon(item.lifecycle)}</span> {item.lifecycle}
+              {" · "}
+              <span aria-hidden="true">{conditionIcon(item.condition)}</span> {item.condition}
+            </p>
             <div className="state-cards">
               <StateCard dim="Contract" state={item.contract} />
               <StateCard dim="Execution" state={item.execution} />

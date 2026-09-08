@@ -14,7 +14,7 @@
  */
 
 import { expect, test } from "@playwright/test";
-import { injectToken } from "./helpers.ts";
+import { injectToken, seedIds } from "./helpers.ts";
 
 test.beforeEach(async ({ page }) => {
   await injectToken(page);
@@ -139,4 +139,28 @@ test("work item page: merge-boundary item has stop action available", async ({ p
   await expect(page.getByTestId("work-item-detail")).toBeVisible({ timeout: 10_000 });
   // Merge-boundary running item shows the evidence panel
   await expect(page.getByTestId("evidence-panel")).toBeVisible();
+});
+
+test("work item page: merge-boundary item shows integration state and lifecycle", async ({
+  page,
+}) => {
+  await injectToken(page);
+
+  // Navigate directly to the seeded wiMerge item using its known ID
+  const { wiMerge } = seedIds();
+  await page.goto(`/#/work-items/${encodeURIComponent(wiMerge)}`);
+  await expect(page.getByTestId("work-item-detail")).toBeVisible({ timeout: 10_000 });
+
+  // Lifecycle text must be visible (R-011: lifecycle and condition shown)
+  const lifecycleEl = page.getByTestId("work-item-lifecycle");
+  await expect(lifecycleEl).toBeVisible({ timeout: 5_000 });
+  // Seed sets lifecycle: "running", condition: "nominal"
+  await expect(lifecycleEl).toContainText("running");
+
+  // Integration card must show a non-pending state (seeded integration has outcome=integrated)
+  // The Integration card label should be "Integrated", not "Pending integration"
+  const integrationCard = page.locator(".state-card").filter({ hasText: "Integration" });
+  await expect(integrationCard).toBeVisible({ timeout: 5_000 });
+  await expect(integrationCard).not.toContainText("Pending integration");
+  await expect(integrationCard).toContainText("Integrated");
 });

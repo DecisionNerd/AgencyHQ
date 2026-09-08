@@ -131,6 +131,10 @@ export type ManifestView = {
 export type Item = {
   workItemId: string;
   intent: string;
+  /** Lifecycle phase of the work item (e.g. "proposed", "active", "completed"). */
+  lifecycle: string;
+  /** Readiness condition of the work item (e.g. "nominal", "blocked"). */
+  condition: string;
   contract: State;
   execution: State;
   verification: State;
@@ -534,6 +538,8 @@ export function buildReturnView(input: ReturnViewInput): ReturnView {
     const item: Item = {
       workItemId: wi.id,
       intent: wi.intent,
+      lifecycle: wi.lifecycle,
+      condition: wi.condition,
       contract: contractState,
       execution: executionState,
       verification: verificationState,

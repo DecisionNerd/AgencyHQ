@@ -115,6 +115,8 @@ function makeItem(
   return {
     workItemId: id,
     intent: `intent for ${id}`,
+    lifecycle: "active",
+    condition: "healthy",
     contract: s,
     execution: s,
     verification: s,

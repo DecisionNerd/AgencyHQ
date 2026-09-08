@@ -573,7 +573,8 @@ async function runSeed(dbUrl: string): Promise<void> {
       changed_paths: ["src/flags/index.ts"],
     });
 
-    // Integration event (pending — no outcome yet)
+    // Integration event (integrated — outcome present)
+    const integResultRevision = "aaaa1111bbbb2222cccc3333dddd4444eeee5555";
     await insertIntegration(client, {
       id: mkId("int"),
       attempt_id: attMergeId,
@@ -581,8 +582,8 @@ async function runSeed(dbUrl: string): Promise<void> {
       contract_version: 1,
       target_ref: "main",
       expected_base_revision: BASE_REVISION,
-      resulting_revision: null,
-      outcome: null,
+      resulting_revision: integResultRevision,
+      outcome: "integrated",
     });
 
     // Integration conflict finding
