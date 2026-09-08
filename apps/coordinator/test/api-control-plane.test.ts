@@ -399,7 +399,7 @@ describe("POST /api/commands kind=reject — field validation", () => {
     assert.equal(res.status, 400);
   });
 
-  it("returns 200 when all required fields are present", async () => {
+  it("returns 400 when reason is missing (T-5: reason_required)", async () => {
     const app = createApp({
       pool: makeFakePool(),
       flow: makeFakeFlow(),
@@ -419,12 +419,70 @@ describe("POST /api/commands kind=reject — field validation", () => {
         kind: "reject",
         workItemId: "wi-1",
         decisionId: "dec-1",
+        // reason intentionally omitted
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { ok: boolean; reason: string };
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, "reason_required");
+  });
+
+  it("returns 400 when reason is empty string (T-5: reason_required)", async () => {
+    const app = createApp({
+      pool: makeFakePool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeControlPlaneCommands(),
+    });
+
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-1",
+        kind: "reject",
+        workItemId: "wi-1",
+        decisionId: "dec-1",
+        reason: "",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { ok: boolean; reason: string };
+    assert.equal(body.ok, false);
+    assert.equal(body.reason, "reason_required");
+  });
+
+  it("returns 200 when all required fields are present (including reason)", async () => {
+    const app = createApp({
+      pool: makeFakePool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeControlPlaneCommands(),
+    });
+
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-1",
+        kind: "reject",
+        workItemId: "wi-1",
+        decisionId: "dec-1",
+        reason: "Not acceptable quality",
       }),
     });
     assert.equal(res.status, 200);
     const body = (await res.json()) as { result: { ok: boolean; decisionId: string } };
     assert.equal(body.result.ok, true);
-    assert.equal(body.result.decisionId, "dec-1");
   });
 });
 

@@ -3,19 +3,24 @@
  *
  * Sequence:
  *  1. Claim the command slot (idempotency).
- *  2. Validate authority with proposeAuthorityUpdate (domain).
- *  3. Load current project; version must increase.
- *  4. In a transaction:
- *     a. Update projects.authority and projects.authority_version.
- *     b. Append to authority_versions via insertAuthorityVersion (db).
- *     c. Insert a decision row of kind "authority_update".
- *  5. completeCommand.
+ *  2. BEGIN a transaction.
+ *  3. SELECT ... FOR UPDATE the project row (prevents lost updates — T-9).
+ *  4. Validate authority with proposeAuthorityUpdate (domain).
+ *  5. UPDATE projects ... WHERE authority_version = $current (CAS).
+ *     A concurrent update from the same base gets stale_version.
+ *  6. If authority_versions is empty, write the initial (pre-update) version
+ *     as history before appending the new version (T-13 backfill).
+ *  7. Append to authority_versions via insertAuthorityVersion (db).
+ *  8. Insert a decision row of kind "authority_update".
+ *  9. COMMIT.
+ * 10. completeCommand.
  *
  * INVARIANTS:
  *  - AuthoritySchema validation required (contracts package).
  *  - Version must strictly increase (numerical comparison of version strings).
- *  - Frozen contract rows (step_contracts) are NEVER modified (R-017/R-018);
- *    see frozenContractsUnaffected in @agencyhq/domain.
+ *  - Frozen contract rows (step_contracts) are NEVER modified (R-017/R-018).
+ *    This command only touches: projects, authority_versions, decisions, commands.
+ *    It never SELECT-s, UPDATE-s, INSERT-s, or DELETE-s step_contracts rows.
  *  - A decision of kind "authority_update" is written for the audit trail.
  */
 
@@ -27,15 +32,8 @@ import {
   insertAuthorityVersion,
   insertDecision,
 } from "@agencyhq/db";
-import { frozenContractsUnaffected, proposeAuthorityUpdate } from "@agencyhq/domain";
+import { proposeAuthorityUpdate } from "@agencyhq/domain";
 import type pg from "pg";
-
-// Satisfies the TypeScript type without AuthoritySchema.parse when current
-// authority is absent; proposeAuthorityUpdate only uses current.version at
-// runtime, not current.authority.
-const _frozenInvariantSatisfied = frozenContractsUnaffected;
-// (Called only for documentation; the implementation never mutates step_contracts.)
-void _frozenInvariantSatisfied;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,7 +54,11 @@ export type UpdateAuthorityResult =
   | { ok: true; version: string; replayed?: boolean }
   | {
       ok: false;
-      reason: "validation_failed" | "version_not_increasing" | "project_not_found";
+      reason:
+        | "validation_failed"
+        | "version_not_increasing"
+        | "project_not_found"
+        | "stale_version";
       replayed?: boolean;
     };
 
@@ -79,53 +81,80 @@ export async function updateAuthority(
       return { ...stored, replayed: true };
     }
 
-    // 2. Load current project — need version and authority for proposeAuthorityUpdate
-    const { rows: projectRows } = await client.query<{
-      id: string;
-      authority_version: string;
-      authority: unknown;
-    }>(`SELECT id, authority_version, authority FROM projects WHERE id = $1`, [projectId]);
-
-    if (projectRows.length === 0) {
-      const result: UpdateAuthorityResult = { ok: false, reason: "project_not_found" };
-      await completeCommand(client, commandId, result);
-      return result;
-    }
-
-    const currentVersionStr = projectRows[0]?.authority_version ?? "0";
-    // proposeAuthorityUpdate uses current.version for comparison; current.authority
-    // is required by the type but not read at runtime when the invariant holds.
-    const currentAuthority = (projectRows[0]?.authority ?? {}) as Authority;
-
-    // 3. Validate and check version via domain function
-    const proposal = proposeAuthorityUpdate(
-      { version: currentVersionStr, authority: currentAuthority },
-      rawAuthority,
-    );
-
-    if (!proposal.ok) {
-      const reason =
-        proposal.error.kind === "parse_error" ? "validation_failed" : "version_not_increasing";
-      const result: UpdateAuthorityResult = { ok: false, reason };
-      await completeCommand(client, commandId, result);
-      return result;
-    }
-
-    const { version: newVersionStr, authority } = proposal.value;
-    const now = new Date();
-    const decisionId = randomUUID();
-
-    // 4. Transaction: update project + insert authority_versions + insert decision
+    // 2-9. All inside one transaction with FOR UPDATE row lock.
     await client.query("BEGIN");
     try {
-      // a. Update project authority
-      await client.query(
-        `UPDATE projects SET authority = $1::jsonb, authority_version = $2, updated_at = now()
-         WHERE id = $3`,
-        [JSON.stringify(authority), newVersionStr, projectId],
+      // 3. SELECT FOR UPDATE — acquires row lock to prevent lost updates (T-9).
+      const { rows: projectRows } = await client.query<{
+        id: string;
+        authority_version: string;
+        authority: unknown;
+      }>(`SELECT id, authority_version, authority FROM projects WHERE id = $1 FOR UPDATE`, [
+        projectId,
+      ]);
+
+      if (projectRows.length === 0) {
+        await client.query("ROLLBACK");
+        const result: UpdateAuthorityResult = { ok: false, reason: "project_not_found" };
+        await completeCommand(client, commandId, result);
+        return result;
+      }
+
+      const currentVersionStr = projectRows[0]?.authority_version ?? "0";
+      // proposeAuthorityUpdate uses current.version; current.authority satisfies the type.
+      const currentAuthority = (projectRows[0]?.authority ?? {}) as Authority;
+
+      // 4. Validate and check version via domain function
+      const proposal = proposeAuthorityUpdate(
+        { version: currentVersionStr, authority: currentAuthority },
+        rawAuthority,
       );
 
-      // b. Append to authority_versions via db repo (idempotent on conflict)
+      if (!proposal.ok) {
+        await client.query("ROLLBACK");
+        const reason =
+          proposal.error.kind === "parse_error" ? "validation_failed" : "version_not_increasing";
+        const result: UpdateAuthorityResult = { ok: false, reason };
+        await completeCommand(client, commandId, result);
+        return result;
+      }
+
+      const { version: newVersionStr, authority } = proposal.value;
+      const now = new Date();
+      const decisionId = randomUUID();
+
+      // 5. CAS update: only succeeds when the version we read is still current.
+      const { rowCount } = await client.query(
+        `UPDATE projects SET authority = $1::jsonb, authority_version = $2, updated_at = now()
+         WHERE id = $3 AND authority_version = $4`,
+        [JSON.stringify(authority), newVersionStr, projectId, currentVersionStr],
+      );
+
+      if ((rowCount ?? 0) === 0) {
+        // Concurrent update won — report stale_version.
+        await client.query("ROLLBACK");
+        const result: UpdateAuthorityResult = { ok: false, reason: "stale_version" };
+        await completeCommand(client, commandId, result);
+        return result;
+      }
+
+      // 6. Backfill: if authority_versions is empty for this project, write the
+      //    pre-update (initial) version as history first (T-13).
+      const { rows: existingVersionRows } = await client.query<{ version: string }>(
+        `SELECT version FROM authority_versions WHERE project_id = $1 LIMIT 1`,
+        [projectId],
+      );
+      if (existingVersionRows.length === 0) {
+        await insertAuthorityVersion(client, {
+          project_id: projectId,
+          version: currentVersionStr,
+          authority: currentAuthority,
+          actor,
+          at: new Date(now.getTime() - 1), // just before the new version
+        });
+      }
+
+      // 7. Append to authority_versions via db repo (idempotent on conflict)
       await insertAuthorityVersion(client, {
         project_id: projectId,
         version: newVersionStr,
@@ -134,7 +163,7 @@ export async function updateAuthority(
         at: now,
       });
 
-      // c. Insert a decision row for the audit trail
+      // 8. Insert a decision row for the audit trail
       await insertDecision(client, {
         id: decisionId,
         kind: "authority_update",
@@ -147,14 +176,14 @@ export async function updateAuthority(
       });
 
       await client.query("COMMIT");
+
+      const result: UpdateAuthorityResult = { ok: true, version: newVersionStr };
+      await completeCommand(client, commandId, result);
+      return result;
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
     }
-
-    const result: UpdateAuthorityResult = { ok: true, version: newVersionStr };
-    await completeCommand(client, commandId, result);
-    return result;
   } finally {
     client.release();
   }

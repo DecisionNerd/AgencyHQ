@@ -6,6 +6,7 @@
  * Contains no scheduling or acceptance logic.
  */
 
+import { LeadPlanOutputSchema, TASK_IDS } from "@agencyhq/contracts";
 import {
   claimCommand,
   completeCommand,
@@ -815,6 +816,39 @@ export function createApp(deps: AppDeps): Hono {
         for (const wi of workItems) {
           const decisions = await listDecisionsByWorkItem(pgClient, wi.id);
           for (const d of decisions) {
+            // T-11: load the Lead proposal's rationale from the lead.plan run
+            // observation for this attempt, if present.
+            let rationale: string | null = null;
+            if (d.attempt_id) {
+              try {
+                const { rows: planIntentRows } = await client.query(
+                  `SELECT run_id FROM dispatch_intents
+                   WHERE attempt_id = $1 AND task = $2
+                   ORDER BY created_at DESC LIMIT 1`,
+                  [d.attempt_id, TASK_IDS.leadPlan],
+                );
+                const planRunId = (planIntentRows[0] as { run_id?: string | null } | undefined)
+                  ?.run_id;
+                if (planRunId) {
+                  const { rows: obsRows } = await client.query(
+                    `SELECT payload FROM run_observations
+                     WHERE run_id = $1 AND stale = false
+                     ORDER BY generation DESC LIMIT 1`,
+                    [planRunId],
+                  );
+                  const obsPayload = (obsRows[0] as { payload?: unknown } | undefined)?.payload as
+                    | { output?: unknown }
+                    | undefined;
+                  const planResult = LeadPlanOutputSchema.safeParse(obsPayload?.output);
+                  if (planResult.success && planResult.data.kind === "proposal") {
+                    rationale = planResult.data.proposal.rationale;
+                  }
+                }
+              } catch {
+                // Best-effort; keep rationale null on any error
+              }
+            }
+
             allDecisions.push({
               id: d.id,
               workItemId: d.work_item_id,
@@ -823,7 +857,7 @@ export function createApp(deps: AppDeps): Hono {
               at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
               contractVersion: d.contract_version,
               attemptId: d.attempt_id,
-              rationale: null, // Lead rationale would need to be fetched from proposal
+              rationale,
             });
           }
 
@@ -1083,6 +1117,7 @@ export function createApp(deps: AppDeps): Hono {
           kind: d.kind ?? "",
           actor: d.actor ?? "",
           outcome: d.outcome,
+          reason: d.reason ?? null,
           contractVersion: d.contract_version,
           attemptId: d.attempt_id,
           at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
@@ -1449,12 +1484,16 @@ export function createApp(deps: AppDeps): Hono {
       if (kind === "reject") {
         const workItemId = body.workItemId;
         const decisionId = body.decisionId;
-        const reason = typeof body.reason === "string" ? body.reason : "operator rejected";
+        const reason = typeof body.reason === "string" ? body.reason : "";
         if (!workItemId || typeof workItemId !== "string") {
           return c.json({ error: "workItemId required for reject" }, 400);
         }
         if (!decisionId || typeof decisionId !== "string") {
           return c.json({ error: "decisionId required for reject" }, 400);
+        }
+        // T-5: reason is required; empty reason → 400
+        if (!reason) {
+          return c.json({ ok: false, reason: "reason_required" }, 400);
         }
         const result = await commands.reject({ commandId, workItemId, decisionId, reason });
         return c.json({ commandId, result }, 200);

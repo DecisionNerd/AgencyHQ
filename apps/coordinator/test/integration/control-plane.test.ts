@@ -131,33 +131,55 @@ async function seedAttemptWithDecision(
 // Tests: rejectWorkItem
 // ---------------------------------------------------------------------------
 
-test("reject: pending_human decision → rejected, work item lifecycle → halted", async (t) => {
+test("reject: pending_human decision → appends rejected row, pending row stays, work item lifecycle → halted (T-12)", async (t) => {
   await withControlPlaneSchema(t, async (ctx) => {
     const pool = makeSchemaPool(process.env.DATABASE_URL ?? "", ctx.schema);
     try {
       const projectId = await seedProject(ctx);
       const workItemId = await seedWorkItem(ctx, projectId, { lifecycle: "active" });
       const contractId = await seedContract(ctx, workItemId, projectId);
-      const { decisionId } = await seedAttemptWithDecision(ctx, contractId, workItemId, {
-        decisionOutcome: "pending_human",
-      });
+      const { decisionId: pendingDecisionId, attemptId } = await seedAttemptWithDecision(
+        ctx,
+        contractId,
+        workItemId,
+        { decisionOutcome: "pending_human" },
+      );
 
       const result = await rejectWorkItem(
         { pool },
-        { commandId: randomUUID(), workItemId, decisionId, reason: "Not acceptable" },
+        {
+          commandId: randomUUID(),
+          workItemId,
+          decisionId: pendingDecisionId,
+          reason: "Not acceptable",
+        },
       );
 
       assert.equal(result.ok, true);
       if (result.ok) {
-        assert.equal(result.decisionId, decisionId);
+        // The returned decisionId is the NEW appended decision, not the pending one.
+        assert.notEqual(
+          result.decisionId,
+          pendingDecisionId,
+          "new decision id differs from pending",
+        );
       }
 
-      // Verify decision is now rejected
-      const { rows: decRows } = (await ctx.client.query(
+      // Pending row remains as history (outcome = pending_human — R-017).
+      const { rows: pendingRows } = (await ctx.client.query(
         `SELECT outcome FROM decisions WHERE id = $1`,
-        [decisionId],
+        [pendingDecisionId],
       )) as { rows: Array<{ outcome: string }> };
-      assert.equal(decRows[0]?.outcome, "rejected");
+      assert.equal(pendingRows[0]?.outcome, "pending_human", "pending row stays as history");
+
+      // A new rejected decision was appended for the same attempt.
+      const { rows: rejectedRows } = (await ctx.client.query(
+        `SELECT outcome, reason FROM decisions
+         WHERE attempt_id = $1 AND outcome = 'rejected' AND kind = 'accept'`,
+        [attemptId],
+      )) as { rows: Array<{ outcome: string; reason: string | null }> };
+      assert.equal(rejectedRows.length, 1, "one rejected decision appended");
+      assert.equal(rejectedRows[0]?.reason, "Not acceptable", "reason persisted (T-5)");
 
       // Verify work item lifecycle is now halted
       const { rows: wiRows } = (await ctx.client.query(
@@ -270,14 +292,24 @@ test("invalidate_acceptance: creates invalidation decision and reopens work item
       assert.equal(oldDecRows[0]?.outcome, "approved"); // historical row untouched
       assert.equal(oldDecRows[0]?.kind, "accept");
 
-      // New invalidation decision should exist
+      // New invalidation decision should exist with reason persisted (T-5)
       const { rows: newDecRows } = (await ctx.client.query(
-        `SELECT kind, outcome, causation_id FROM decisions WHERE kind = 'invalidate' AND work_item_id = $1`,
+        `SELECT kind, outcome, causation_id, reason FROM decisions WHERE kind = 'invalidate' AND work_item_id = $1`,
         [workItemId],
-      )) as { rows: Array<{ kind: string; outcome: string; causation_id: string }> };
+      )) as {
+        rows: Array<{ kind: string; outcome: string; causation_id: string; reason: string | null }>;
+      };
       assert.equal(newDecRows.length, 1);
       assert.equal(newDecRows[0]?.kind, "invalidate");
       assert.equal(newDecRows[0]?.causation_id, acceptDecisionId);
+      assert.equal(newDecRows[0]?.reason, "Defect found", "reason persisted");
+
+      // T-13: step_contracts row is unchanged after invalidation.
+      const { rows: scRows } = (await ctx.client.query(
+        `SELECT id, status FROM step_contracts WHERE id = $1`,
+        [contractId],
+      )) as { rows: Array<{ id: string; status: string }> };
+      assert.equal(scRows[0]?.status, "active", "step_contracts row unchanged");
     } finally {
       await pool.end();
     }
@@ -449,7 +481,7 @@ test("assign_campaign: returns not_found for missing campaign", async (t) => {
 // Tests: setMainEffort
 // ---------------------------------------------------------------------------
 
-test("set_main_effort: updates campaign main_effort_work_item_id", async (t) => {
+test("set_main_effort: updates campaign main_effort_work_item_id (membership guard — assign first) (T-8)", async (t) => {
   await withControlPlaneSchema(t, async (ctx) => {
     const pool = makeSchemaPool(process.env.DATABASE_URL ?? "", ctx.schema);
     try {
@@ -462,6 +494,13 @@ test("set_main_effort: updates campaign main_effort_work_item_id", async (t) => 
       );
       assert.equal(campaignResult.ok, true);
       const campaignId = campaignResult.ok ? campaignResult.campaignId : "";
+
+      // T-8: must assign the work item to the campaign before setting it as main effort.
+      const assignResult = await assignCampaign(
+        { pool },
+        { commandId: randomUUID(), workItemId, campaignId },
+      );
+      assert.equal(assignResult.ok, true, "assign succeeded");
 
       const result = await setMainEffort(
         { pool },
@@ -476,6 +515,36 @@ test("set_main_effort: updates campaign main_effort_work_item_id", async (t) => 
         [campaignId],
       )) as { rows: Array<{ main_effort_work_item_id: string | null }> };
       assert.equal(rows[0]?.main_effort_work_item_id, workItemId);
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("set_main_effort: returns not_a_member when work item not in campaign (T-8)", async (t) => {
+  await withControlPlaneSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(process.env.DATABASE_URL ?? "", ctx.schema);
+    try {
+      const projectId = await seedProject(ctx);
+      const workItemId = await seedWorkItem(ctx, projectId);
+
+      const campaignResult = await createCampaign(
+        { pool },
+        { commandId: randomUUID(), name: "Campaign Guard Test" },
+      );
+      assert.equal(campaignResult.ok, true);
+      const campaignId = campaignResult.ok ? campaignResult.campaignId : "";
+
+      // Do NOT assign — expect not_a_member
+      const result = await setMainEffort(
+        { pool },
+        { commandId: randomUUID(), campaignId, workItemId },
+      );
+
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.reason, "not_a_member");
+      }
     } finally {
       await pool.end();
     }
@@ -589,14 +658,16 @@ test("update_authority: validates with AuthoritySchema and increments version", 
       )) as { rows: Array<{ authority_version: string }> };
       assert.equal(projRows[0]?.authority_version, "2");
 
-      // Verify authority_versions table has the new entry
+      // Verify authority_versions table has both the backfilled initial version and the new entry.
+      // T-13: on first update, the initial version is backfilled before the new version is written.
       const { rows: avRows } = (await ctx.client.query(
-        `SELECT version, actor FROM authority_versions WHERE project_id = $1`,
+        `SELECT version, actor FROM authority_versions WHERE project_id = $1 ORDER BY at`,
         [projectId],
       )) as { rows: Array<{ version: string; actor: string }> };
-      assert.equal(avRows.length, 1);
-      assert.equal(avRows[0]?.version, "2");
-      assert.equal(avRows[0]?.actor, "operator");
+      // The last row is the new version.
+      const lastRow = avRows[avRows.length - 1];
+      assert.equal(lastRow?.version, "2");
+      assert.equal(lastRow?.actor, "operator");
 
       // Verify a decision of kind authority_update was inserted
       const { rows: decRows } = (await ctx.client.query(
