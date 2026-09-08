@@ -609,9 +609,9 @@ function DecisionsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized:
         buildApproveBody({
           commandId: crypto.randomUUID(),
           workItemId: impact.workItemId,
-          contractId: impact.attemptId ?? "",
+          contractId: impact.contractId ?? "",
           contractVersion: impact.contractVersion ?? 0,
-          attemptRevision: impact.attemptId ?? "",
+          attemptRevision: impact.attemptRevision ?? "",
         }),
       );
       load();
@@ -1121,7 +1121,14 @@ function WorkItemPage({
                   className="btn-primary"
                   data-testid="action-approve"
                   disabled={actionInFlight !== null}
-                  onClick={() =>
+                  onClick={() => {
+                    // Look up contractId and artifact revision from evidence
+                    const attemptForDecision = evidence?.attempts.find(
+                      (a) => a.id === pendingDecision.attemptId,
+                    );
+                    const artifactForAttempt = evidence?.artifacts.find(
+                      (a) => a.attemptId === pendingDecision.attemptId,
+                    );
                     confirmThen(
                       `Approve decision for work item ${item.workItemId}` +
                         (pendingDecision.contractVersion != null
@@ -1134,13 +1141,13 @@ function WorkItemPage({
                           buildApproveBody({
                             commandId: crypto.randomUUID(),
                             workItemId: item.workItemId,
-                            contractId: pendingDecision.attemptId ?? "",
+                            contractId: attemptForDecision?.contractId ?? "",
                             contractVersion: pendingDecision.contractVersion ?? 0,
-                            attemptRevision: pendingDecision.attemptId ?? "",
+                            attemptRevision: artifactForAttempt?.revision ?? "",
                           }),
                         ),
-                    )
-                  }
+                    );
+                  }}
                 >
                   Approve
                 </button>

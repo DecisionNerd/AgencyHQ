@@ -27,7 +27,7 @@ const execFile = promisify(execFileCb);
 function parseArgs(args: string[]): {
   repo: string;
   intent: string;
-  defect?: string;
+  defect: string | undefined;
   authority: string;
 } {
   const get = (flag: string): string | undefined => {

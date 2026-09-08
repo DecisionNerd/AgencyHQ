@@ -67,3 +67,49 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:integration
+
+  browser:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: agencyhq
+          POSTGRES_PASSWORD: agencyhq
+          POSTGRES_DB: agencyhq_browser_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agencyhq"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://agencyhq:agencyhq@localhost:5432/agencyhq_browser_test
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        run: pnpm --filter @agencyhq/web exec playwright install chromium --with-deps
+
+      - run: pnpm test:browser
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: apps/web/playwright-report/
+          retention-days: 14
