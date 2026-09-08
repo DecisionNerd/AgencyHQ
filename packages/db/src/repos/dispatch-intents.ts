@@ -155,6 +155,61 @@ export async function listQueuedWorkerIntents(
   return rows as QueuedWorkerIntentRow[];
 }
 
+// ---------------------------------------------------------------------------
+// Active attempts for scheduling
+// ---------------------------------------------------------------------------
+
+/**
+ * A row returned by listActiveAttemptsForScheduling.
+ */
+export type ActiveAttemptForScheduling = {
+  work_item_id: string;
+  project_id: string;
+  status: string;
+  bounds: Record<string, unknown>;
+};
+
+/**
+ * List attempts that are "active" for scheduling — i.e. a worker process is
+ * or may be running in their worktree.
+ *
+ * An attempt is active when:
+ *   (a) its status is 'stopping' (worker shutdown in progress), OR
+ *   (b) its status is 'dispatched' or 'running' AND there is an open
+ *       dispatch_intents row (task='worker.attempt', status='triggered').
+ *
+ * Attempts whose only open intents are verify/review/accept runs, and attempts
+ * with no open intent at all, are NOT counted — no worker process exists in
+ * their worktree and holding a slot or repo-busy flag would block new work.
+ *
+ * Terminal work item lifecycles (halted, completed, done) are excluded so
+ * halted items never pin a repository as busy.
+ */
+export async function listActiveAttemptsForScheduling(
+  client: pg.PoolClient,
+): Promise<ActiveAttemptForScheduling[]> {
+  const { rows } = await client.query<ActiveAttemptForScheduling>(
+    `SELECT a.status, sc.work_item_id, sc.project_id, sc.bounds
+     FROM attempts a
+     JOIN step_contracts sc ON sc.id = a.contract_id
+     JOIN work_items wi      ON wi.id = sc.work_item_id
+     WHERE wi.lifecycle NOT IN ('halted', 'completed', 'done')
+       AND (
+         a.status = 'stopping'
+         OR (
+           a.status IN ('dispatched', 'running')
+           AND EXISTS (
+             SELECT 1 FROM dispatch_intents di
+             WHERE di.attempt_id = a.id
+               AND di.task       = 'worker.attempt'
+               AND di.status     = 'triggered'
+           )
+         )
+       )`,
+  );
+  return rows;
+}
+
 /**
  * Transition a dispatch intent's status.
  * Uses optimistic concurrency: WHERE id = $1 AND status = $2.

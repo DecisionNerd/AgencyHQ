@@ -18,6 +18,7 @@ import type { LeadPlanOutput } from "@agencyhq/contracts";
 import { LeadPlanOutputSchema, TASK_IDS } from "@agencyhq/contracts";
 import {
   applyObservation,
+  listActiveAttemptsForScheduling,
   listCurrentCapacity,
   listOpenDispatchIntents,
   listQueuedWorkerIntents,
@@ -302,25 +303,16 @@ export class Reconciler {
       const queuedIntents = await listQueuedWorkerIntents(client);
       if (queuedIntents.length === 0) return;
 
-      // 2. Load active attempts (dispatched|running|stopping) for slot + repo counting.
-      //    Exclude attempts whose work item lifecycle is terminal or halted: attempt
-      //    status is reused across verify/review/accept runs and can be left non-terminal
-      //    when an item is halted (e.g. Lead-failure → pending_human → reject path leaves
-      //    the attempt in 'dispatched' while the work item moves to 'halted').
-      //    Without this exclusion, halted items hold busyRepos forever (repository_busy).
-      const { rows: activeRows } = await client.query<{
-        work_item_id: string;
-        project_id: string;
-        status: string;
-        bounds: Record<string, unknown>;
-      }>(
-        `SELECT a.status, sc.work_item_id, sc.project_id, sc.bounds
-         FROM attempts a
-         JOIN step_contracts sc ON sc.id = a.contract_id
-         JOIN work_items wi ON wi.id = sc.work_item_id
-         WHERE a.status IN ('dispatched', 'running', 'stopping')
-           AND wi.lifecycle NOT IN ('halted', 'completed', 'done')`,
-      );
+      // 2. Load active attempts for slot + repo counting.
+      //    An attempt is active only when a worker process is or may be running:
+      //    status='stopping' (always), or status IN ('dispatched','running') with
+      //    an open worker.attempt intent (status='triggered').  Attempts whose only
+      //    open intents are verify/review/accept runs are NOT counted — no worker
+      //    process exists and holding slots/busyRepos for them blocks legitimate work
+      //    (observed live: 33 stale 'dispatched' rows with only lead.review/accept
+      //    intents filled all slots with AGENCYHQ_WORKER_SLOTS=1).
+      //    Terminal work item lifecycles (halted, completed, done) are also excluded.
+      const activeRows = await listActiveAttemptsForScheduling(client);
 
       // 3. Load current provider capacity.
       const capacityRows = await listCurrentCapacity(client, new Date());

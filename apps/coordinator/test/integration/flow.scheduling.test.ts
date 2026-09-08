@@ -16,6 +16,15 @@
  * (g) Halted/completed items do not hold the repository — their dispatched attempt
  *     is excluded from activeAttempts so the project does not appear in busyRepos.
  *
+ * Active-attempt definition fix (S6-fix-active-attempts):
+ * (i) Dispatched attempt with no triggered worker.attempt intent (only lead.review/accept,
+ *     or no open intent at all) does not occupy a slot or make the project busy: a queued
+ *     item on a different project is dispatched (not no_slot), and a queued item on the
+ *     same project is dispatched on the next pass (not repository_busy).
+ * (ii) Dispatched attempt WITH a triggered worker.attempt intent still blocks (no_slot /
+ *     repository_busy) — covered by existing tests (b) and slot-regression.
+ * (iii) Stopping attempt counts as active regardless of whether it has an open intent.
+ *
  * Wake-up subscription refresh tests (Design 3):
  * (wakeup-tags) wakeupTags() returns tags for non-terminal work items and open intents.
  * (wakeup-a) Startup with no open work → no subscribe; after pollOnce with open work → subscribed.
@@ -1225,6 +1234,13 @@ test("scheduling(h): intent skipped repository_busy on pass 1, dispatched on pas
 
 // ---------------------------------------------------------------------------
 // (wakeup-tags) wakeupTags() unit: returns correct project tags
+/** Poll until `pred()` is true or `ms` elapsed (the wake-up subscription is
+ * established asynchronously after startWakeup(): a DB query then subscribe()). */
+async function waitFor(pred: () => boolean, ms = 2000): Promise<void> {
+  const until = Date.now() + ms;
+  while (!pred() && Date.now() < until) await new Promise((r) => setTimeout(r, 20));
+}
+
 // ---------------------------------------------------------------------------
 
 test("scheduling(wakeup-tags): wakeupTags returns tags for non-terminal work items and open intents", async (t) => {
@@ -1354,9 +1370,9 @@ test("scheduling(wakeup-b): tag set change causes resubscription; old subscripti
         lifecycle: "admitted",
       });
 
-      // Start wake-up → subscribes to project A.
+      // Start wake-up → subscribes to project A (asynchronously: query, then subscribe).
       const wakeupPromise = reconciler.startWakeup();
-      await new Promise((r) => setTimeout(r, 10));
+      await waitFor(() => fake.calls.some((c) => c.method === "subscribe"));
 
       const subCallsInitial = fake.calls.filter((c) => c.method === "subscribe");
       assert.equal(subCallsInitial.length, 1, "initial subscription to project A");
@@ -1522,6 +1538,346 @@ test("scheduling(slot-regression): slots=1, one attempt dispatched on project A 
       const after = (afterRows as { status: string; skip_reason: string | null }[])[0]!;
       assert.equal(after.status, "queued", "wi2 must stay queued (slot taken by wi1)");
       assert.equal(after.skip_reason, "no_slot", "skip_reason must be no_slot");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (i) Dispatched attempt with no triggered worker.attempt intent does not block
+// ---------------------------------------------------------------------------
+
+test("scheduling(i): dispatched attempt with no triggered worker.attempt intent does not occupy slot or make repo busy", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Seed project A (wi1_A + wi_A2) and project B (wi_B).
+      const { workItemId: wi1_A, projectId: projectA } = await seedProjectAndWorkItem(client);
+      // wi_A2: second item on project A.
+      const wi_A2 = newId("wi");
+      await client.query(
+        `INSERT INTO work_items
+           (id, project_id, rank, intent, defect, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 2, 'Fix a second issue on project A', NULL, 'artifact', 'proposed', 'healthy', false, 1)`,
+        [wi_A2, projectA],
+      );
+      // wi_B: item on a different project.
+      const { workItemId: wi_B } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      // Workers stay EXECUTING — we control slot state via direct DB updates.
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // Use a large workerSlots count when admitting wi1_A so bounded-repair
+      // dispatches it immediately (slot check inside bounded-repair uses its own
+      // query and we need attempt1 to be in 'dispatched' state).
+      const depsAdmit = makeFlowDeps(pool, fake, { workerSlots: 99 });
+      const flowAdmit = new BoundedRepairFlow(depsAdmit);
+
+      // Admit wi1_A — creates attempt1 (dispatched) + triggered worker.attempt intent.
+      const { intentId: pi1, runId: pr1 } = await flowAdmit.plan(wi1_A, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flowAdmit.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Simulate the scenario where the worker run already finished and bounded-repair
+      // moved on to a review/accept run: mark wi1_A's worker.attempt intent as 'observed'.
+      // Attempt1 now has status='dispatched' but NO triggered worker.attempt intent.
+      await client.query(
+        `UPDATE dispatch_intents
+         SET status = 'observed', updated_at = now()
+         WHERE task = $1
+           AND attempt_id IN (
+             SELECT a.id FROM attempts a
+             JOIN step_contracts sc ON sc.id = a.contract_id
+             WHERE sc.work_item_id = $2
+           )`,
+        [TASK_IDS.workerAttempt, wi1_A],
+      );
+
+      // Now admit wi_A2 and wi_B with slots=1. bounded-repair's own slot check
+      // (SELECT COUNT(*) FROM attempts WHERE status IN ('dispatched','running','stopping'))
+      // still sees attempt1 as dispatched → queues wi_A2 and wi_B.
+      const deps1 = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow1 = new BoundedRepairFlow(deps1);
+      const reconciler = new Reconciler(deps1, flow1, { workerSlots: 1 });
+
+      const { intentId: pi_A2, runId: pr_A2 } = await flow1.plan(wi_A2, newId("cmd"));
+      fake.advance(pr_A2);
+      fake.advance(pr_A2);
+      await flow1.onLeadPlanOutput(pi_A2, goodPlanOutput(), newId("cmd"));
+
+      const { intentId: pi_B, runId: pr_B } = await flow1.plan(wi_B, newId("cmd"));
+      fake.advance(pr_B);
+      fake.advance(pr_B);
+      await flow1.onLeadPlanOutput(pi_B, goodPlanOutput(), newId("cmd"));
+
+      // Confirm wi_A2 and wi_B are queued before running the scheduler.
+      const { rows: preA2 } = await client.query(
+        `SELECT di.status FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi_A2],
+      );
+      assert.equal(
+        (preA2 as { status: string }[])[0]?.status,
+        "queued",
+        "wi_A2 queued before scheduler",
+      );
+      const { rows: preB } = await client.query(
+        `SELECT di.status FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi_B],
+      );
+      assert.equal(
+        (preB as { status: string }[])[0]?.status,
+        "queued",
+        "wi_B queued before scheduler",
+      );
+
+      // Pass 1: scheduleOnce with slots=1.
+      // attempt1 has no triggered worker.attempt intent → NOT active (0 active attempts).
+      // The scheduler should dispatch one item (whichever ranks first) and skip the
+      // other with no_slot (not repository_busy from attempt1 on project A).
+      await reconciler.scheduleOnce();
+
+      const { rows: pass1A2 } = await client.query(
+        `SELECT di.status, di.skip_reason FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi_A2],
+      );
+      const { rows: pass1B } = await client.query(
+        `SELECT di.status, di.skip_reason FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi_B],
+      );
+      const p1A2 = (pass1A2 as { status: string; skip_reason: string | null }[])[0]!;
+      const p1B = (pass1B as { status: string; skip_reason: string | null }[])[0]!;
+
+      // Critically: neither should have repository_busy (attempt1 must NOT be active).
+      assert.ok(
+        p1A2.skip_reason !== "repository_busy",
+        `wi_A2 must not be repository_busy on pass 1 (attempt1 not active): got ${p1A2.skip_reason}`,
+      );
+      assert.ok(
+        p1B.skip_reason !== "repository_busy",
+        `wi_B must not be repository_busy on pass 1 (attempt1 not active): got ${p1B.skip_reason}`,
+      );
+
+      // At least one item should be dispatched (slot was free).
+      const oneTriggered = p1A2.status === "triggered" || p1B.status === "triggered";
+      assert.ok(
+        oneTriggered,
+        `at least one of wi_A2/wi_B should be triggered on pass 1 (slot was free), got: A2=${p1A2.status} B=${p1B.status}`,
+      );
+
+      // wi_B (different project from attempt1's project A) must be triggered or no_slot
+      // (never repository_busy from attempt1 on project A).
+      assert.ok(
+        p1B.status === "triggered" || p1B.skip_reason === "no_slot",
+        `wi_B must be triggered or no_slot, not repository_busy from attempt1; got: status=${p1B.status} skip_reason=${p1B.skip_reason}`,
+      );
+
+      // Pass 2: close whichever intent was triggered (free the slot) and mark its
+      // attempt completed, then run scheduleOnce again — the remaining item should
+      // dispatch. wi_A2 (same project as attempt1) must NOT be repository_busy.
+      await client.query(
+        `UPDATE dispatch_intents SET status = 'observed', updated_at = now()
+         WHERE task = $1 AND status = 'triggered'
+           AND attempt_id IN (
+             SELECT a.id FROM attempts a
+             JOIN step_contracts sc ON sc.id = a.contract_id
+             WHERE sc.work_item_id IN ($2, $3)
+           )`,
+        [TASK_IDS.workerAttempt, wi_A2, wi_B],
+      );
+      await client.query(
+        `UPDATE attempts SET status = 'completed', updated_at = now()
+         WHERE id IN (
+           SELECT a.id FROM attempts a
+           JOIN step_contracts sc ON sc.id = a.contract_id
+           WHERE sc.work_item_id IN ($1, $2)
+         ) AND status = 'dispatched'`,
+        [wi_A2, wi_B],
+      );
+
+      await reconciler.scheduleOnce();
+
+      const { rows: pass2A2 } = await client.query(
+        `SELECT di.status, di.skip_reason FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi_A2],
+      );
+      const { rows: pass2B } = await client.query(
+        `SELECT di.status, di.skip_reason FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi_B],
+      );
+      const p2A2 = (pass2A2 as { status: string; skip_reason: string | null }[])[0]!;
+      const p2B = (pass2B as { status: string; skip_reason: string | null }[])[0]!;
+
+      // After pass 2 both should be triggered (dispatched) or already observed.
+      const bothDone =
+        (p2A2.status === "triggered" || p2A2.status === "observed") &&
+        (p2B.status === "triggered" || p2B.status === "observed");
+      assert.ok(
+        bothDone,
+        `both wi_A2 and wi_B should be triggered/observed after pass 2; got A2=${p2A2.status} B=${p2B.status}`,
+      );
+
+      // The key assertion: wi_A2 (same project as attempt1) must never have been
+      // blocked by repository_busy from attempt1.
+      assert.ok(
+        p2A2.skip_reason !== "repository_busy",
+        `wi_A2 (same project as attempt1) must never get repository_busy: got ${p2A2.skip_reason}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (iii) Stopping attempt counts as active regardless of open intents
+// ---------------------------------------------------------------------------
+
+test("scheduling(iii): stopping attempt is always active — blocks slot and makes project busy even with no open worker.attempt intent", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Seed project A (wi1_A + wi_A2) and project B (wi_B).
+      const { workItemId: wi1_A, projectId: projectA } = await seedProjectAndWorkItem(client);
+      const wi_A2 = newId("wi");
+      await client.query(
+        `INSERT INTO work_items
+           (id, project_id, rank, intent, defect, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 2, 'Fix a second issue on project A (iii)', NULL, 'artifact', 'proposed', 'healthy', false, 1)`,
+        [wi_A2, projectA],
+      );
+      const { workItemId: wi_B } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // Admit wi1_A with a large slots value so it dispatches immediately.
+      const depsAdmit = makeFlowDeps(pool, fake, { workerSlots: 99 });
+      const flowAdmit = new BoundedRepairFlow(depsAdmit);
+
+      const { intentId: pi1, runId: pr1 } = await flowAdmit.plan(wi1_A, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flowAdmit.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Transition attempt1 to 'stopping' (worker being shut down) and also
+      // mark its worker.attempt intent as 'observed' — so there is NO triggered
+      // worker.attempt intent. A stopping attempt must STILL be counted as active.
+      await client.query(
+        `UPDATE attempts SET status = 'stopping', updated_at = now()
+         WHERE id IN (
+           SELECT a.id FROM attempts a
+           JOIN step_contracts sc ON sc.id = a.contract_id
+           WHERE sc.work_item_id = $1
+         )`,
+        [wi1_A],
+      );
+      await client.query(
+        `UPDATE dispatch_intents SET status = 'observed', updated_at = now()
+         WHERE task = $1
+           AND attempt_id IN (
+             SELECT a.id FROM attempts a
+             JOIN step_contracts sc ON sc.id = a.contract_id
+             WHERE sc.work_item_id = $2
+           )`,
+        [TASK_IDS.workerAttempt, wi1_A],
+      );
+
+      // Admit wi_A2 and wi_B with slots=1.
+      const deps1 = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow1 = new BoundedRepairFlow(deps1);
+      const reconciler = new Reconciler(deps1, flow1, { workerSlots: 1 });
+
+      const { intentId: pi_A2, runId: pr_A2 } = await flow1.plan(wi_A2, newId("cmd"));
+      fake.advance(pr_A2);
+      fake.advance(pr_A2);
+      await flow1.onLeadPlanOutput(pi_A2, goodPlanOutput(), newId("cmd"));
+
+      const { intentId: pi_B, runId: pr_B } = await flow1.plan(wi_B, newId("cmd"));
+      fake.advance(pr_B);
+      fake.advance(pr_B);
+      await flow1.onLeadPlanOutput(pi_B, goodPlanOutput(), newId("cmd"));
+
+      // Run scheduler: attempt1 is 'stopping' → counted as active despite no open
+      // worker.attempt intent → slot occupied → both wi_A2 and wi_B must be skipped.
+      await reconciler.scheduleOnce();
+
+      const { rows: rowsA2 } = await client.query(
+        `SELECT di.status, di.skip_reason FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi_A2],
+      );
+      const { rows: rowsB } = await client.query(
+        `SELECT di.status, di.skip_reason FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi_B],
+      );
+      const rA2 = (rowsA2 as { status: string; skip_reason: string | null }[])[0]!;
+      const rB = (rowsB as { status: string; skip_reason: string | null }[])[0]!;
+
+      // wi_B (different project) must be no_slot — stopping attempt occupies the slot.
+      assert.equal(rB.status, "queued", "wi_B must stay queued (stopping attempt occupies slot)");
+      assert.equal(
+        rB.skip_reason,
+        "no_slot",
+        "wi_B must get no_slot (stopping attempt1 counts as active)",
+      );
+
+      // wi_A2 (same project) must be repository_busy — stopping attempt makes project A busy.
+      assert.equal(
+        rA2.status,
+        "queued",
+        "wi_A2 must stay queued (same project as stopping attempt)",
+      );
+      assert.equal(
+        rA2.skip_reason,
+        "repository_busy",
+        "wi_A2 must get repository_busy (stopping attempt1 makes project A busy)",
+      );
     } finally {
       await pool.end();
     }
