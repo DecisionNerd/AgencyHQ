@@ -318,7 +318,11 @@ test("approve(i): humanRequired contract → pending_human → approve with matc
         "SELECT lifecycle FROM work_items WHERE id = $1",
         [workItemId],
       );
-      assert.notEqual(wiRows1[0]!.lifecycle, "completed", "work item not yet completed before approve");
+      assert.notEqual(
+        wiRows1[0]!.lifecycle,
+        "completed",
+        "work item not yet completed before approve",
+      );
 
       // Approve with matching contractId + contractVersion + attemptRevision
       const approveDeps: ApproveDeps = {
