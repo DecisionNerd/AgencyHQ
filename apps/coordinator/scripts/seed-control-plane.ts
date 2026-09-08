@@ -237,6 +237,7 @@ async function runSeed(dbUrl: string): Promise<void> {
       const expectedTags = [
         "wiApprove",
         "wiReject",
+        "wiPending",
         "wiCompleted",
         "wiAdmitted",
         "wiBlocked",
@@ -327,6 +328,20 @@ async function runSeed(dbUrl: string): Promise<void> {
       rank: 2,
       mainEffort: false,
       intent: "wi-reject: Fix linter warnings in auth module",
+    });
+
+    // ---------------------------------------------------------------------------
+    // Work item WI_PENDING: active + pending_human accept that no journey
+    // resolves, so state-display journeys can rely on it regardless of the
+    // order in which the approve/reject journeys ran (CI runs on a clean ledger).
+    // ---------------------------------------------------------------------------
+
+    const wiPending = await seedPendingHumanItem(client, {
+      projectId,
+      campaignId,
+      rank: 3,
+      mainEffort: false,
+      intent: "wi-pending: Add retry to the fetch helper",
     });
 
     // Set campaign main effort
@@ -619,6 +634,7 @@ async function runSeed(dbUrl: string): Promise<void> {
       campaignId,
       wiApprove,
       wiReject,
+      wiPending,
       wiCompleted: wiCompletedId,
       wiAdmitted: wiAdmittedId,
       wiBlocked: wiBlockedId,
@@ -629,7 +645,12 @@ async function runSeed(dbUrl: string): Promise<void> {
     await client.query("COMMIT");
 
     const decApprove = await pendingAcceptDecisionId(client, wiApprove);
-    publishSeedIds({ ...output, ...(decApprove ? { decApprove } : {}) });
+    const decPending = await pendingAcceptDecisionId(client, wiPending);
+    publishSeedIds({
+      ...output,
+      ...(decApprove ? { decApprove } : {}),
+      ...(decPending ? { decPending } : {}),
+    });
   } catch (err) {
     // Rollback on any error to leave no partial data.
     try {
@@ -831,6 +852,7 @@ async function seedPendingHumanItem(
 function intentToTag(intent: string): string | null {
   if (intent.startsWith("wi-approve:")) return "wiApprove";
   if (intent.startsWith("wi-reject:")) return "wiReject";
+  if (intent.startsWith("wi-pending:")) return "wiPending";
   if (intent.startsWith("wi-completed:")) return "wiCompleted";
   if (intent.startsWith("wi-admitted:")) return "wiAdmitted";
   if (intent.startsWith("wi-blocked:")) return "wiBlocked";

@@ -12,6 +12,10 @@ const port = new URL(baseURL).port || "8793";
 
 export default defineConfig({
   testDir: "./e2e",
+  // The journeys share one seeded ledger and some of them mutate it (approve,
+  // reject, stop), so they run one at a time in a deterministic order.
+  workers: 1,
+  fullyParallel: false,
   retries: 1,
   trace: "on-first-retry",
   use: {

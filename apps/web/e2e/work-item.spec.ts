@@ -41,23 +41,26 @@ async function openWorkItemByIntent(page: ReturnType<typeof page.constructor>, i
 }
 
 test("work item page: pending_human accept state shows approve action", async ({ page }) => {
+  // Target the seeded item that no journey resolves (wiPending): the approve
+  // and reject journeys consume their own items, and on a clean ledger (CI)
+  // "any item with pending decisions" would be empty once they ran.
+  const ids = seedIds();
+  expect(ids.wiPending, "seed must publish wiPending").toBeTruthy();
+
   await injectToken(page);
   await page.goto("/#/");
   await expect(page.getByTestId("projects-section")).toBeVisible({ timeout: 10_000 });
 
-  // Find any work item with pending decisions > 0 and navigate to it
-  const pendingCell = page
-    .locator(`[data-testid^="pending-decisions-"]`)
-    .filter({ hasNotText: "0" })
-    .first();
+  const pendingCell = page.getByTestId(`pending-decisions-${ids.wiPending}`);
   await expect(pendingCell).toBeVisible({ timeout: 5_000 });
+  await expect(pendingCell).not.toHaveText("0");
 
   // Navigate to that work item by clicking the link in the same row
-  const row = pendingCell.locator("xpath=ancestor::tr");
-  const link = row.locator("a").first();
-  await link.click();
+  const row = page.getByTestId(`work-item-row-${ids.wiPending}`);
+  await row.locator("a").first().click();
 
   await expect(page.getByTestId("work-item-detail")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByTestId("work-item-lifecycle")).toContainText("active");
   // Approve action should be visible for pending_human items
   await expect(page.getByTestId("action-approve")).toBeVisible();
 });
