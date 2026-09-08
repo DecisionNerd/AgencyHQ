@@ -109,7 +109,21 @@ export async function stopAttempt(
     const runId = attempt.run_id ?? null;
     const cancelledAt = deps.clock.now();
     if (runId !== null) {
-      await deps.runtime.cancel(runId);
+      try {
+        await deps.runtime.cancel(runId);
+      } catch (cancelErr) {
+        // The generation is already revoked and the attempt is stopping.
+        // Complete the command so the row is not left claimed-but-no-result.
+        console.log(`[stop] runtime.cancel(${runId}) failed, skipping cancel:`, cancelErr);
+        const result: StopAttemptResult = { ok: true, generation: newGeneration, runId };
+        await completeCommand(client, commandId, {
+          ...result,
+          cancelledAt,
+          cancelSkipped: true,
+          reason: cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
+        });
+        return result;
+      }
     }
 
     // 5. Complete command with result

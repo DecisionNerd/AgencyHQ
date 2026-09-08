@@ -833,12 +833,31 @@ test("flow.stop (rw4b-ii): stop.ndjson stop_done survivors [] → stopped, check
         { attemptId, commandId: newId("cmd"), actor: "human", reason: "rw4b-ii" },
       );
 
-      // Write stop.ndjson with empty survivors and a checkpoint commit
+      // Write stop.ndjson with empty survivors and a checkpoint commit (real adapter format)
       const runDir = join(worktreeBase, "runs", attemptId);
       await mkdir(runDir, { recursive: true });
       const lines = [
-        JSON.stringify({ event: "checkpoint", commit: "filecommit99" }),
-        JSON.stringify({ event: "stop_done", survivors: [] }),
+        JSON.stringify({ at: "2026-09-07T18:40:26.081Z", step: "abort_signal" }),
+        JSON.stringify({
+          at: "2026-09-07T18:40:26.081Z",
+          step: "stop_start",
+          order: "kill-first",
+          pid: 34936,
+          pgid: 34936,
+        }),
+        JSON.stringify({
+          at: "2026-09-07T18:40:26.199Z",
+          step: "killed",
+          terminated: [34936],
+          killed: [],
+          survivors: [],
+        }),
+        JSON.stringify({
+          at: "2026-09-07T18:40:26.264Z",
+          step: "checkpoint",
+          checkpointCommit: "filecommit99",
+        }),
+        JSON.stringify({ at: "2026-09-07T18:40:26.316Z", step: "stop_done", survivors: [] }),
       ].join("\n");
       await writeFile(join(runDir, "stop.ndjson"), lines, "utf-8");
 
@@ -918,14 +937,28 @@ test("flow.stop (rw4b-iii): stop.ndjson survivors [123] → attempt uncertain, w
         { attemptId, commandId: newId("cmd"), actor: "human", reason: "rw4b-iii" },
       );
 
-      // Write stop.ndjson with non-empty survivors
+      // Write stop.ndjson with non-empty survivors (real adapter format)
       const runDir = join(worktreeBase, "runs", attemptId);
       await mkdir(runDir, { recursive: true });
-      await writeFile(
-        join(runDir, "stop.ndjson"),
-        JSON.stringify({ event: "stop_done", survivors: [123] }),
-        "utf-8",
-      );
+      const survivors123Lines = [
+        JSON.stringify({ at: "2026-09-07T18:40:26.081Z", step: "abort_signal" }),
+        JSON.stringify({
+          at: "2026-09-07T18:40:26.081Z",
+          step: "stop_start",
+          order: "kill-first",
+          pid: 34936,
+          pgid: 34936,
+        }),
+        JSON.stringify({
+          at: "2026-09-07T18:40:26.199Z",
+          step: "killed",
+          terminated: [],
+          killed: [],
+          survivors: [123],
+        }),
+        JSON.stringify({ at: "2026-09-07T18:40:26.316Z", step: "stop_done", survivors: [123] }),
+      ].join("\n");
+      await writeFile(join(runDir, "stop.ndjson"), survivors123Lines, "utf-8");
 
       await reconciler.pollOnce();
 
@@ -1086,6 +1119,215 @@ test("flow.stop (rw4b-iv): TIMED_OUT dispatched attempt → auto-stop (actor coo
 
       const { rows: allA2 } = await client.query("SELECT id FROM attempts");
       assert.equal(allA2.length, 1, "(rw4b-iv) no replacement attempt after poll 2");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CR-4: onWorkerFinal stopping path honors config.uncertainAfterMs
+// ---------------------------------------------------------------------------
+
+test("flow.stop (CR-4): onWorkerFinal stopping path uses config.uncertainAfterMs (clock-driven)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      let nowMs = Date.now();
+      const clock2 = { now: () => new Date(nowMs).toISOString() };
+      const fake = new FakeExecutionRuntime(() => new Date(nowMs).toISOString());
+      const uncertainAfterMs = 300;
+
+      fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
+      // Worker stays executing so we can manually control state
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // Flow with non-default uncertainAfterMs in config
+      const deps = makeFlowDepsWithClock(pool, fake, clock2);
+      const depsWithUncertain: FlowDeps = {
+        ...deps,
+        config: { ...deps.config, uncertainAfterMs },
+      };
+      const flow = new BoundedRepairFlow(depsWithUncertain);
+
+      const { workerRunId, attemptId } = await setupWorkerRunning(
+        depsWithUncertain,
+        flow,
+        fake,
+        workItemId,
+        client,
+      );
+
+      // Stop the attempt (sets status=stopping, bumps generation)
+      await stopAttempt(
+        { pool, runtime: fake, clock: clock2 },
+        { attemptId, commandId: newId("cmd"), actor: "human", reason: "CR-4 test" },
+      );
+
+      // Manually set the intent's idempotency_key generation to match the new generation
+      // so that onWorkerFinal does NOT classify the observation as stale.
+      // After stop, attempt.generation = 2, so we need intent key :g2.
+      const { rows: intentRows } = await client.query<{ id: string; idempotency_key: string }>(
+        "SELECT id, idempotency_key FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      const intentId = intentRows[0]?.id;
+      const oldKey = intentRows[0]?.idempotency_key ?? "";
+      // Replace :g1 with :g2 in the idempotency key
+      const newKey = oldKey.replace(/:g1$/, ":g2");
+      await client.query("UPDATE dispatch_intents SET idempotency_key = $2 WHERE id = $1", [
+        intentId,
+        newKey,
+      ]);
+
+      // Script the run to return CANCELED; retrieve obs while clock is at t0
+      // so obs.observedAt = new Date(nowMs).toISOString().
+      fake.script(TASK_IDS.workerAttempt, () => ({ status: "CANCELED" }));
+      const canceledObs = await fake.retrieve(workerRunId);
+
+      // Advance clock past deadline BEFORE calling onWorkerFinal.
+      // elapsed = (nowMs + uncertainAfterMs + 100) - nowMs > uncertainAfterMs → uncertain.
+      nowMs += uncertainAfterMs + 100;
+
+      // Single call: elapsed already exceeds deadline → confirmStop returns uncertain.
+      const cmd1 = newId("cmd");
+      await flow.onWorkerFinal(canceledObs, cmd1);
+
+      const { rows: a2 } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(
+        a2[0]?.status,
+        "uncertain",
+        "(CR-4) attempt uncertain after deadline — config.uncertainAfterMs honored",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CR-2: status guard on attempt status update in onWorkerFinal
+// Simulate: stop arrives between applyObservation and the transaction that sets
+// status='completed'. The UPDATE with guard should skip, attempt stays stopping.
+// ---------------------------------------------------------------------------
+
+test("flow.stop (CR-2): stop after observation → onWorkerFinal skips stale status update, attempt stays stopping", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+      const clock2 = { now: () => new Date().toISOString() };
+      const fake = new FakeExecutionRuntime();
+
+      const commitId = "aabbccdd1234567890aabbccdd1234567890aabb";
+
+      fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
+      fake.script(TASK_IDS.workerAttempt, (payload: unknown) => {
+        const p = payload as { attemptId: string };
+        return {
+          status: "COMPLETED",
+          output: workerCompletedOutput(p.attemptId, { commitId }),
+        };
+      });
+
+      const deps = makeFlowDepsWithClock(pool, fake, clock2);
+      const flow = new BoundedRepairFlow(deps);
+
+      const { workerRunId, attemptId } = await setupWorkerRunning(
+        deps,
+        flow,
+        fake,
+        workItemId,
+        client,
+      );
+
+      // Advance worker to COMPLETED
+      fake.advance(workerRunId);
+      fake.advance(workerRunId);
+      const completedObs = await fake.retrieve(workerRunId);
+      assert.equal(completedObs.status, "COMPLETED", "(CR-2) obs is COMPLETED");
+
+      // Apply the observation (records run_observations row)
+      const workerIntentRow = (
+        await client.query<{ id: string; idempotency_key: string }>(
+          "SELECT id, idempotency_key FROM dispatch_intents WHERE task = $1",
+          [TASK_IDS.workerAttempt],
+        )
+      ).rows[0]!;
+      const dispatchedGen = parseInt(workerIntentRow.idempotency_key.match(/:g(\d+)$/)?.[1] ?? "1");
+      const pgClient = (await pool.connect()) as Parameters<typeof applyObservation>[0];
+      try {
+        await applyObservation(pgClient, {
+          runId: workerRunId,
+          generation: dispatchedGen,
+          attemptId,
+          status: completedObs.status,
+          payload: completedObs,
+          observedAt: new Date(completedObs.observedAt),
+        });
+      } finally {
+        pgClient.release();
+      }
+
+      // Now stop the attempt (simulates stop landing between applyObservation and transaction)
+      const stopResult = await stopAttempt(
+        { pool, runtime: fake, clock: clock2 },
+        { attemptId, commandId: newId("cmd"), actor: "human", reason: "CR-2 test" },
+      );
+      assert.equal(stopResult.ok, true, "(CR-2) stop succeeded");
+
+      const { rows: aStopped } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(aStopped[0]?.status, "stopping", "(CR-2) attempt is stopping after stop");
+
+      // Now call onWorkerFinal — the transaction tries to set status='completed'
+      // but the guard (AND status IN ('admitted','dispatched','running')) should block it.
+      const workerFinalCmdId = newId("cmd");
+      await flow.onWorkerFinal(completedObs, workerFinalCmdId);
+
+      // Attempt should still be stopping (not completed), no verify.run triggered
+      const { rows: aFinal } = await client.query<{ status: string }>(
+        "SELECT status FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      // The observation is stale (gen mismatch after stop) so flow exits early via stale check,
+      // OR if generation matches, the status guard prevents overwriting stopping.
+      // Either way, attempt must NOT be 'completed'.
+      assert.notEqual(aFinal[0]?.status, "completed", "(CR-2) attempt must not be completed");
+
+      // No verify.run should have been triggered
+      const verifyTriggers = fake.calls.filter(
+        (c) =>
+          c.method === "trigger" && (c.args[0] as { task: string }).task === TASK_IDS.verifyRun,
+      );
+      assert.equal(verifyTriggers.length, 0, "(CR-2) no verify.run triggered");
     } finally {
       await pool.end();
     }

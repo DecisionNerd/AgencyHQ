@@ -14,6 +14,7 @@ import type {
 } from "../src/app.ts";
 import { createApp } from "../src/app.ts";
 import type { CoordinatorConfig } from "../src/config.ts";
+import { loadConfig } from "../src/config.ts";
 
 // ---------------------------------------------------------------------------
 // Fake dependencies
@@ -33,6 +34,7 @@ function makeConfig(overrides: Partial<CoordinatorConfig> = {}): CoordinatorConf
     freshnessStaleMs: 30000,
     uncertainAfterMs: 120000,
     port: 8787,
+    bindHost: "127.0.0.1",
     ...overrides,
   };
 }
@@ -503,5 +505,103 @@ describe("GET /api/work-items/:id (ledger detail)", () => {
     assert.deepEqual(body.contracts, []);
     assert.deepEqual(body.attempts, []);
     assert.deepEqual(body.decisions, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CR-1: retry_dispatch uses intentId (not workItemId)
+// ---------------------------------------------------------------------------
+
+describe("POST /api/commands kind=retry_dispatch (CR-1)", () => {
+  type RetryFlow = FlowLike & {
+    retryDispatchCalls: Array<{ intentId: string; commandId: string }>;
+  };
+
+  function makeRetryFlow(): RetryFlow {
+    const retryDispatchCalls: Array<{ intentId: string; commandId: string }> = [];
+    return {
+      retryDispatchCalls,
+      async plan(workItemId, commandId) {
+        return { ok: true, intentId: workItemId, runId: "fake-run", commandId };
+      },
+      async retryDispatch(intentId, commandId) {
+        retryDispatchCalls.push({ intentId, commandId });
+        return { runId: "fake-run-2" };
+      },
+    };
+  }
+
+  it("missing intentId returns 400", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeRetryFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commandId: "cmd-rd-1", kind: "retry_dispatch" }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /intentId/);
+  });
+
+  it("retry_dispatch with intentId reaches the flow with that id", async () => {
+    const flow = makeRetryFlow();
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow,
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-rd-2",
+        kind: "retry_dispatch",
+        intentId: "di_abc123",
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(flow.retryDispatchCalls.length, 1);
+    assert.equal(flow.retryDispatchCalls[0]?.intentId, "di_abc123");
+    assert.equal(flow.retryDispatchCalls[0]?.commandId, "cmd-rd-2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CR-3: loadConfig bindHost defaults to 127.0.0.1; overrideable via env
+// ---------------------------------------------------------------------------
+
+describe("loadConfig bindHost (CR-3)", () => {
+  const REQUIRED_ENV = {
+    DATABASE_URL: "postgres://fake/test",
+    RUNTIME: "fake",
+    AGENCYHQ_WORKTREE_BASE: "/worktrees",
+    AGENCYHQ_WORKER_MODEL: "claude-sonnet-4",
+    AGENCYHQ_LEAD_MODEL: "claude-opus-4",
+    AGENCYHQ_REVIEWER_MODEL: "claude-sonnet-4",
+  };
+
+  it("bindHost defaults to 127.0.0.1 when AGENCYHQ_BIND_HOST is not set", () => {
+    const config = loadConfig(REQUIRED_ENV as NodeJS.ProcessEnv);
+    assert.equal(config.bindHost, "127.0.0.1");
+  });
+
+  it("bindHost reads from AGENCYHQ_BIND_HOST env var", () => {
+    const config = loadConfig({
+      ...REQUIRED_ENV,
+      AGENCYHQ_BIND_HOST: "0.0.0.0",
+    } as NodeJS.ProcessEnv);
+    assert.equal(config.bindHost, "0.0.0.0");
   });
 });

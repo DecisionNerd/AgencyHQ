@@ -31,6 +31,8 @@ export interface FlowConfig {
   reviewerModel: string;
   verifierName: string;
   leadVariant?: string | undefined;
+  /** Milliseconds before a stop without evidence is classified uncertain. */
+  uncertainAfterMs?: number | undefined;
 }
 
 // ---------------------------------------------------------------------------

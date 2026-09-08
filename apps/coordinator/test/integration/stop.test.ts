@@ -561,3 +561,118 @@ test("stop: command replay returns stored result with replayed: true", async (t)
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// H-5: runtime.cancel throws → attempt still gets stopping status, command
+// completed with cancelSkipped:true
+// ---------------------------------------------------------------------------
+
+test("stop (H-5): runtime.cancel throws → generation revoked, attempt stopping, command cancelSkipped", async (t) => {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(url, ctx.schema);
+    try {
+      const { attemptId } = await seedAttempt(ctx, { status: "running", generation: 1 });
+
+      const cancelError = new Error("run already finalized");
+      const throwingRuntime: FakeRuntime = {
+        ...new FakeRuntime(),
+        calls: [],
+        cancel: async (_runId: string) => {
+          throw cancelError;
+        },
+        trigger: new FakeRuntime().trigger.bind(new FakeRuntime()),
+        retrieve: new FakeRuntime().retrieve.bind(new FakeRuntime()),
+        createPublicToken: new FakeRuntime().createPublicToken.bind(new FakeRuntime()),
+      };
+
+      const deps = makeDeps(pool, throwingRuntime);
+      const commandId = `cmd-h5-${randomUUID()}`;
+
+      const result = await stopAttempt(deps, {
+        commandId,
+        attemptId,
+        actor: "coordinator",
+        reason: "H-5 cancel-throws test",
+      });
+
+      // Return value must be ok:true (generation was revoked before cancel)
+      assert.ok(result.ok, `Expected ok=true; got: ${JSON.stringify(result)}`);
+
+      // Attempt must be stopping (generation revoked before cancel threw)
+      const { rows: attemptRows } = await ctx.client.query<{ status: string; generation: number }>(
+        "SELECT status, generation FROM attempts WHERE id = $1",
+        [attemptId],
+      );
+      assert.equal(attemptRows[0]?.status, "stopping", "(H-5) attempt status is stopping");
+      assert.equal(attemptRows[0]?.generation, 2, "(H-5) generation bumped to 2");
+
+      // Command row must be completed with cancelSkipped:true
+      const { rows: cmdRows } = await ctx.client.query<{ result: Record<string, unknown> }>(
+        "SELECT result FROM commands WHERE command_id = $1",
+        [commandId],
+      );
+      assert.ok(cmdRows.length > 0, "(H-5) command row exists");
+      const stored = cmdRows[0]?.result ?? {};
+      assert.equal(stored["cancelSkipped"], true, "(H-5) cancelSkipped:true in command result");
+      assert.ok(typeof stored["reason"] === "string", "(H-5) reason string present");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("stop (H-5): cancel-throws result is replayed correctly on second call", async (t) => {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(url, ctx.schema);
+    try {
+      const { attemptId } = await seedAttempt(ctx, { status: "running", generation: 1 });
+
+      const throwingRuntime: FakeRuntime = {
+        ...new FakeRuntime(),
+        calls: [],
+        cancel: async (_runId: string) => {
+          throw new Error("always fails");
+        },
+        trigger: new FakeRuntime().trigger.bind(new FakeRuntime()),
+        retrieve: new FakeRuntime().retrieve.bind(new FakeRuntime()),
+        createPublicToken: new FakeRuntime().createPublicToken.bind(new FakeRuntime()),
+      };
+
+      const deps = makeDeps(pool, throwingRuntime);
+      const commandId = `cmd-h5-replay-${randomUUID()}`;
+
+      // First call → cancel throws, command completed with cancelSkipped
+      const first = await stopAttempt(deps, {
+        commandId,
+        attemptId,
+        actor: "coordinator",
+        reason: "H-5 replay test",
+      });
+      assert.ok(first.ok, "first call ok:true");
+
+      // Second call with same commandId → replayed from stored result
+      const second = await stopAttempt(deps, {
+        commandId,
+        attemptId,
+        actor: "coordinator",
+        reason: "H-5 replay test",
+      });
+      assert.ok(second.ok, "replay ok:true");
+      assert.equal(second.replayed, true, "(H-5) second call replayed:true");
+    } finally {
+      await pool.end();
+    }
+  });
+});

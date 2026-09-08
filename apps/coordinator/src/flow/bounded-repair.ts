@@ -746,7 +746,14 @@ export class BoundedRepairFlow {
       // F-2: CANCELED/TIMED_OUT when a stop was requested → call confirmStop;
       // never dispatch a replacement on this path.
       if (classification.attemptStatus === "stopping") {
-        const commandDeps: CommandDeps = { pool, runtime, clock: this.deps.clock };
+        const commandDeps: CommandDeps = {
+          pool,
+          runtime,
+          clock: this.deps.clock,
+          ...(config.uncertainAfterMs !== undefined
+            ? { config: { uncertainAfterMs: config.uncertainAfterMs } }
+            : {}),
+        };
         const csResult = await confirmStop(commandDeps, client, {
           attemptId: attemptRow.id,
           generation: attemptRow.generation,
@@ -807,10 +814,15 @@ export class BoundedRepairFlow {
               "worker completed without a commit (null commitId — no artifact)",
             ],
           );
-          await client.query(
-            "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1",
+          const { rowCount: nullCommitFailedRows } = await client.query(
+            "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1 AND status IN ('admitted','dispatched','running')",
             [attemptRow.id, String(failureId)],
           );
+          if (!nullCommitFailedRows) {
+            await client.query("ROLLBACK");
+            await completeCommand(client, commandId, { skipped: "stale_status" });
+            return;
+          }
           // Close the incoming worker intent (F-5).
           await client.query(
             "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
@@ -842,11 +854,11 @@ export class BoundedRepairFlow {
             JSON.stringify(output.changedPaths),
           ],
         );
-        await client.query(
+        const { rowCount: completedRows } = await client.query(
           `UPDATE attempts
            SET status = 'completed', commit_sha = $2, diff_digest = $3,
                worktree_path = $4, session_id = $5, updated_at = now()
-           WHERE id = $1`,
+           WHERE id = $1 AND status IN ('admitted','dispatched','running')`,
           [
             attemptRow.id,
             output.commitId,
@@ -855,6 +867,13 @@ export class BoundedRepairFlow {
             output.opencode.sessionID,
           ],
         );
+
+        if (!completedRows) {
+          // A stop landed between applyObservation and here — stale skip.
+          await client.query("ROLLBACK");
+          await completeCommand(client, commandId, { skipped: "stale_status" });
+          return;
+        }
 
         const verifyIntentId = ids.next("di") as DispatchIntentId;
         const verifyPayload = VerifyRunPayloadSchema.parse({
@@ -953,10 +972,16 @@ export class BoundedRepairFlow {
           );
         }
 
-        await client.query(
-          `UPDATE attempts SET status = 'quarantined', failure_id = $2, updated_at = now() WHERE id = $1`,
+        const { rowCount: quarantinedRows } = await client.query(
+          `UPDATE attempts SET status = 'quarantined', failure_id = $2, updated_at = now() WHERE id = $1 AND status IN ('admitted','dispatched','running')`,
           [attemptRow.id, String(failureId)],
         );
+
+        if (!quarantinedRows) {
+          await client.query("ROLLBACK");
+          await completeCommand(client, commandId, { skipped: "stale_status" });
+          return;
+        }
 
         // Close the incoming worker intent (F-5).
         await client.query(
@@ -990,11 +1015,22 @@ export class BoundedRepairFlow {
         // New attempt starts at generation 1; encode it in the idempotency key (F-2).
         const newIntentKey = `${String(newIntentId)}:g1`;
 
+        const retryFailureId = ids.next("fail") as FailureId;
         await client.query("BEGIN");
         await client.query(
-          "UPDATE attempts SET status = 'failed', updated_at = now() WHERE id = $1",
-          [attemptRow.id],
+          `INSERT INTO failures (id, class, phase, attempt_id, run_id, cause)
+           VALUES ($1, 'execution', 'final', $2, $3, $4)`,
+          [String(retryFailureId), attemptRow.id, obs.runId, obs.status],
         );
+        const { rowCount: retryFailedRows } = await client.query(
+          "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1 AND status IN ('admitted','dispatched','running')",
+          [attemptRow.id, String(retryFailureId)],
+        );
+        if (!retryFailedRows) {
+          await client.query("ROLLBACK");
+          await completeCommand(client, commandId, { skipped: "stale_status" });
+          return;
+        }
         await client.query(
           `INSERT INTO attempts
              (id, contract_id, contract_version, generation, status, budget_remaining)
@@ -1066,10 +1102,15 @@ export class BoundedRepairFlow {
             classification.reason,
           ],
         );
-        await client.query(
-          "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1",
+        const { rowCount: failedRows } = await client.query(
+          "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1 AND status IN ('admitted','dispatched','running')",
           [attemptRow.id, String(failureId)],
         );
+        if (!failedRows) {
+          await client.query("ROLLBACK");
+          await completeCommand(client, commandId, { skipped: "stale_status" });
+          return;
+        }
         // Close the incoming worker intent (F-5).
         await client.query(
           "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",

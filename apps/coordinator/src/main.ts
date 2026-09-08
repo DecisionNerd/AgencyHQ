@@ -85,6 +85,7 @@ const flowDeps: FlowDeps = {
     reviewerModel: config.reviewerModel,
     verifierName: "agencyhq/verify.run",
     leadVariant: config.leadVariant,
+    uncertainAfterMs: config.uncertainAfterMs,
   },
   profileResolver,
 };
@@ -117,12 +118,13 @@ const app = createApp({
 const server = serve({
   fetch: app.fetch,
   port: config.port,
+  hostname: config.bindHost,
 });
 
 // Log startup facts (no secrets)
 const webDistPresent = config.webDist !== undefined && existsSync(config.webDist);
 console.log(
-  `Coordinator listening on port ${String(config.port)} runtime=${config.runtime} webDist=${webDistPresent ? config.webDist : "none"}`,
+  `Coordinator listening on ${config.bindHost}:${String(config.port)} runtime=${config.runtime} webDist=${webDistPresent ? config.webDist : "none"}`,
 );
 
 // Graceful shutdown on SIGTERM and SIGINT

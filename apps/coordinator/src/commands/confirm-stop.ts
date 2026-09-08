@@ -54,11 +54,22 @@ export async function readStopEvidence(runDir: string): Promise<StopFileEvidence
     if (typeof parsed !== "object" || parsed === null) continue;
 
     const record = parsed as Record<string, unknown>;
-    if (record.event === "stop_done" && Array.isArray(record.survivors)) {
+    // Accept `step` (adapter format) or legacy `event` key.
+    const eventKey = typeof record.step === "string" ? record.step : record.event;
+    if (eventKey === "stop_done" && Array.isArray(record.survivors)) {
       stopDone = { survivors: record.survivors as number[] };
     }
-    if (record.event === "checkpoint" && typeof record.commit === "string") {
-      checkpointCommit = record.commit;
+    if (eventKey === "checkpoint") {
+      // Accept `checkpointCommit` (adapter format) or legacy `commit` key.
+      const commit =
+        typeof record.checkpointCommit === "string"
+          ? record.checkpointCommit
+          : typeof record.commit === "string"
+            ? record.commit
+            : undefined;
+      if (commit !== undefined) {
+        checkpointCommit = commit;
+      }
     }
   }
 
