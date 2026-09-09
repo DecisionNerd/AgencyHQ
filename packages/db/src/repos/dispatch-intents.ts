@@ -211,6 +211,49 @@ export async function listActiveAttemptsForScheduling(
 }
 
 /**
+ * Per-project count of "active" attempts using the same rule as the scheduler
+ * (listActiveAttemptsForScheduling).  Used by the overview API so the UI's
+ * active-attempt indicator is consistent with what the scheduler considers busy.
+ *
+ * An attempt is active when:
+ *   (a) its status is 'stopping', OR
+ *   (b) its status is 'dispatched'|'running' AND there is an open
+ *       worker.attempt dispatch intent (status='triggered').
+ *
+ * Terminal work item lifecycles (halted, completed, done) are excluded.
+ */
+export type ActiveAttemptCountByProject = {
+  project_id: string;
+  count: number;
+};
+
+export async function listActiveAttemptCountsPerProject(
+  client: pg.PoolClient,
+): Promise<ActiveAttemptCountByProject[]> {
+  const { rows } = await client.query<{ project_id: string; cnt: string }>(
+    `SELECT sc.project_id, COUNT(*) AS cnt
+     FROM attempts a
+     JOIN step_contracts sc ON sc.id = a.contract_id
+     JOIN work_items wi      ON wi.id = sc.work_item_id
+     WHERE wi.lifecycle NOT IN ('halted', 'completed', 'done')
+       AND (
+         a.status = 'stopping'
+         OR (
+           a.status IN ('dispatched', 'running')
+           AND EXISTS (
+             SELECT 1 FROM dispatch_intents di
+             WHERE di.attempt_id = a.id
+               AND di.task       = 'worker.attempt'
+               AND di.status     = 'triggered'
+           )
+         )
+       )
+     GROUP BY sc.project_id`,
+  );
+  return rows.map((r) => ({ project_id: r.project_id, count: Number(r.cnt) }));
+}
+
+/**
  * Transition a dispatch intent's status.
  * Uses optimistic concurrency: WHERE id = $1 AND status = $2.
  * On 0 rows updated returns { ok: false, reason: "state_mismatch" }.

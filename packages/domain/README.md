@@ -65,6 +65,8 @@ repository or exhausted slots — the UI always shows the correct main effort.
 
 `activeByProvider: Record<string, number>` counts active attempts per provider before this pass. The combined count (active + chosen this pass) never exceeds `concurrencyFor`. Observations past their `validUntil` are treated as `unknown` (conservative stale handling, R-008/Slice 6).
 
+**Provider gate caveat**: the gate runs only when `providerCapacity.length > 0`. With an empty `provider_capacity` table the gate is skipped entirely — all items are unconstrained by it. Once any row exists (for any provider), a missing or expired observation for a specific `provider`/`model` pair yields `unknown` → concurrency 1. Live evidence: T1 concurrent workers (run_cmtt6e0rj / run_cmtt6evmq, 21:23:08–21:23:14Z) ran with an empty table (first `set_capacity` at 21:25:14Z); K7 hit `provider_unknown` after the operator row expired at 21:44Z (22:08Z, coordinator restart log).
+
 The function is pure (no I/O) and deterministic (ties broken by `id` ascending).
 ## Authority
 

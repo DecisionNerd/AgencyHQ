@@ -116,10 +116,7 @@ Owns the ledger and the policy:
   Artifacts, VerificationResults, Reviews, and failure records;
 - commits Lead proposals as Decisions only when they pass the authority check;
 - holds the Trigger secret key and AgencyHQ's own secrets;
-- runs a batch scheduler on every polling pass: `selectDispatch` selects the
-  highest-ranked eligible work items up to `AGENCYHQ_WORKER_SLOTS`, deducting
-  active attempts (dispatched, running, or stopping — `listActiveAttemptsForScheduling`)
-  and applying provider capacity gating before the slot gate;
+- on admission records the worker intent as `queued` and immediately runs the scheduling pass itself (`scheduleQueuedIntents` in `apps/coordinator/src/flow/schedule.ts`, the same pass the reconciler runs on every poll), applying every gate at admission time; runs the same `selectDispatch` on every polling pass: `selectDispatch` selects the highest-ranked eligible work items up to `AGENCYHQ_WORKER_SLOTS`, deducting active attempts (attempts in `stopping` status or with an in-flight `worker.attempt` intent, whose work item is not halted/completed/done — `listActiveAttemptsForScheduling`) and applying provider capacity gating before the slot gate; the provider gate is skipped entirely when the `provider_capacity` table is empty;
 - when `AGENCYHQ_REALTIME_WAKEUP=true`, subscribes to `runs.subscribeToRunsWithTag`
   for the tags of all non-terminal work items; the subscription refreshes after every
   poll and resubscribes when the tag set changes (observed 2026-09-08, `@trigger.dev/sdk` 4.5.16:
@@ -196,17 +193,17 @@ host profile and does not cause R-016 rejection; only contracts that enable
 
 | Boundary | Host profile | Kind | Container profile |
 | --- | --- | --- | --- |
-| Worktree per attempt | Separate `git worktree` folder; never shared with a replacement. | Before action | Fresh clone per container. |
+| Worktree per attempt | Separate `git worktree` folder; never shared with a replacement. | Before action | Fresh clone per container. not observed (no clone-from-remote step exists). |
 | Filesystem isolation from the host | None; the worker can read host files. | Advisory | Container filesystem. spike-observed (2026-09-08): cwd /app, no host paths visible. |
-| CPU, memory | None. | Advisory | Machine preset. |
-| Duration | Trigger `maxDuration` from the contract. | Before action | Same. |
-| Tool and command capability | OpenCode permission rules generated from the contract; `deny` survives `--auto`. | Before action | Same. |
-| Output paths | Adapter diff check against `paths.allow/deny`; violations quarantine the attempt. | On output | Same. |
-| Git pushes from the worker | Scrubbed child environment (no SSH agent, no tokens, empty credential helper) plus `deny` on `git push`/`git remote`. | Before action | No credential exists. spike-observed (2026-09-08): env = TRIGGER_*/OTEL_*/NODE_* only; SSH agent and git credential helper absent. |
-| Merge, deploy, publish | Only `integrate.merge`, after acceptance, serialized, compare-and-set. | Before action | Same, with operation-scoped token. |
-| Termination | Generation revoked → `runs.cancel` → `onCancel` checkpoint commit and process-group kill → adapter confirms no survivors → Trigger final status. | Trusted observation | Supervisor removes the container. |
-| Egress and provider spend | None; spend is an estimate. | Advisory | Gateway with per-attempt keys (deferred; evidence requirement: ADR plus measured spend baseline). |
-| Nested agents | OpenCode `task` tool denied for worker agents. | Before action | Same. |
+| CPU, memory | None. | Advisory | Machine preset. not observed. |
+| Duration | Trigger `maxDuration` from the contract. | Before action | Same. not observed. |
+| Tool and command capability | OpenCode permission rules generated from the contract; `deny` survives `--auto`. | Before action | Same. not observed. |
+| Output paths | Adapter diff check against `paths.allow/deny`; violations quarantine the attempt. | On output | Same. not observed. |
+| Git pushes from the worker | Scrubbed child environment (no SSH agent, no tokens, empty credential helper) plus `deny` on `git push`/`git remote`. | Before action | No credential exists. spike-observed (2026-09-08): env = TRIGGER_*/OTEL_*/NODE_* only; SSH_AUTH_SOCK and GIT_* credential helper variables not present in the environment. |
+| Merge, deploy, publish | Only `integrate.merge`, after acceptance, serialized, compare-and-set. | Before action | Same, with operation-scoped token. not observed. |
+| Termination | Generation revoked → `runs.cancel` → `onCancel` checkpoint commit and process-group kill → adapter confirms no survivors → Trigger final status. | Trusted observation | Supervisor removes the container. not observed (DOCKER_AUTOREMOVE_EXITED_CONTAINERS=0 was set; the exited container remained). |
+| Egress and provider spend | None; spend is an estimate. | Advisory | Gateway with per-attempt keys (deferred; evidence requirement: ADR plus measured spend baseline). not observed. |
+| Nested agents | OpenCode `task` tool denied for worker agents. | Before action | Same. not observed. |
 
 ## Dependency rule
 
@@ -236,9 +233,10 @@ user-approved temporary TCP forwarder, `trigger deploy --local-build`
 succeeded: version 20260908.2, 7 tasks, image 238.78 MB pushed to the bundled
 registry. `spike.echo` run run_cmtt9txxd00hl3qp3tygv0v2k ran inside a
 container (DEQUEUED 22:58:53Z, COMPLETED 22:59:02Z; exited 0). Inside the
-container: no host filesystem access (cwd /app), no host environment or
-secrets (spike-observed 2026-09-08), no SSH agent or git credential helper
-(spike-observed 2026-09-08), git 2.39.5 present. OpenCode binary not on PATH
+container spike-observed (2026-09-08): cwd /app, no host paths visible;
+environment limited to TRIGGER_*/OTEL_*/NODE_* keys (SSH_AUTH_SOCK and GIT_*
+credential helper variables not present in the environment); git 2.39.5
+present. OpenCode binary not on PATH
 (build-extension gap — `additionalPackages` installs into /app/node_modules
 but does not add the binary to PATH); `worker.attempt` was not attempted in a
 container. See [trials/2026-09-slice6.md](trials/2026-09-slice6.md).

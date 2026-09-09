@@ -83,6 +83,7 @@ import type pg from "pg";
 
 import { deriveTargetRef } from "./integrate.ts";
 import { buildLeadPlanIntent } from "./payloads.ts";
+import { scheduleQueuedIntents } from "./schedule.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -864,7 +865,7 @@ export class BoundedRepairFlow {
     output: LeadPlanOutput,
     commandId: string,
   ): Promise<void> {
-    const { pool, runtime, ids, config, profile, profileResolver } = this.deps;
+    const { pool, ids, config, profile, profileResolver } = this.deps;
 
     // Captured early so the catch block can record a recovery decision (Defect 4).
     let recoveryWorkItemId: string | null = null;
@@ -1226,69 +1227,29 @@ export class BoundedRepairFlow {
 
       await client.query("COMMIT");
 
-      // Slot check: count active worker attempts to decide whether to dispatch
-      // immediately or queue for the scheduler (R-008, Slice 6).
-      // The check is outside the transaction — the scheduler handles races via
-      // the in-flight guard and idempotency key.
-      const workerSlots = config.workerSlots ?? 1;
-      const { rows: slotRows } = await pool.query<{ cnt: string }>(
-        `SELECT COUNT(*) AS cnt FROM attempts WHERE status IN ('dispatched', 'running', 'stopping')`,
+      // Always queue: let scheduleQueuedIntents() apply all gates (provider capacity,
+      // repository busy, slot count) — the same code path as the normal poll
+      // (R-008).  A free, unconstrained slot still dispatches immediately
+      // because scheduleQueuedIntents() is called directly after queuing.
+      await pool.query(
+        "UPDATE dispatch_intents SET status = 'queued', updated_at = now() WHERE id = $1",
+        [String(workerIntentId)],
       );
-      const activeCount = Number(slotRows[0]?.cnt ?? 0);
 
-      if (activeCount < workerSlots) {
-        // Slot available: dispatch immediately (R-002 path).
-        // Trigger AFTER commit (R-002)
-        const { runId } = await runtime.trigger({
-          intentId: workerIntentId,
-          task: TASK_IDS.workerAttempt,
-          payload: workerPayload,
-          options: {
-            idempotencyKey: workerIntentKey,
-            maxDurationSeconds: contract.bounds.budget.maxDurationSeconds,
-            concurrencyKey: String(contract.projectId),
-            tags: triggerTags({
-              projectId: String(contract.projectId),
-              workItemId: String(contract.workItemId),
-              contractId: String(contractId),
-              contractVersion: contract.version,
-              attemptId: String(attemptId),
-            }),
-          },
-        });
+      await completeCommand(client, commandId, {
+        decisionId: String(decisionId),
+        contractId: String(contractId),
+        attemptId: String(attemptId),
+        workerIntentId: String(workerIntentId),
+        queued: true,
+      });
 
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-          [String(workerIntentId), runId],
-        );
-        await pool.query(
-          "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",
-          [String(attemptId), runId],
-        );
-
-        await completeCommand(client, commandId, {
-          decisionId: String(decisionId),
-          contractId: String(contractId),
-          attemptId: String(attemptId),
-          workerIntentId: String(workerIntentId),
-          runId,
-        });
-      } else {
-        // No slot: move the intent to 'queued' so the scheduler can dispatch it
-        // when a slot becomes free.  The attempt stays 'admitted'.
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'queued', updated_at = now() WHERE id = $1",
-          [String(workerIntentId)],
-        );
-
-        await completeCommand(client, commandId, {
-          decisionId: String(decisionId),
-          contractId: String(contractId),
-          attemptId: String(attemptId),
-          workerIntentId: String(workerIntentId),
-          queued: true,
-        });
-      }
+      // Immediately run a scheduling pass so a free slot dispatches without
+      // waiting for the next poll interval. All gates (provider capacity,
+      // repository busy, slot count) apply here too — R-008.
+      // Errors propagate to the outer catch so Defect-4 recovery records
+      // a failure row and parks the work item pending_human.
+      await scheduleQueuedIntents(this.deps, (id) => this.retryDispatch(id));
     } catch (err) {
       // Rollback any open transaction.
       try {

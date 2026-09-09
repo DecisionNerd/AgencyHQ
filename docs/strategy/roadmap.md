@@ -147,13 +147,7 @@ on it.
   with pinned Git and OpenCode, API-key providers, generation-bound push
   tokens; then a model gateway with per-attempt keys, upgrading isolation,
   egress, and spend from advisory to enforced.
-- Outcome (2026-09-08): batch scheduler (`selectDispatch`) wired into the
-  coordinator polling loop; `AGENCYHQ_WORKER_SLOTS` environment limit; per-pass
-  slot counting deducts active attempts (dispatched, running, or stopping —
-  `listActiveAttemptsForScheduling`); repository serialization release point
-  confirmed as worker-run completion; provider capacity gate (`ProviderCapacity`
-  aggregate with conservative stale handling) precedes the slot gate in
-  `selectDispatch`; operator `set_capacity` command and `/api/capacity` route;
+- Outcome (2026-09-08): admission records the worker intent as `queued` and immediately runs the scheduling pass (`scheduleQueuedIntents`, shared with the reconciler), applying every gate at admission time; batch scheduler (`selectDispatch`) wired into the coordinator polling loop; `AGENCYHQ_WORKER_SLOTS` environment limit; per-pass slot counting deducts active attempts (attempts in `stopping` status or with an in-flight `worker.attempt` intent, whose work item is not halted/completed/done — `listActiveAttemptsForScheduling`); the overview uses `listActiveAttemptCountsPerProject` with the same rule; repository serialization release point confirmed as worker-run completion; provider capacity gate (`ProviderCapacity` aggregate with conservative stale handling) precedes the slot gate in `selectDispatch`; gate skipped entirely when the `provider_capacity` table is empty (unconstrained); operator `set_capacity` command and `/api/capacity` route;
   Lead quality metrics via `lead_metrics` SQL view and `/api/metrics/lead` route;
   `AGENCYHQ_REALTIME_WAKEUP` subscription follows non-terminal work items and
   resubscribes on change; v2 verification profiles (`node-pnpm-v2`,
@@ -162,9 +156,10 @@ on it.
   to the trigger.dev platform; with a user-approved TCP forwarder the image
   built (238.78 MB, linux/amd64) and was pushed to the bundled registry;
   `spike.echo` ran in a container (run_cmtt9txxd00hl3qp3tygv0v2k, COMPLETED
-  22:59:02Z); enforcement observed: no host filesystem access, no host
-  environment or secrets, no SSH agent or credential helper; `worker.attempt`
-  not attempted (OpenCode binary not on PATH — build-extension gap).
+  22:59:02Z); spike-observed: cwd /app, no host paths in the environment;
+  environment limited to TRIGGER_*/OTEL_*/NODE_* keys (SSH_AUTH_SOCK and GIT_*
+  credential helper variables not present); git 2.39.5 present; OpenCode not on PATH
+  (build-extension gap); `worker.attempt` not attempted.
   Multi-machine, generation-bound push tokens, and model gateway are deferred
   with evidence requirements.
   Full record: [trials/2026-09-slice6.md](../engineering/trials/2026-09-slice6.md).

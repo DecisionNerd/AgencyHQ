@@ -12,6 +12,7 @@ import {
   completeCommand,
   getWorkItem,
   leadMetrics,
+  listActiveAttemptCountsPerProject,
   listAttemptsByContract,
   listCurrentCapacity,
   listDecisionsByWorkItem,
@@ -742,18 +743,12 @@ export function createApp(deps: AppDeps): Hono {
         }
       }
 
-      // Load active attempt counts per project.
-      const { rows: activeAttemptCountRowsRaw } = await client.query(
-        `SELECT sc.project_id, COUNT(*) AS cnt
-         FROM attempts a
-         JOIN step_contracts sc ON sc.id = a.contract_id
-         WHERE a.status IN ('dispatched', 'running', 'stopping')
-         GROUP BY sc.project_id`,
+      // Load active attempt counts per project using the same rule as the scheduler
+      // (listActiveAttemptsForScheduling) so the UI and the scheduler agree on what
+      // counts as "active" (F8 fix: was using the raw status rule).
+      const activeAttemptCountRows = await listActiveAttemptCountsPerProject(
+        client as Parameters<typeof listActiveAttemptCountsPerProject>[0],
       );
-      const activeAttemptCountRows = activeAttemptCountRowsRaw as Array<{
-        project_id: string;
-        cnt: string;
-      }>;
 
       // Load current capacity for the overview summary.
       const pgClient2 = client as Parameters<typeof listCurrentCapacity>[0];
@@ -809,7 +804,7 @@ export function createApp(deps: AppDeps): Hono {
         })),
         activeAttempts: activeAttemptCountRows.map((r) => ({
           projectId: r.project_id,
-          count: Number(r.cnt),
+          count: r.count,
         })),
         capacity: overviewCapacity,
       });

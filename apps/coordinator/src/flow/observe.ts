@@ -16,28 +16,16 @@
 
 import type { LeadPlanOutput } from "@agencyhq/contracts";
 import { LeadPlanOutputSchema, TASK_IDS } from "@agencyhq/contracts";
-import {
-  applyObservation,
-  listActiveAttemptsForScheduling,
-  listCurrentCapacity,
-  listOpenDispatchIntents,
-  listQueuedWorkerIntents,
-  recordCapacity,
-} from "@agencyhq/db";
+import { applyObservation, listOpenDispatchIntents, recordCapacity } from "@agencyhq/db";
 import type { CommandId, RunObservation } from "@agencyhq/domain";
-import {
-  effectiveCapacity,
-  FINAL_RUN_STATUSES,
-  type SkipReason,
-  selectDispatch,
-} from "@agencyhq/domain";
+import { effectiveCapacity, FINAL_RUN_STATUSES } from "@agencyhq/domain";
 import type pg from "pg";
-
 import { confirmStop, readStopEvidence } from "../commands/confirm-stop.ts";
 import { stopAttempt } from "../commands/stop.ts";
 import type { BoundedRepairFlow, LeadHandlerResult } from "./bounded-repair.ts";
 import { generationOfIntent as getIntentGen } from "./bounded-repair.ts";
 import { onIntegrateFinal } from "./integrate.ts";
+import { scheduleQueuedIntents } from "./schedule.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -54,8 +42,6 @@ export class Reconciler {
   private _polling = false;
   /** Passed to confirmStop as config.uncertainAfterMs. */
   private readonly _uncertainAfterMs: number | undefined;
-  /** Worker slot count for the scheduler (Design 1). */
-  private readonly _workerSlots: number;
   /** Whether realtime wake-up is enabled (Design 3). */
   private readonly _realtimeWakeup: boolean;
   /** AbortController for the overall wake-up lifecycle (Design 3). */
@@ -75,7 +61,6 @@ export class Reconciler {
     this.deps = deps;
     this.flow = flow;
     this._uncertainAfterMs = options?.uncertainAfterMs;
-    this._workerSlots = options?.workerSlots ?? deps.config.workerSlots ?? 1;
     this._realtimeWakeup = options?.realtimeWakeup ?? false;
   }
 
@@ -296,155 +281,12 @@ export class Reconciler {
    * Protected by the pollOnce() in-flight guard — never concurrent.
    */
   async scheduleOnce(): Promise<void> {
-    const { pool } = this.deps;
-    const client = await pool.connect();
     try {
-      // 1. Load queued intents with their work item data.
-      const queuedIntents = await listQueuedWorkerIntents(client);
-      if (queuedIntents.length === 0) return;
-
-      // 2. Load active attempts for slot + repo counting.
-      //    An attempt is active only when a worker process is or may be running:
-      //    status='stopping' (always), or status IN ('dispatched','running') with
-      //    an open worker.attempt intent (status='triggered').  Attempts whose only
-      //    open intents are verify/review/accept runs are NOT counted — no worker
-      //    process exists and holding slots/busyRepos for them blocks legitimate work
-      //    (observed live: 33 stale 'dispatched' rows with only lead.review/accept
-      //    intents filled all slots with AGENCYHQ_WORKER_SLOTS=1).
-      //    Terminal work item lifecycles (halted, completed, done) are also excluded.
-      const activeRows = await listActiveAttemptsForScheduling(client);
-
-      // 3. Load current provider capacity.
-      const capacityRows = await listCurrentCapacity(client, new Date());
-
-      // 4. Load campaigns for main-effort ordering.
-      const { rows: campaignRows } = await client.query<{
-        id: string;
-        main_effort_work_item_id: string | null;
-      }>(`SELECT id, main_effort_work_item_id FROM campaigns`);
-      const mainEffortByCampaign: Record<string, string> = {};
-      for (const c of campaignRows) {
-        if (c.main_effort_work_item_id) {
-          mainEffortByCampaign[c.id] = c.main_effort_work_item_id;
-        }
-      }
-
-      // 5. Derive uncertain repositories from work items with condition='uncertain'.
-      const { rows: uncertainRows } = await client.query<{ project_id: string }>(
-        `SELECT DISTINCT sc.project_id FROM work_items wi
-         JOIN step_contracts sc ON sc.work_item_id = wi.id
-         WHERE wi.condition = 'uncertain'`,
-      );
-      const uncertainRepositories = uncertainRows.map((r) => r.project_id);
-
-      // 6. Build WorkItemLike[] from queued intents.
-      const workItems = queuedIntents.map((row) => {
-        const bounds = row.bounds as {
-          models?: { worker?: string };
-        };
-        const workerModel = bounds.models?.worker;
-        let provider: string | undefined;
-        let model: string | undefined;
-        if (workerModel && workerModel.includes("/")) {
-          const slashIdx = workerModel.indexOf("/");
-          provider = workerModel.slice(0, slashIdx);
-          model = workerModel.slice(slashIdx + 1);
-        }
-        const item: import("@agencyhq/domain").WorkItemLike = {
-          id: row.work_item_id,
-          projectId: row.project_id,
-          repositoryId: row.project_id,
-          rank: row.wi_rank,
-          lifecycle: row.wi_lifecycle as
-            | "proposed"
-            | "admitted"
-            | "active"
-            | "completed"
-            | "halted"
-            | "reopened",
-          condition: row.wi_condition as "healthy" | "blocked" | "uncertain",
-          mainEffort: row.wi_main_effort,
-          hasOpenIntegrateIntent: row.has_open_integrate_intent,
-        };
-        if (row.wi_campaign_id !== null) item.campaignId = row.wi_campaign_id;
-        if (row.wi_created_at instanceof Date) item.createdAt = row.wi_created_at.toISOString();
-        if (provider !== undefined) item.provider = provider;
-        if (model !== undefined) item.model = model;
-        return item;
-      });
-
-      // 7. Build ActiveAttemptLike[] and activeByProvider from active rows.
-      const activeAttempts = activeRows.map((r) => ({
-        workItemId: r.work_item_id,
-        repositoryId: r.project_id,
-        status: r.status,
-      }));
-      const activeByProvider: Record<string, number> = {};
-      for (const a of activeRows) {
-        const bds = a.bounds as { models?: { worker?: string } };
-        const wm = bds.models?.worker;
-        if (wm && wm.includes("/")) {
-          const p = wm.slice(0, wm.indexOf("/"));
-          activeByProvider[p] = (activeByProvider[p] ?? 0) + 1;
-        }
-      }
-
-      // 8. Convert capacity rows to domain format.
-      const providerCapacity = capacityRows.map((r) => ({
-        provider: r.provider,
-        model: r.model,
-        status: r.status,
-        observedAt: r.observed_at.toISOString(),
-        validUntil: r.valid_until.toISOString(),
-        source: r.source,
-      }));
-
-      // 9. Run selectDispatch.
-      const now = new Date().toISOString();
-      const result = selectDispatch({
-        workItems,
-        activeAttempts,
-        slots: this._workerSlots,
-        uncertainRepositories,
-        mainEffortByCampaign,
-        providerCapacity,
-        now,
-        activeByProvider,
-      });
-
-      // Build map from workItemId → queued intent id.
-      const intentByWorkItem = new Map<string, string>();
-      for (const row of queuedIntents) {
-        intentByWorkItem.set(row.work_item_id, row.intent_id);
-      }
-
-      // 10. Dispatch chosen items.
-      for (const item of result.dispatch) {
-        const intentId = intentByWorkItem.get(item.workItemId);
-        if (!intentId) continue;
-        try {
-          await this.flow.retryDispatch(intentId);
-        } catch (err) {
-          console.error("[scheduler] retryDispatch failed", intentId, err);
-        }
-      }
-
-      // 11. Record skip_reason for skipped items.
-      for (const skipped of result.skipped) {
-        const intentId = intentByWorkItem.get(skipped.workItemId);
-        if (!intentId) continue;
-        // Only update if still queued (avoid overwriting a concurrent dispatch).
-        await client.query(
-          `UPDATE dispatch_intents
-           SET skip_reason = $2, updated_at = now()
-           WHERE id = $1 AND status = 'queued'`,
-          [intentId, skipped.reason],
-        );
-      }
+      await scheduleQueuedIntents(this.deps, (id) => this.flow.retryDispatch(id));
     } catch (err) {
+      // Non-fatal in poll context: log and continue.  The intent remains queued
+      // and the next poll will retry dispatch.
       console.error("[scheduler] scheduleOnce failed", err);
-    } finally {
-      client.release();
     }
   }
 

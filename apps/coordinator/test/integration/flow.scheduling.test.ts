@@ -8,13 +8,24 @@
  *     stale validUntil → treated as unknown (concurrency=1).
  * (d) Queued→triggered path: R-002 preserved (intent exists before trigger);
  *     idempotent (second scheduler pass triggers nothing new).
- * (e) Wake-up: fake subscribe emits → pollOnce runs once; observation goes
- *     through applyObservation, no duplicate rows.
+ * (e) Wake-up: fake subscribe emits two observations for the same run; pollOnce
+ *     runs once per wake-up; observation applied exactly once through
+ *     applyObservation (exactly one run_observations row); no duplicate row on
+ *     a third explicit pollOnce (R-010).
  * (f) API tests: GET /api/metrics/lead, GET /api/capacity, set_capacity replay.
  * (h) skip_reason cleared on dispatch: intent skipped repository_busy on pass 1, dispatched on
  *     pass 2 → skip_reason IS NULL and status='triggered' (R-010).
  * (g) Halted/completed items do not hold the repository — their dispatched attempt
  *     is excluded from activeAttempts so the project does not appear in busyRepos.
+ *
+ * Admission gate tests (F2 rework — all gates apply at admission via scheduleOnce):
+ * (admission-a) provider down, slots=2, nothing running → admitted intent stays queued
+ *               with skip_reason=provider_down (no raw-COUNT bypass).
+ * (admission-b) slots=2, one worker EXECUTING on project A → second item on project A
+ *               is queued with repository_busy after admission.
+ * (admission-c) slots=2, nothing running, capacity table empty → admission dispatches
+ *               immediately through scheduleOnce (intent triggered, run_id set).
+ * (admission-d) replaying the same plan observation does not create a second intent.
  *
  * Active-attempt definition fix (S6-fix-active-attempts):
  * (i) Dispatched attempt with no triggered worker.attempt intent (only lead.review/accept,
@@ -201,7 +212,7 @@ test("scheduling(a): slots=2 dispatches both work items immediately", async (t) 
 
       const deps = makeFlowDeps(pool, fake, { workerSlots: 2 });
       const flow = new BoundedRepairFlow(deps);
-
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 2 });
       // Plan and admit both items; with 2 slots both should dispatch immediately.
       const planCmd1 = newId("cmd");
       const { intentId: planIntent1, runId: planRun1 } = await flow.plan(wi1, planCmd1);
@@ -264,7 +275,6 @@ test("scheduling(a): slots=1 → second item queued with skip_reason=no_slot, di
       const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
       const flow = new BoundedRepairFlow(deps);
       const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
-
       // Admit wi1 — should dispatch immediately (slot free).
       const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
       fake.advance(pr1);
@@ -370,7 +380,7 @@ test("scheduling(b): two items on same project → second gets repository_busy s
       fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
 
       // Use slots=1: wi1 occupies the single slot, wi2 is queued.
-      // scheduleOnce then sees wi1's project as busyRepos → repository_busy for wi2.
+      // scheduleQueuedIntents sees wi1's project as busyRepos → repository_busy for wi2.
       const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
       const flow = new BoundedRepairFlow(deps);
       const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
@@ -471,31 +481,14 @@ test("scheduling(g): halted work item does not hold the repository — second it
         [wi1],
       );
 
-      // Admit wi2 (same project) — slot occupied by wi1's attempt (status='dispatched');
-      // workerSlots=1 and activeCount=1 >= 1 → wi2's worker intent is queued.
+      // Admit wi2 (same project). wi1 is halted, so listActiveAttemptsForScheduling
+      // excludes wi1's attempt → slot free → scheduleQueuedIntents dispatches wi2.
       const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
       fake.advance(pr2);
       fake.advance(pr2);
       await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
 
-      // Verify wi2's worker intent is queued before calling scheduleOnce.
-      const { rows: preRows } = await client.query(
-        `SELECT di.status FROM dispatch_intents di
-         JOIN attempts a ON a.id = di.attempt_id
-         JOIN step_contracts sc ON sc.id = a.contract_id
-         WHERE di.task = $1 AND sc.work_item_id = $2`,
-        [TASK_IDS.workerAttempt, wi2],
-      );
-      assert.equal(
-        (preRows as { status: string }[])[0]?.status,
-        "queued",
-        "wi2 queued before scheduler",
-      );
-
-      // Run scheduler: wi1 is halted, so its dispatched attempt must be excluded
-      // from activeAttempts — the project must NOT appear in busyRepos → wi2 dispatched.
-      // The mirror case (wi1 active with dispatched attempt → repository_busy for wi2)
-      // is covered by scheduling(b).
+      // scheduleQueuedIntents already ran at admission; a second call is a no-op (wi2 triggered).
       await reconciler.scheduleOnce();
 
       const { rows } = await client.query(
@@ -552,7 +545,7 @@ test("scheduling(c): provider_down → queued item gets provider_down skip_reaso
       fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
 
       // Use slots=1: one slot occupied by wi2 (different project), so workItemId is queued.
-      // scheduleOnce then sees provider is down → provider_down skip (before no_slot check).
+      // provider_down wins before no_slot in selectDispatch ordering.
       const deps1 = makeFlowDeps(pool, fake, { workerSlots: 1 });
       const flow1 = new BoundedRepairFlow(deps1);
       const reconciler1 = new Reconciler(deps1, flow1, { workerSlots: 1 });
@@ -564,7 +557,7 @@ test("scheduling(c): provider_down → queued item gets provider_down skip_reaso
       fake.advance(pr2);
       await flow1.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
 
-      // Now admit the test item — slot=1 occupied, so it is queued.
+      // Now admit the test item — slot=1 occupied + provider down → provider_down.
       const { intentId: pi1, runId: pr1 } = await flow1.plan(workItemId, newId("cmd"));
       fake.advance(pr1);
       fake.advance(pr1);
@@ -636,7 +629,7 @@ test("scheduling(c): stale provider capacity → treated as unknown (concurrency
       scriptLeadPlan(fake);
       fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
 
-      // Use slots=1: wi1 dispatched (occupies slot), wi2 naturally queued.
+      // Use slots=1: wi1 dispatched (occupies slot), wi2 queued (no slot).
       const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
       const flow = new BoundedRepairFlow(deps);
       const reconciler = new Reconciler(deps, flow, { workerSlots: 1 });
@@ -809,11 +802,14 @@ test("scheduling(d): R-002 preserved — intent row exists before trigger; idemp
 });
 
 // ---------------------------------------------------------------------------
-// (e) Wake-up: fake subscribe emits → pollOnce runs once; observation goes
-//     through applyObservation exactly once (no duplicate rows).
+// (e) Wake-up: fake subscribe emits two observations for the same run (one
+//     EXECUTING wake-up, one COMPLETED wake-up); pollOnce runs once per
+//     wake-up; observation applied through applyObservation exactly once
+//     (exactly one run_observations row, not "0 or 1"); third explicit
+//     pollOnce produces no second row (R-010).
 // ---------------------------------------------------------------------------
 
-test("scheduling(e): realtime wake-up triggers pollOnce once; observation applied through applyObservation", async (t) => {
+test("scheduling(e): two wake-ups for same run → pollOnce once per wake-up; applyObservation dedup keeps exactly one run_observations row (R-010)", async (t) => {
   if (!DATABASE_URL) {
     t.skip("DATABASE_URL is not set");
     return;
@@ -830,71 +826,127 @@ test("scheduling(e): realtime wake-up triggers pollOnce once; observation applie
 
       const fake = new FakeExecutionRuntime();
       scriptLeadPlan(fake);
-      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+      // Script the worker with TWO steps: EXECUTING then COMPLETED.
+      // advance #1 → EXECUTING (wake-up #1, not final, no observation row)
+      // advance #2 → COMPLETED (wake-up #2, final, applyObservation creates one row)
+      fake.script(TASK_IDS.workerAttempt, (payload: unknown) => {
+        const p = payload as { attemptId: string };
+        return [
+          { status: "EXECUTING" },
+          {
+            status: "COMPLETED",
+            output: workerCompletedOutput(p.attemptId, {
+              commitId: "deadbeef1234567890deadbeef1234567890dead",
+            }),
+          },
+        ];
+      });
 
       const deps = makeFlowDeps(pool, fake, { workerSlots: 1 });
       const flow = new BoundedRepairFlow(deps);
-      // Enable realtimeWakeup.
+      // Enable realtimeWakeup; admission calls scheduleQueuedIntents directly which
+      // dispatches the worker intent immediately (slot free, no gates block).
       const reconciler = new Reconciler(deps, flow, { workerSlots: 1, realtimeWakeup: true });
 
-      // Admit the work item.
+      // Admit the work item — scheduleQueuedIntents fires and dispatches the worker
+      // intent immediately (slot free, no gates block), setting run_id.
       const { intentId: pi, runId: pr } = await flow.plan(workItemId, newId("cmd"));
       fake.advance(pr);
       fake.advance(pr);
       await flow.onLeadPlanOutput(pi, goodPlanOutput(), newId("cmd"));
 
-      // Get the worker run id.
+      // Get the worker run id (set by scheduleOnce dispatch during admission).
       const { rows: diRows } = await client.query(
         `SELECT di.run_id FROM dispatch_intents di WHERE di.task = $1`,
         [TASK_IDS.workerAttempt],
       );
       const workerRunId = (diRows as { run_id: string }[])[0]!.run_id;
+      assert.ok(
+        workerRunId,
+        "worker run id must be set (scheduleQueuedIntents dispatched at admission)",
+      );
 
       // Start wake-up (subscribes to project tags of open intents).
       const wakeupPromise = reconciler.startWakeup();
 
-      // Give subscribe a tick to register.
-      await new Promise((r) => setTimeout(r, 10));
+      // Wait for subscribe to register.
+      await waitFor(() => fake.calls.some((c) => c.method === "subscribe"), 2000);
+      assert.equal(
+        fake.calls.filter((c) => c.method === "subscribe").length,
+        1,
+        "subscribe called once after startWakeup",
+      );
 
-      // Verify subscribe was called.
-      const subscribeCalls = fake.calls.filter((c) => c.method === "subscribe");
-      assert.equal(subscribeCalls.length, 1, "subscribe called once");
+      // Baseline: count retrieve calls for the worker run before any advances.
+      const retrievesBefore = fake.calls.filter(
+        (c) => c.method === "retrieve" && (c.args as string[])[0] === workerRunId,
+      ).length;
 
-      // Advance the worker run (EXECUTING is already set; add COMPLETED).
-      fake.script(TASK_IDS.workerAttempt, (payload: unknown) => {
-        const p = payload as { attemptId: string };
-        return {
-          status: "COMPLETED",
-          output: workerCompletedOutput(p.attemptId, {
-            commitId: "deadbeef1234567890deadbeef1234567890dead",
-          }),
-        };
-      });
-      // Advance to final status — this triggers subscriber callback → pollOnce.
-      fake.advance(workerRunId); // → COMPLETED (scripted final step)
+      // Wake-up #1: advance run → EXECUTING.
+      // Subscriber fires → void this.pollOnce() called.
+      // pollOnce #1 calls retrieve → EXECUTING (not final) → no run_observations row.
+      fake.advance(workerRunId);
 
-      // Give the async pollOnce time to run.
-      await new Promise((r) => setTimeout(r, 50));
+      // Wait until pollOnce #1 has called retrieve (it's in the observation-routing phase).
+      await waitFor(
+        () =>
+          fake.calls.filter(
+            (c) => c.method === "retrieve" && (c.args as string[])[0] === workerRunId,
+          ).length > retrievesBefore,
+        2000,
+      );
+      // Tiny extra wait for _polling to flip back to false before the next advance.
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Wake-up #2: advance run → COMPLETED.
+      // Subscriber fires → void this.pollOnce() called.
+      // pollOnce #2 calls retrieve → COMPLETED (final) → applyObservation → 1 row.
+      fake.advance(workerRunId);
+
+      // Wait until pollOnce #2 has called retrieve.
+      await waitFor(
+        () =>
+          fake.calls.filter(
+            (c) => c.method === "retrieve" && (c.args as string[])[0] === workerRunId,
+          ).length >
+          retrievesBefore + 1,
+        2000,
+      );
+      // Allow pollOnce #2 to complete its DB work (applyObservation + transition).
+      await new Promise((r) => setTimeout(r, 100));
 
       // Stop wake-up.
       reconciler.stopWakeup();
       await wakeupPromise;
 
-      // Check run_observations: exactly one observation for the worker run (no duplicates).
+      // Assert: retrieve called exactly twice for this run — once per wake-up.
+      const retrieveCount =
+        fake.calls.filter((c) => c.method === "retrieve" && (c.args as string[])[0] === workerRunId)
+          .length - retrievesBefore;
+      assert.equal(
+        retrieveCount,
+        2,
+        `retrieve called exactly once per wake-up (got ${retrieveCount})`,
+      );
+
+      // Assert: exactly one run_observations row — applyObservation applied once
+      // (not "0 or 1" — the R-010 path must be taken, not bypassed).
       const { rows: obsRows } = await client.query(
         "SELECT count(*)::int AS n FROM run_observations WHERE run_id = $1",
         [workerRunId],
       );
-      // The observation may go through onWorkerFinal which uses applyObservation
-      // internally; zero rows is also acceptable if onWorkerFinal handles it.
-      // Key assertion: no more than 1 row.
       const obsCount = (obsRows as { n: number }[])[0]!.n;
-      assert.ok(obsCount <= 1, `at most one run_observations row, got ${obsCount}`);
+      assert.equal(obsCount, 1, `exactly one run_observations row, got ${obsCount}`);
 
-      // The in-flight guard means even if advance fired multiple observations
-      // only one pollOnce executes concurrently.
-      const pollGuardHeld = reconciler.healthy;
-      assert.ok(pollGuardHeld !== undefined, "reconciler health reachable");
+      // Third explicit pollOnce: no second row (applyObservation dedup / intent closure).
+      await reconciler.pollOnce();
+
+      const { rows: obsRows2 } = await client.query(
+        "SELECT count(*)::int AS n FROM run_observations WHERE run_id = $1",
+        [workerRunId],
+      );
+      const obsCount2 = (obsRows2 as { n: number }[])[0]!.n;
+      assert.equal(obsCount2, 1, `still exactly one row after third pollOnce, got ${obsCount2}`);
     } finally {
       await pool.end();
     }
@@ -1504,7 +1556,7 @@ test("scheduling(slot-regression): slots=1, one attempt dispatched on project A 
       fake.advance(pr1);
       await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
 
-      // Admit wi2 on a different project — bounded-repair sees slot occupied → queued.
+      // Admit wi2 on a different project — slot occupied → scheduleOnce sees no_slot → queued.
       const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
       fake.advance(pr2);
       fake.advance(pr2);
@@ -1579,9 +1631,8 @@ test("scheduling(i): dispatched attempt with no triggered worker.attempt intent 
       // Workers stay EXECUTING — we control slot state via direct DB updates.
       fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
 
-      // Use a large workerSlots count when admitting wi1_A so bounded-repair
-      // dispatches it immediately (slot check inside bounded-repair uses its own
-      // query and we need attempt1 to be in 'dispatched' state).
+      // Use a large workerSlots count when admitting wi1_A so scheduleQueuedIntents
+      // dispatches it immediately — we need attempt1 in 'dispatched' state.
       const depsAdmit = makeFlowDeps(pool, fake, { workerSlots: 99 });
       const flowAdmit = new BoundedRepairFlow(depsAdmit);
 
@@ -1606,9 +1657,9 @@ test("scheduling(i): dispatched attempt with no triggered worker.attempt intent 
         [TASK_IDS.workerAttempt, wi1_A],
       );
 
-      // Now admit wi_A2 and wi_B with slots=1. bounded-repair's own slot check
-      // (SELECT COUNT(*) FROM attempts WHERE status IN ('dispatched','running','stopping'))
-      // still sees attempt1 as dispatched → queues wi_A2 and wi_B.
+      // Now admit wi_A2 and wi_B with slots=1. With attempt1's worker.attempt intent
+      // marked 'observed', attempt1 is not active → slot free → wi_A2 dispatches at
+      // admission. wi_B is then blocked by no_slot (wi_A2 occupies the single slot).
       const deps1 = makeFlowDeps(pool, fake, { workerSlots: 1 });
       const flow1 = new BoundedRepairFlow(deps1);
       const reconciler = new Reconciler(deps1, flow1, { workerSlots: 1 });
@@ -1623,7 +1674,8 @@ test("scheduling(i): dispatched attempt with no triggered worker.attempt intent 
       fake.advance(pr_B);
       await flow1.onLeadPlanOutput(pi_B, goodPlanOutput(), newId("cmd"));
 
-      // Confirm wi_A2 and wi_B are queued before running the scheduler.
+      // wi_A2 is dispatched immediately at admission (attempt1 not active → slot free).
+      // wi_B is still queued (wi_A2 now occupies the single slot).
       const { rows: preA2 } = await client.query(
         `SELECT di.status FROM dispatch_intents di
          JOIN attempts a ON a.id = di.attempt_id
@@ -1633,8 +1685,8 @@ test("scheduling(i): dispatched attempt with no triggered worker.attempt intent 
       );
       assert.equal(
         (preA2 as { status: string }[])[0]?.status,
-        "queued",
-        "wi_A2 queued before scheduler",
+        "triggered",
+        "wi_A2 triggered at admission (attempt1 not active → slot free)",
       );
       const { rows: preB } = await client.query(
         `SELECT di.status FROM dispatch_intents di
@@ -1791,7 +1843,7 @@ test("scheduling(iii): stopping attempt is always active — blocks slot and mak
       scriptLeadPlan(fake);
       fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
 
-      // Admit wi1_A with a large slots value so it dispatches immediately.
+      // Admit wi1_A with a large slots value so scheduleQueuedIntents dispatches it immediately.
       const depsAdmit = makeFlowDeps(pool, fake, { workerSlots: 99 });
       const flowAdmit = new BoundedRepairFlow(depsAdmit);
 
@@ -1877,6 +1929,287 @@ test("scheduling(iii): stopping attempt is always active — blocks slot and mak
         rA2.skip_reason,
         "repository_busy",
         "wi_A2 must get repository_busy (stopping attempt1 makes project A busy)",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Admission gate tests (F2 rework): all gates apply at admission via
+// scheduleOnce — the old raw COUNT bypass is gone.
+// ---------------------------------------------------------------------------
+
+test("scheduling(admission-a): provider down, slots=2, nothing running → admission leaves intent queued with skip_reason=provider_down", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Insert a provider_capacity row with status='down' for the worker model provider.
+      // The worker model is 'openai/gpt-5.6-terra' (from makeFlowDeps), so provider='openai'.
+      const validUntil = new Date(Date.now() + 3600_000); // 1 hour from now
+      await client.query(
+        `INSERT INTO provider_capacity (provider, model, status, observed_at, valid_until, source)
+         VALUES ($1, $2, 'down', now(), $3, 'operator')
+         ON CONFLICT (provider, model, observed_at) DO UPDATE SET status = 'down', valid_until = $3`,
+        ["openai", "gpt-5.6-terra", validUntil.toISOString()],
+      );
+
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // slots=2, nothing running — without the F2 fix the old raw COUNT (0 < 2) would have
+      // bypassed all gates and triggered the worker. Now scheduleQueuedIntents applies
+      // provider gate first → provider_down.
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 2 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 2 });
+
+      // Admit the work item. scheduleQueuedIntents runs at admission → provider is down → queued.
+      const { intentId: pi, runId: pr } = await flow.plan(workItemId, newId("cmd"));
+      fake.advance(pr);
+      fake.advance(pr);
+      await flow.onLeadPlanOutput(pi, goodPlanOutput(), newId("cmd"));
+
+      // The worker intent must be queued (not triggered) and have skip_reason=provider_down.
+      const { rows } = await client.query(
+        `SELECT di.status, di.skip_reason
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      const intent = (rows as { status: string; skip_reason: string | null }[])[0];
+      assert.ok(intent, "worker intent must exist");
+      assert.equal(
+        intent.status,
+        "queued",
+        "intent must be queued (provider down blocked dispatch)",
+      );
+      assert.equal(
+        intent.skip_reason,
+        "provider_down",
+        `skip_reason must be provider_down, got: ${intent.skip_reason}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(admission-b): second item on same project admitted while first is running → queued with repository_busy", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Two work items on the SAME project (repository_busy applies within a project).
+      const { workItemId: wi1, projectId } = await seedProjectAndWorkItem(client);
+      const wi2 = newId("wi");
+      await client.query(
+        `INSERT INTO work_items
+           (id, project_id, rank, intent, defect, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 2, 'Second fix on same project', NULL, 'artifact', 'proposed', 'healthy', false, 1)`,
+        [wi2, projectId],
+      );
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      // Workers stay EXECUTING so slots remain occupied.
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // slots=2 (enough for two workers) so the slot gate does not block.
+      // The repository_busy gate fires because wi1 has an active worker on the same project.
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 2 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 2 });
+
+      // Admit wi1 — dispatches immediately (slot free, no busy constraint).
+      const { intentId: pi1, runId: pr1 } = await flow.plan(wi1, newId("cmd"));
+      fake.advance(pr1);
+      fake.advance(pr1);
+      await flow.onLeadPlanOutput(pi1, goodPlanOutput(), newId("cmd"));
+
+      // Verify wi1 was dispatched (triggered).
+      const { rows: wi1Rows } = await client.query(
+        `SELECT di.status FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi1],
+      );
+      assert.equal(
+        (wi1Rows as { status: string }[])[0]?.status,
+        "triggered",
+        "wi1 must be triggered (dispatched at admission)",
+      );
+
+      // Admit wi2 (same project). scheduleQueuedIntents runs at admission → wi1's attempt
+      // is active on project → repository_busy for wi2.
+      const { intentId: pi2, runId: pr2 } = await flow.plan(wi2, newId("cmd"));
+      fake.advance(pr2);
+      fake.advance(pr2);
+      await flow.onLeadPlanOutput(pi2, goodPlanOutput(), newId("cmd"));
+
+      const { rows } = await client.query(
+        `SELECT di.status, di.skip_reason
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wi2],
+      );
+      const intent = (rows as { status: string; skip_reason: string | null }[])[0];
+      assert.ok(intent, "wi2 worker intent must exist");
+      assert.equal(intent.status, "queued", "wi2 must be queued (same project as running wi1)");
+      assert.equal(
+        intent.skip_reason,
+        "repository_busy",
+        `skip_reason must be repository_busy, got: ${intent.skip_reason}`,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(admission-c): empty capacity table, slots=2, nothing running → admission dispatches immediately (no poll latency)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // No provider_capacity rows (capacity table empty).
+      // slots=2, nothing running → all gates pass → scheduleOnce dispatches immediately.
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 2 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 2 });
+
+      // Admit the work item. scheduleQueuedIntents runs at admission → no gates block → dispatches.
+      const { intentId: pi, runId: pr } = await flow.plan(workItemId, newId("cmd"));
+      fake.advance(pr);
+      fake.advance(pr);
+      await flow.onLeadPlanOutput(pi, goodPlanOutput(), newId("cmd"));
+
+      // The worker intent must be triggered (dispatched) with a run_id set —
+      // this proves dispatch happened at admission without waiting for a poll interval.
+      const { rows } = await client.query(
+        `SELECT di.status, di.run_id
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      const intent = (rows as { status: string; run_id: string | null }[])[0];
+      assert.ok(intent, "worker intent must exist");
+      assert.equal(
+        intent.status,
+        "triggered",
+        "intent must be triggered (admission dispatched immediately via scheduleOnce)",
+      );
+      assert.ok(intent.run_id, "run_id must be set (worker was triggered, not just queued)");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test("scheduling(admission-d): replaying the same plan observation does not create a second intent", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 2 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 2 });
+
+      // First admission — plan the work item.
+      const { intentId: pi, runId: pr } = await flow.plan(workItemId, newId("cmd"));
+      fake.advance(pr);
+      fake.advance(pr);
+
+      // Use a fixed commandId so the replay uses the same key.
+      const admitCmdId = newId("cmd");
+      await flow.onLeadPlanOutput(pi, goodPlanOutput(), admitCmdId);
+
+      // Verify exactly one worker intent exists after first admission.
+      const { rows: rows1 } = await client.query(
+        `SELECT count(*)::int AS n FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      assert.equal(
+        (rows1 as { n: number }[])[0]!.n,
+        1,
+        "exactly one worker intent after first admission",
+      );
+
+      // Replay the same plan observation with the same commandId.
+      // claimCommand sees the commandId already recorded → returns immediately (no-op).
+      await flow.onLeadPlanOutput(pi, goodPlanOutput(), admitCmdId);
+
+      // Still exactly one worker intent — no duplicate created.
+      const { rows: rows2 } = await client.query(
+        `SELECT count(*)::int AS n FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      assert.equal(
+        (rows2 as { n: number }[])[0]!.n,
+        1,
+        "still exactly one worker intent after replay (idempotent admission)",
       );
     } finally {
       await pool.end();
