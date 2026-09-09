@@ -348,18 +348,17 @@ export async function requestMagicLink(
     finalPath = r.url;
   }
 
+  // 3. A successful request ALSO answers 302 -> /login (observed live
+  // 2026-09-09: POST /login/magic 302 Location: /login, then the
+  // "check your email" page); only an explicit rate-limit signal (headers
+  // above, or page text) means the link was not sent. Anything else is
+  // treated as sent and the SMTP sink decides within its timeout.
   if (finalPath.startsWith("/login")) {
-    // 3. Inspect page text for a rate-limit signal.
     const isRateLimitText = /too many|rate.?limit|try again later/i.test(r.text);
-    const resetAt = parseResetAt(r.firstHopHeaders);
     if (isRateLimitText) {
       log("rate limited (page text): magic link not sent");
-    } else {
-      log(
-        "redirected to /login without rate-limit text: classifying as rate_limited (link not sent)",
-      );
+      return { kind: "rate_limited", resetAt: parseResetAt(r.firstHopHeaders) };
     }
-    return { kind: "rate_limited", resetAt };
   }
 
   return { kind: "sent" };
