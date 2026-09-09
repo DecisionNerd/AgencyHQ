@@ -161,6 +161,8 @@ export const DispatchIntentRowSchema = z
     run_id: NullableText,
     idempotency_key: z.string(),
     skip_reason: NullableText.optional(),
+    /** SHA-256 hex hash of the nonce passed to the task container (0009). Absent on old rows. */
+    dispatch_nonce_hash: NullableText.optional(),
   })
   .merge(Timestamps);
 

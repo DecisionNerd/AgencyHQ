@@ -12,7 +12,7 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { confirmStopped } from "@agencyhq/db";
+import { confirmStopped, listStopEvidenceForAttempt } from "@agencyhq/db";
 import type { RunObservation } from "@agencyhq/trigger/client";
 import { FINAL_RUN_STATUSES } from "@agencyhq/trigger/client";
 import type pg from "pg";
@@ -26,6 +26,68 @@ export type StopFileEvidence = {
   survivors: number[];
   checkpointCommit?: string;
 };
+
+/**
+ * Read stop evidence DB-first (for mirror-mode projects), then fall back to
+ * file-based evidence (for host_clone projects).
+ *
+ * For mirror projects: reads from attempt_stop_evidence (uploaded by the worker
+ * container via POST /internal/attempts/:id/stop-evidence) for the current
+ * generation. If no DB row exists, returns null (no fallback to file).
+ *
+ * For host_clone projects: reads from the run directory's stop.ndjson file
+ * (legacy behavior).
+ *
+ * @param client  - DB pool client (used only for mirror-mode lookup)
+ * @param attemptId - The attempt ID
+ * @param generation - The current generation
+ * @param sourceMode - 'mirror' or 'host_clone'
+ * @param runDir - The run directory path (used only for host_clone fallback)
+ */
+export async function readStopEvidenceDbFirst(
+  client: pg.PoolClient,
+  attemptId: string,
+  generation: number,
+  sourceMode: "mirror" | "host_clone",
+  runDir?: string | undefined,
+): Promise<StopFileEvidence | null> {
+  if (sourceMode === "mirror") {
+    // DB-first: query attempt_stop_evidence for this (attemptId, generation)
+    const rows = await listStopEvidenceForAttempt(client, attemptId);
+    const row = rows.find((r) => r.generation === generation);
+    if (!row) return null;
+
+    // Parse steps to extract survivors and checkpointCommit
+    const steps = Array.isArray(row.steps)
+      ? (row.steps as Array<{ step: string; detail?: string }>)
+      : [];
+    const uploadDone = steps.some((s) => s.step === "upload_done");
+    const aborted = steps.some((s) => s.step === "aborted");
+    const processDied = steps.some(
+      (s) => s.step === "process_exited" || s.step === "survivor_scan",
+    );
+
+    // survivors = [] means clean stop; non-empty means survivors present
+    // We derive from the presence of 'aborted' or 'survivor_scan' steps
+    const survivors: number[] = aborted ? [1] : [];
+
+    // Look for checkpointCommit in checkpoint_committed step detail
+    const cpStep = steps.find((s) => s.step === "checkpoint_committed");
+    const checkpointCommit = cpStep?.detail;
+
+    if (!uploadDone && !aborted && !processDied) return null;
+
+    const result: StopFileEvidence = { survivors };
+    if (checkpointCommit) {
+      result.checkpointCommit = checkpointCommit;
+    }
+    return result;
+  }
+
+  // host_clone: fall back to file-based evidence
+  if (!runDir) return null;
+  return readStopEvidence(runDir);
+}
 
 /**
  * Parse stop evidence from a run directory's stop.ndjson file.

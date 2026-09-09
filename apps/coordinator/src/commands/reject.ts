@@ -101,7 +101,8 @@ export async function rejectWorkItem(
       return result;
     }
 
-    const pendingDecision = decisionRows[0]!;
+    if (!decisionRows[0]) throw new Error("invariant: decision row missing after length check");
+    const pendingDecision = decisionRows[0];
     const newDecisionId = randomUUID();
     const now = new Date();
 

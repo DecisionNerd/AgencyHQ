@@ -14,7 +14,7 @@ export {
   setMainEffort,
   setWorkItemRank,
 } from "./campaign.ts";
-export { confirmStop, readStopEvidence } from "./confirm-stop.ts";
+export { confirmStop, readStopEvidence, readStopEvidenceDbFirst } from "./confirm-stop.ts";
 export { createWorkItem } from "./create-work-item.ts";
 export type {
   DispositionDeps,
@@ -23,6 +23,8 @@ export type {
   DispositionValue,
 } from "./disposition.ts";
 export { dispositionFinding } from "./disposition.ts";
+export type { ImportDeps } from "./import-host-project.ts";
+export { importHostProject, revertImport } from "./import-host-project.ts";
 export { invalidateAcceptance } from "./invalidate-acceptance.ts";
 export { pauseWorkItem, resumeWorkItem } from "./pause.ts";
 export { rejectWorkItem } from "./reject.ts";

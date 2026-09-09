@@ -18,7 +18,7 @@ import type { LeadPlanOutput } from "@agencyhq/contracts";
 import { LeadPlanOutputSchema, TASK_IDS } from "@agencyhq/contracts";
 import { applyObservation, listOpenDispatchIntents, recordCapacity } from "@agencyhq/db";
 import type { CommandId, RunObservation } from "@agencyhq/domain";
-import { effectiveCapacity, FINAL_RUN_STATUSES } from "@agencyhq/domain";
+import { FINAL_RUN_STATUSES } from "@agencyhq/domain";
 import type pg from "pg";
 import { confirmStop, readStopEvidence } from "../commands/confirm-stop.ts";
 import { stopAttempt } from "../commands/stop.ts";
@@ -363,14 +363,16 @@ export class Reconciler {
     if (!this._realtimeWakeup || !this.deps.runtime.subscribe) return;
 
     this._wakeupAbort = new AbortController();
+    // Capture locally so TypeScript keeps the non-null type across the await.
+    const wakeupAbort = this._wakeupAbort;
 
     // Initial subscription attempt (cheap; no-op when no open work yet).
     await this._refreshWakeupSubscription();
 
     // Resolve only when stopWakeup() aborts the global controller.
-    if (this._wakeupAbort.signal.aborted) return;
+    if (wakeupAbort.signal.aborted) return;
     return new Promise<void>((resolve) => {
-      this._wakeupAbort!.signal.addEventListener("abort", () => resolve(), { once: true });
+      wakeupAbort.signal.addEventListener("abort", () => resolve(), { once: true });
     });
   }
 

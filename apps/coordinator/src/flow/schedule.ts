@@ -23,6 +23,7 @@ import {
 } from "@agencyhq/db";
 import { selectDispatch, type WorkItemLike } from "@agencyhq/domain";
 
+import type { ProviderStatus } from "../provider/state.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -44,10 +45,14 @@ export type ScheduleOutcome = {
  * @param deps          Shared flow dependencies (pool, config.workerSlots, …).
  * @param retryDispatch Called for each intent the scheduler elects to dispatch.
  *                      Must return { runId } on success; may throw on failure.
+ * @param providerStatus Optional provider auth state. When login_required,
+ *                       expired, or unavailable, all queued intents are skipped
+ *                       with reason "provider_login_required".
  */
 export async function scheduleQueuedIntents(
   deps: FlowDeps,
   retryDispatch: (intentId: string) => Promise<{ runId: string }>,
+  providerStatus?: ProviderStatus,
 ): Promise<ScheduleOutcome> {
   const outcome: ScheduleOutcome = { dispatched: [], skipped: [], failed: [] };
   const { pool } = deps;
@@ -56,6 +61,28 @@ export async function scheduleQueuedIntents(
     // 1. Load queued intents with their work item data.
     const queuedIntents = await listQueuedWorkerIntents(client);
     if (queuedIntents.length === 0) return outcome;
+
+    // 1a. Provider gate: if provider auth is not ready, skip all intents.
+    if (
+      providerStatus === "login_required" ||
+      providerStatus === "expired" ||
+      providerStatus === "unavailable"
+    ) {
+      for (const row of queuedIntents) {
+        await client.query(
+          `UPDATE dispatch_intents
+           SET skip_reason = $2, updated_at = now()
+           WHERE id = $1 AND status = 'queued'`,
+          [row.intent_id, "provider_login_required"],
+        );
+        outcome.skipped.push({
+          intentId: row.intent_id,
+          workItemId: row.work_item_id,
+          reason: "provider_login_required",
+        });
+      }
+      return outcome;
+    }
 
     // 2. Load active attempts for slot + repo counting.
     //    An attempt is active only when a worker process is or may be running:
@@ -97,7 +124,7 @@ export async function scheduleQueuedIntents(
       const workerModel = bounds.models?.worker;
       let provider: string | undefined;
       let model: string | undefined;
-      if (workerModel && workerModel.includes("/")) {
+      if (workerModel?.includes("/")) {
         const slashIdx = workerModel.indexOf("/");
         provider = workerModel.slice(0, slashIdx);
         model = workerModel.slice(slashIdx + 1);
@@ -122,6 +149,7 @@ export async function scheduleQueuedIntents(
       if (row.wi_created_at instanceof Date) item.createdAt = row.wi_created_at.toISOString();
       if (provider !== undefined) item.provider = provider;
       if (model !== undefined) item.model = model;
+      if (row.di_seq !== undefined) item.intentSeq = Number(row.di_seq);
       return item;
     });
 
@@ -135,7 +163,7 @@ export async function scheduleQueuedIntents(
     for (const a of activeRows) {
       const bds = a.bounds as { models?: { worker?: string } };
       const wm = bds.models?.worker;
-      if (wm && wm.includes("/")) {
+      if (wm?.includes("/")) {
         const p = wm.slice(0, wm.indexOf("/"));
         activeByProvider[p] = (activeByProvider[p] ?? 0) + 1;
       }

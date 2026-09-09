@@ -6,6 +6,7 @@
  * No secret values appear in any output.
  */
 
+import { buildProviderReadiness, providerNextAction } from "./provider.ts";
 import type {
   BootstrapReadiness,
   ImageReadiness,
@@ -23,10 +24,11 @@ import type {
  * 4. Bootstrap failed → backoff time when it will retry, else phase and error category.
  * 5. Bootstrap done but trigger unconfigured → bootstrap may still be deploying the key.
  * 6. Bootstrap done but image absent → deploy still in progress.
- * 7. All ready → instruct operator to log in with OpenCode.
+ * 7. Provider not ready → provider-specific action.
+ * 8. All ready → system is operational.
  */
 function deriveNextAction(inputs: ReadinessInputs): string {
-  const { database, trigger, bootstrapJson, deploymentJson } = inputs;
+  const { database, trigger, bootstrapJson, deploymentJson, providerStatus } = inputs;
 
   if (database === "down") {
     return "Database is unavailable; check the agencyhq-postgres container";
@@ -63,6 +65,13 @@ function deriveNextAction(inputs: ReadinessInputs): string {
     return "Task image not yet deployed; bootstrap may still be deploying";
   }
 
+  // Provider auth checks (when dataDir is configured — container profile).
+  const providerAction = providerNextAction(providerStatus);
+  if (providerAction !== null) {
+    return providerAction;
+  }
+
+  // Host profile (no dataDir) or provider ready
   return "Ready for provider login: run `docker compose exec opencode opencode auth login`";
 }
 
@@ -71,7 +80,7 @@ function deriveNextAction(inputs: ReadinessInputs): string {
  * Pure — no I/O, no side effects.
  */
 export function buildReadiness(inputs: ReadinessInputs): ReadinessResponse {
-  const { database, trigger, bootstrapJson, deploymentJson } = inputs;
+  const { database, trigger, bootstrapJson, deploymentJson, providerStatus } = inputs;
 
   const bootstrap: BootstrapReadiness = bootstrapJson
     ? {
@@ -97,14 +106,19 @@ export function buildReadiness(inputs: ReadinessInputs): ReadinessResponse {
       }
     : null;
 
+  const { provider, worker } = buildProviderReadiness({
+    providerStatus,
+    imageRegistered: deploymentJson !== null,
+  });
+
   const nextAction = deriveNextAction(inputs);
 
   return {
     services: { database, trigger },
     bootstrap,
     image,
-    provider: "unknown",
-    worker: "unknown",
+    provider,
+    worker,
     nextAction,
   };
 }

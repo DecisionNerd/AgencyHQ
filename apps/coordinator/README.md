@@ -135,6 +135,37 @@ The coordinator reads two files from this directory on every readiness poll:
   after completing the credentials phase. Read lazily on every readiness poll
   so the app starts before bootstrap completes without requiring a restart.
 
+## Portable source and artifacts
+
+When a project's `source_mode` is `mirror`, the coordinator owns the authoritative git history instead of the host filesystem. Task containers receive a `SourceRef` (v2 payload) that points at an internal HTTP endpoint rather than a host path.
+
+### Git mirror
+
+`ensureMirror` clones the project remote as a bare mirror under `AGENCYHQ_GIT_ROOT/<projectId>.git` (default `<worktreeBase>/git/<projectId>.git`). Subsequent calls call `git remote update --prune` to fetch new refs. Credentials for private remotes come from a temporary `GIT_ASKPASS` script file (mode 0700, deleted in the `finally` block) populated from the `project_credentials` table (`git-read` purpose), decrypted in-process. The token never appears on the command line, in environment log output, or in any payload. `GIT_TERMINAL_PROMPT=0` prevents interactive credential prompts.
+
+### Bundles
+
+`exportBundle` creates a git bundle from the mirror and streams it as `application/x-git-bundle`. The size is enforced against `AGENCYHQ_MAX_BUNDLE_BYTES` (default 200 MiB). `importBundle` writes the incoming body to a temporary file, calls `git bundle verify` (prerequisites must already be in the mirror), fetches the head commit into `refs/agencyhq/attempts/<id>/g<gen>`, and asserts that the resolved SHA equals the claimed commit. Tampered or prerequisite-missing bundles are rejected before any DB row is written.
+
+### Artifact admission
+
+`POST /internal/attempts/:id/artifacts` and `POST /internal/attempts/:id/checkpoints` accept bundle uploads from worker containers. The coordinator:
+
+1. Authenticates the request by comparing `sha256(bearer token)` against the `nonce_hash` stored in the `leases` table (purpose `upload`).
+2. Validates the `X-AgencyHQ-Meta` header against `validateArtifactAdmission` (pure domain function): lease freshness, generation match, bundle size, path safety, commit presence in mirror, and diff digest equality.
+3. Imports the bundle into the mirror.
+4. Inserts an `attempt_artifacts` row (`ON CONFLICT DO NOTHING` for idempotency).
+
+`POST /internal/attempts/:id/stop-evidence` upserts `attempt_stop_evidence` after the same lease check and `validateStopEvidenceAdmission`.
+
+### v2 task payloads
+
+When `source_mode = 'mirror'`, `leadPlanPayload`, `workerAttemptPayload`, and `leadReviewPayload` return v2 payloads. v2 payloads contain no host filesystem paths (`repoPath`, `worktreeBase`, `patchPath`, and `manifestRepoPaths` are absent). The `source` field carries a `SourceRef` with `projectId`, `revision`, and `bundlePath` pointing at `/internal/source/<projectId>?rev=<sha>`. Workers fetch the source bundle from that endpoint using their upload lease as the bearer token.
+
+### Importing a project
+
+`importHostProject` clones the mirror and updates `projects.source_mode = 'mirror'`. `revertImport` sets it back to `host_clone` (the mirror remains on disk for debugging). Neither command re-dispatches pending work items.
+
 ## Network isolation
 
 The coordinator binds to `AGENCYHQ_BIND_HOST` (default `127.0.0.1`). All
@@ -144,6 +175,63 @@ unset and the bind host is not loopback, the server fails closed at startup.
 Loopback without a token is allowed but logs a startup warning. All
 coordinator-to-Trigger communication uses the Trigger secret key held only
 by the coordinator process.
+
+## Provider readiness
+
+The coordinator reads `$AGENCYHQ_OPENCODE_DATA_DIR/auth.json` (container profile only) to derive provider status. `readProviderState` returns one of:
+
+| Status | Meaning |
+|--------|---------|
+| `unavailable` | `AGENCYHQ_OPENCODE_DATA_DIR` not set (host profile) |
+| `login_required` | auth.json absent, empty, or required provider missing |
+| `expired` | OAuth token past expiry or capacity 401 within lookback window |
+| `ready` | At least one valid provider credential present |
+
+The function never exposes credential values (key, access, refresh). It returns only provider id, type, and expiry timestamp. `providerIdFromModel(model)` extracts the provider prefix from a `provider/model` string.
+
+When provider status is `login_required`, `expired`, or `unavailable`, `scheduleQueuedIntents` skips all queued intents with `skip_reason = "provider_login_required"` before doing any DB work.
+
+## Internal API (task containers)
+
+Routes under `/internal/*` are NOT protected by the operator bearer token. They use per-dispatch nonce authentication only. These routes are for worker containers running inside the deployment network.
+
+### `POST /internal/leases`
+
+Issues a time-bounded credential grant to an authenticated task container.
+
+Request:
+```json
+{
+  "runId": "run_...",
+  "attemptId": "attempt_...",
+  "generation": 0,
+  "purpose": "provider | git-read | integrate | upload",
+  "nonce": "<64 hex chars — raw nonce matching dispatch_nonce_hash>"
+}
+```
+
+The coordinator verifies `sha256(nonce) == dispatch_intents.dispatch_nonce_hash`. On success it issues a lease with a TTL (default 30 min for provider, 5 min for integrate). Leases are idempotent: same nonce hash returns the same lease id.
+
+Grant material by purpose:
+
+| Purpose | Material |
+|---------|---------|
+| `provider` | `authJson` — raw auth.json content (snapshot at lease time) |
+| `git-read` | decrypted project credential |
+| `integrate` | decrypted project credential (longer TTL) |
+| `upload` | random upload token |
+
+No credential values appear in coordinator logs. All grants are logged via `redactLeaseGrant` before writing to the log.
+
+Environment variables (container profile):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AGENCYHQ_OPENCODE_DATA_DIR` | — | OpenCode data dir (required in container) |
+| `AGENCYHQ_SECRETS_KEY` | — | AES-256-GCM key for decrypting project credentials |
+| `AGENCYHQ_LEASE_TTL_MS` | 1 800 000 (30 min) | Provider/git-read lease TTL |
+| `AGENCYHQ_INTEGRATE_LEASE_TTL_MS` | 300 000 (5 min) | Integrate lease TTL |
+| `AGENCYHQ_RUNTIME_PROFILE` | `host` | Set to `container` to enable internal routes |
 
 ## Readiness API
 
@@ -170,15 +258,15 @@ The route is bearer-authenticated (same rule as all other `/api/*` routes).
     "platform": "linux/arm64",
     "at": "2026-09-08T12:00:00.000Z"
   },
-  "provider": "unknown",
-  "worker": "unknown",
+  "provider": "ready | login_required | expired | unavailable | unknown",
+  "worker": "ready | login_required | expired | unavailable | unknown",
   "nextAction": "Human-readable sentence describing what to do next"
 }
 ```
 
 `bootstrap` and `image` are `null` when the corresponding state file is
 absent (bootstrap not yet started; image not yet deployed). `provider` and
-`worker` are placeholder values until issues #17 and #19 supply real data.
+`worker` are `unknown` when not running in container profile.
 No secret values appear in the response.
 
 ### nextAction examples

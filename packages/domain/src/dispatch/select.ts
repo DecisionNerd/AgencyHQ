@@ -59,6 +59,14 @@ export type WorkItemLike = {
    * observation.  When absent, no provider capacity constraint is applied.
    */
   model?: string;
+  /**
+   * Optional monotonically increasing insertion-order sequence from the
+   * dispatch_intents table (di.seq BIGSERIAL).  Used as the final tiebreaker
+   * when rank, createdAt, and id all compare equal — guarantees a stable sort
+   * even when two intents are inserted within the same microsecond.  Absent
+   * items sort last (Number.MAX_SAFE_INTEGER).
+   */
+  intentSeq?: number;
 };
 
 /** Minimal active-attempt shape needed to detect busy repositories. */
@@ -79,7 +87,9 @@ export type SkipReason =
   | "integration_pending"
   | "provider_down"
   | "provider_limited"
-  | "provider_unknown";
+  | "provider_unknown"
+  /** Provider requires re-authentication (login_required, expired, or unavailable). */
+  | "provider_login_required";
 
 /**
  * Design note — `not_main_effort_slot`:
@@ -190,6 +200,7 @@ type SortKey = {
   localRank: number;
   createdAt: string;
   id: string;
+  intentSeq: number;
 };
 
 function buildSortKey(
@@ -208,6 +219,7 @@ function buildSortKey(
         localRank: item.rank,
         createdAt: item.createdAt ?? "",
         id: item.id,
+        intentSeq: item.intentSeq ?? Number.MAX_SAFE_INTEGER,
       };
     }
   }
@@ -218,6 +230,7 @@ function buildSortKey(
     localRank: item.rank,
     createdAt: item.createdAt ?? "",
     id: item.id,
+    intentSeq: item.intentSeq ?? Number.MAX_SAFE_INTEGER,
   };
 }
 
@@ -227,6 +240,10 @@ function compareSortKeys(a: SortKey, b: SortKey): number {
   if (a.localRank !== b.localRank) return a.localRank - b.localRank;
   if (a.createdAt < b.createdAt) return -1;
   if (a.createdAt > b.createdAt) return 1;
+  // intentSeq (BIGSERIAL insertion order) comes before the random id so that
+  // two intents created within the same clock tick sort in insertion order
+  // rather than by an arbitrary UUID comparison.
+  if (a.intentSeq !== b.intentSeq) return a.intentSeq - b.intentSeq;
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
