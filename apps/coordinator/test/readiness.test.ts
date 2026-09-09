@@ -7,7 +7,8 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { buildReadiness } from "../src/readiness/build.ts";
@@ -368,5 +369,145 @@ describe("readDeploymentJson", () => {
     const result = readDeploymentJson(tmpDir);
     assert.ok(result !== null);
     assert.equal("digest" in (result ?? {}), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// nextRetryAt — rate-limit backoff surface
+// ---------------------------------------------------------------------------
+
+describe("buildReadiness — login_rate_limited nextAction", () => {
+  const RATE_LIMITED_AT = "2026-09-09T13:00:00.000Z";
+  const NEXT_RETRY_AT = "2026-09-09T14:00:00.000Z";
+
+  it("login_rate_limited with nextRetryAt → nextAction mentions backoff time", () => {
+    const r = buildReadiness(
+      inputs({
+        bootstrapJson: {
+          phase: "login",
+          status: "failed",
+          error: "login_rate_limited",
+          at: RATE_LIMITED_AT,
+          nextRetryAt: NEXT_RETRY_AT,
+        },
+      }),
+    );
+    assert.ok(
+      r.nextAction.includes(NEXT_RETRY_AT) || r.nextAction.includes("backing off"),
+      `expected backoff time in nextAction, got: ${r.nextAction}`,
+    );
+    assert.ok(
+      r.nextAction.includes("login_rate_limited"),
+      `expected category in nextAction, got: ${r.nextAction}`,
+    );
+  });
+
+  it("login_rate_limited without nextRetryAt → falls back to generic failed message", () => {
+    const r = buildReadiness(
+      inputs({
+        bootstrapJson: {
+          phase: "login",
+          status: "failed",
+          error: "login_rate_limited",
+          at: RATE_LIMITED_AT,
+        },
+      }),
+    );
+    assert.ok(
+      r.nextAction.includes("login_rate_limited"),
+      `expected category in nextAction, got: ${r.nextAction}`,
+    );
+    assert.ok(
+      r.nextAction.includes("docker compose logs bootstrap"),
+      `expected docker compose logs in nextAction, got: ${r.nextAction}`,
+    );
+  });
+
+  it("nextRetryAt propagated into bootstrap response field", () => {
+    const r = buildReadiness(
+      inputs({
+        bootstrapJson: {
+          phase: "login",
+          status: "failed",
+          error: "login_rate_limited",
+          at: RATE_LIMITED_AT,
+          nextRetryAt: NEXT_RETRY_AT,
+        },
+      }),
+    );
+    assert.equal(r.bootstrap?.nextRetryAt, NEXT_RETRY_AT);
+  });
+
+  it("nextRetryAt absent when bootstrapJson has no nextRetryAt", () => {
+    const r = buildReadiness(
+      inputs({
+        bootstrapJson: {
+          phase: "login",
+          status: "failed",
+          error: "other_error",
+          at: RATE_LIMITED_AT,
+        },
+      }),
+    );
+    assert.equal("nextRetryAt" in (r.bootstrap ?? {}), false);
+  });
+});
+
+describe("readBootstrapJson — nextRetryAt from BootstrapState format", () => {
+  let tmpDir: string;
+
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "next-retry-test-"));
+  });
+
+  after(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("reads nextRetryAt from BootstrapState format", () => {
+    const nextRetryAt = "2026-09-09T14:30:00.000Z";
+    writeFileSync(
+      join(tmpDir, "bootstrap.json"),
+      JSON.stringify({
+        version: 1,
+        phases: {
+          login: {
+            status: "failed",
+            errorCategory: "login_rate_limited",
+            errorMessage: "rate limited",
+            completedAt: "2026-09-09T13:00:00.000Z",
+          },
+        },
+        updatedAt: "2026-09-09T13:00:00.000Z",
+        nextRetryAt,
+        magicLinkRateLimitedUntil: "2026-09-09T14:00:00.000Z",
+        attempt: 1,
+      }),
+    );
+    const result = readBootstrapJson(tmpDir);
+    assert.ok(result !== null);
+    assert.equal(result?.nextRetryAt, nextRetryAt);
+    assert.equal(result?.error, "login_rate_limited");
+  });
+
+  it("nextRetryAt is absent when not set in BootstrapState", () => {
+    const tmp2 = mkdtempSync(join(tmpdir(), "no-retry-test-"));
+    try {
+      writeFileSync(
+        join(tmp2, "bootstrap.json"),
+        JSON.stringify({
+          version: 1,
+          phases: {
+            deploy: { status: "running", startedAt: "2026-09-09T13:00:00.000Z" },
+          },
+          updatedAt: "2026-09-09T13:00:00.000Z",
+        }),
+      );
+      const result = readBootstrapJson(tmp2);
+      assert.ok(result !== null);
+      assert.equal("nextRetryAt" in (result ?? {}), false);
+    } finally {
+      rmSync(tmp2, { recursive: true, force: true });
+    }
   });
 });

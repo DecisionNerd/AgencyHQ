@@ -82,6 +82,8 @@ interface FetchResult {
   url: string;
   text: string;
   headers: Headers;
+  /** Headers from the very first response in a redirect chain. */
+  firstHopHeaders: Headers;
 }
 
 async function doFetch(
@@ -96,6 +98,7 @@ async function doFetch(
   let currentUrl = url;
   let currentBody: URLSearchParams | undefined = body;
   let redirectCount = 0;
+  let firstHopHeaders: Headers | undefined;
 
   for (;;) {
     const reqHeaders: Record<string, string> = { ...extraHeaders };
@@ -113,6 +116,9 @@ async function doFetch(
       ...(needsBody && currentBody !== undefined ? { body: currentBody.toString() } : {}),
       redirect: "manual",
     });
+
+    // Capture headers from the first hop (used by requestMagicLink for rate-limit detection).
+    if (firstHopHeaders === undefined) firstHopHeaders = resp.headers;
 
     // Merge Set-Cookie from every hop so session cookies set on redirects are captured.
     mergeCookiesFromResponse(jar, resp.headers);
@@ -144,7 +150,13 @@ async function doFetch(
     // Final response — consume body.
     const text = await resp.text();
     log(`← ${resp.status} ${currentUrl} (${text.length} bytes)`);
-    return { status: resp.status, url: currentUrl, text, headers: resp.headers };
+    return {
+      status: resp.status,
+      url: currentUrl,
+      text,
+      headers: resp.headers,
+      firstHopHeaders: firstHopHeaders ?? resp.headers,
+    };
   }
 }
 
@@ -225,6 +237,45 @@ export async function resolveWebappIp(webappUrl: string): Promise<string> {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * Result of a magic-link request.
+ *
+ * - `sent`         The webapp accepted the request and will send an email.
+ *                  Wait for the SMTP sink to capture the link.
+ * - `rate_limited` The webapp rejected the request because the per-address
+ *                  limit is exhausted. `resetAt` is epoch-ms when the limit
+ *                  resets (null if not advertised). Do NOT wait for the SMTP sink.
+ */
+export type MagicLinkResult = { kind: "sent" } | { kind: "rate_limited"; resetAt: number | null };
+
+/**
+ * Parse the rate-limit reset time from response headers.
+ * Handles:
+ *   x-ratelimit-reset: epoch-seconds or epoch-ms (< 1e12 → seconds, else ms)
+ *   retry-after: seconds (RFC 7231)
+ * Returns epoch-ms or null when no parseable value is present.
+ */
+function parseResetAt(headers: Headers): number | null {
+  // x-ratelimit-reset takes precedence (epoch seconds or ms)
+  const resetHeader = headers.get("x-ratelimit-reset");
+  if (resetHeader !== null) {
+    const val = Number(resetHeader);
+    if (!Number.isNaN(val) && val > 0) {
+      // Epoch-ms values are typically > 1e12; epoch-s values are < 1e11.
+      return val < 1e12 ? val * 1000 : val;
+    }
+  }
+  // retry-after in seconds
+  const retryAfter = headers.get("retry-after");
+  if (retryAfter !== null) {
+    const val = Number(retryAfter);
+    if (!Number.isNaN(val) && val >= 0) {
+      return Date.now() + val * 1000;
+    }
+  }
+  return null;
+}
+
 export interface OrgProject {
   orgSlug: string;
   projectSlug: string;
@@ -255,16 +306,63 @@ export async function waitForReadiness(webappUrl: string, timeoutMs = 120_000): 
 
 /**
  * POST /login/magic to request a magic link for the bootstrap email.
- * Returns HTTP status (expect 302 on success).
+ *
+ * Returns a `MagicLinkResult`:
+ *   - `{ kind: "sent" }`            Webapp accepted the request; wait for SMTP email.
+ *   - `{ kind: "rate_limited", resetAt }` Per-address limit exhausted; do NOT wait
+ *                                    for SMTP; sleep until resetAt (epoch-ms) or back off.
+ *
+ * Rate-limit detection (checked in order):
+ *   1. `x-ratelimit-remaining: 0` or `retry-after` header on the first response hop.
+ *   2. The final URL (after redirect-following) is /login or starts with /login,
+ *      indicating the webapp rejected the request and redirected back to the login page.
+ *   3. The /login page body contains "too many", "rate limit", or "try again".
+ *
+ * All three indicators are checked because different Trigger.dev versions may
+ * advertise the limit differently (headers alone, redirect alone, or text alone).
  */
 export async function requestMagicLink(
   webappUrl: string,
   email: string,
   jar: CookieJar,
-): Promise<number> {
+): Promise<MagicLinkResult> {
   const body = new URLSearchParams({ action: "send", email });
   const r = await doFetch("POST", `${webappUrl}/login/magic`, jar, body);
-  return r.status;
+
+  // 1. Check rate-limit headers from the first response hop.
+  const remaining = r.firstHopHeaders.get("x-ratelimit-remaining");
+  const retryAfter = r.firstHopHeaders.get("retry-after");
+  if (remaining === "0" || retryAfter !== null) {
+    const resetAt = parseResetAt(r.firstHopHeaders);
+    log(
+      `rate limited (headers): x-ratelimit-remaining=${remaining ?? "n/a"}, retry-after=${retryAfter ?? "n/a"}`,
+    );
+    return { kind: "rate_limited", resetAt };
+  }
+
+  // 2. Check whether the final URL is the /login page (link was not sent).
+  let finalPath: string;
+  try {
+    finalPath = new URL(r.url).pathname;
+  } catch {
+    finalPath = r.url;
+  }
+
+  if (finalPath.startsWith("/login")) {
+    // 3. Inspect page text for a rate-limit signal.
+    const isRateLimitText = /too many|rate.?limit|try again later/i.test(r.text);
+    const resetAt = parseResetAt(r.firstHopHeaders);
+    if (isRateLimitText) {
+      log("rate limited (page text): magic link not sent");
+    } else {
+      log(
+        "redirected to /login without rate-limit text: classifying as rate_limited (link not sent)",
+      );
+    }
+    return { kind: "rate_limited", resetAt };
+  }
+
+  return { kind: "sent" };
 }
 
 /**
@@ -449,9 +547,9 @@ export async function mintPAT(
  */
 export async function requestFreshMagicLinkUrl(webappUrl: string, email: string): Promise<string> {
   const jar: CookieJar = new Map();
-  const status = await requestMagicLink(webappUrl, email, jar);
-  if (status !== 200 && status !== 302) {
-    throw new Error(`magic link request returned HTTP ${status}`);
+  const result = await requestMagicLink(webappUrl, email, jar);
+  if (result.kind !== "sent") {
+    throw new Error(`magic link request failed: ${result.kind}`);
   }
   // The URL is in the SMTP sink in normal flow; for dashboard-link we can't
   // capture it here without an SMTP sink. Return a note for the caller.

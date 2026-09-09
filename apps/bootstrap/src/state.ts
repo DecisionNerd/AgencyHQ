@@ -44,6 +44,25 @@ export interface BootstrapState {
    * Used to enforce a 60-second throttle between requests to the same address.
    */
   lastMagicLinkRequestAt?: string;
+  /**
+   * ISO timestamp when the webapp's magic-link rate limit resets.
+   * Set when the login phase encounters a 429/302-to-login rate-limit response.
+   * The CLI sleeps until this time (capped at 15 minutes) before exiting.
+   */
+  magicLinkRateLimitedUntil?: string;
+  /**
+   * ISO timestamp of the next retry attempt.
+   * Set just before the process sleeps so the coordinator can surface it.
+   * Cleared to undefined on any successful phase.
+   */
+  nextRetryAt?: string;
+  /**
+   * Exponential backoff attempt counter.
+   * Incremented on each transient failure exit; reset to 0 on any phase success.
+   * Used to compute min(2^attempt × 15 s, 5 min) backoff when no rate-limit
+   * reset time is known.
+   */
+  attempt?: number;
 }
 
 export const PHASES: readonly Phase[] = [
@@ -113,6 +132,9 @@ export class StateManager {
       status: "done",
       completedAt: new Date().toISOString(),
     };
+    // Reset backoff on any phase success so the next failure starts from attempt 0.
+    state.attempt = 0;
+    delete state.nextRetryAt;
     this.save(state);
   }
 

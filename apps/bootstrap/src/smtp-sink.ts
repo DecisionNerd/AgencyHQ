@@ -207,6 +207,12 @@ export interface SmtpSinkOptions {
   host?: string;
   /** How long to wait for the email before rejecting. Defaults to 120 000 ms. */
   timeoutMs?: number;
+  /**
+   * If provided and aborted before the email arrives, the promise rejects
+   * immediately with a non-timeout error so the caller can fail fast without
+   * waiting for the full SMTP timeout.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -242,6 +248,23 @@ export function startSmtpSink(options: SmtpSinkOptions = {}): Promise<SmtpSinkRe
 
     function stopServer(): void {
       server?.close();
+    }
+
+    // If an AbortSignal is provided, reject immediately when it fires so the
+    // caller can skip the SMTP wait after a failed magic-link request.
+    if (options.signal) {
+      const sig = options.signal;
+      if (sig.aborted) {
+        // Already aborted before we even started.
+        reject(Object.assign(new Error("smtp-sink: aborted"), { errorCategory: "smtp_aborted" }));
+        return;
+      }
+      sig.addEventListener(
+        "abort",
+        () =>
+          fail(Object.assign(new Error("smtp-sink: aborted"), { errorCategory: "smtp_aborted" })),
+        { once: true },
+      );
     }
 
     server = createServer((socket) => {

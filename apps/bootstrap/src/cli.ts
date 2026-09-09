@@ -36,6 +36,37 @@ import {
 } from "./trigger-web.ts";
 import { verifyDeployment } from "./verify.ts";
 
+// ── Transient failure categories that trigger backoff before exit ─────────────
+
+const TRANSIENT_CATEGORIES = new Set([
+  "login_rate_limited",
+  "magic_link_timeout",
+  "smtp_aborted",
+  "services_unavailable",
+  "deploy_failed",
+]);
+
+/**
+ * Compute the backoff sleep duration (ms) before exiting non-zero.
+ *
+ * If the rate-limit reset time is known (magicLinkRateLimitedUntil), sleep
+ * until that time, capped at 15 minutes.
+ *
+ * Otherwise use exponential backoff: min(2^attempt × 15 s, 5 min),
+ * where attempt is the persistent counter from bootstrap.json.
+ */
+function computeBackoffMs(state: BootstrapState, category: string): number {
+  if (category === "login_rate_limited" && state.magicLinkRateLimitedUntil) {
+    const resetMs = new Date(state.magicLinkRateLimitedUntil).getTime();
+    const waitMs = resetMs - Date.now();
+    const MAX_RATE_LIMIT_WAIT_MS = 15 * 60_000; // 15 minutes
+    return Math.min(Math.max(waitMs, 0), MAX_RATE_LIMIT_WAIT_MS);
+  }
+  const attempt = state.attempt ?? 0;
+  const MAX_BACKOFF_MS = 5 * 60_000; // 5 minutes
+  return Math.min(2 ** attempt * 15_000, MAX_BACKOFF_MS);
+}
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 const STATE_DIR = process.env["AGENCYHQ_STATE_DIR"] ?? "/var/agencyhq/state";
@@ -102,8 +133,7 @@ async function enforceMagicLinkThrottle(state: BootstrapState, sm: StateManager)
 
 // ── Phase runner ─────────────────────────────────────────────────────────────
 
-async function runAll(): Promise<void> {
-  const sm = new StateManager(STATE_DIR, SECRETS_DIR);
+async function runAll(sm: StateManager): Promise<void> {
   const state = sm.load();
 
   // ── Phase: wait_services ─────────────────────────────────────────────────
@@ -131,20 +161,30 @@ async function runAll(): Promise<void> {
     try {
       // Enforce throttle before sending the magic-link request.
       await enforceMagicLinkThrottle(state, sm);
-      const [sinkResult, status] = await Promise.all([
-        startSmtpSink({ port: SMTP_PORT, timeoutMs: BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS }),
-        (async () => {
-          // Give the sink a moment to start before requesting the link.
-          await sleep(200);
-          return requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
-        })(),
-      ]);
-      if (status !== 200 && status !== 302) {
-        throw Object.assign(
-          new Error(`magic link request returned HTTP ${status} (expected 200 or 302)`),
-          { errorCategory: "magic_link_timeout" },
-        );
+      // Start SMTP sink early so it is listening before the webapp sends mail.
+      // The AbortController lets us stop the sink immediately if the request fails.
+      const abort = new AbortController();
+      const sinkPromise = startSmtpSink({
+        port: SMTP_PORT,
+        timeoutMs: BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS,
+        signal: abort.signal,
+      });
+      // Give the sink a moment to start before requesting the link.
+      await sleep(200);
+      const mlResult = await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
+      if (mlResult.kind === "rate_limited") {
+        // Stop SMTP sink immediately — no email will arrive.
+        abort.abort();
+        if (mlResult.resetAt !== null) {
+          state.magicLinkRateLimitedUntil = new Date(mlResult.resetAt).toISOString();
+          sm.save(state);
+        }
+        throw Object.assign(new Error("magic link rate limited by webapp"), {
+          errorCategory: "login_rate_limited",
+        });
       }
+      // mlResult.kind === "sent" — wait for the email to arrive in the SMTP sink.
+      const sinkResult = await sinkPromise;
       sinkResult.stop();
       log("magic link captured from SMTP sink");
       const landingPath = await followMagicLink(sinkResult.magicLink, WEBAPP_URL, jar);
@@ -168,18 +208,36 @@ async function runAll(): Promise<void> {
       // Fail hard if re-establishment fails — do not continue to later phases.
       try {
         await enforceMagicLinkThrottle(state, sm);
-        const [sinkResult] = await Promise.all([
-          startSmtpSink({ port: SMTP_PORT, timeoutMs: BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS }),
-          (async () => {
-            await sleep(200);
-            await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
-          })(),
-        ]);
+        const abort = new AbortController();
+        const sinkPromise = startSmtpSink({
+          port: SMTP_PORT,
+          timeoutMs: BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS,
+          signal: abort.signal,
+        });
+        await sleep(200);
+        const mlResult = await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
+        if (mlResult.kind === "rate_limited") {
+          abort.abort();
+          if (mlResult.resetAt !== null) {
+            state.magicLinkRateLimitedUntil = new Date(mlResult.resetAt).toISOString();
+            sm.save(state);
+          }
+          throw Object.assign(new Error("magic link rate limited by webapp"), {
+            errorCategory: "login_rate_limited",
+          });
+        }
+        const sinkResult = await sinkPromise;
         sinkResult.stop();
         const landingPath = await followMagicLink(sinkResult.magicLink, WEBAPP_URL, jar);
         await confirmBasicDetailsIfNeeded(WEBAPP_URL, BOOTSTRAP_EMAIL, jar, landingPath);
         saveSession(jar, SESSION_FILE);
-      } catch (_err) {
+      } catch (err) {
+        const category = (err as { errorCategory?: string }).errorCategory;
+        if (category === "login_rate_limited") {
+          // Already recorded magicLinkRateLimitedUntil; propagate to trigger backoff.
+          sm.setFailed(state, "login", "login_rate_limited", String(err));
+          throw err;
+        }
         const timeoutSec = Math.round(BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS / 1000);
         const msg =
           `Trigger webapp login could not be re-established (magic link not received within ` +
@@ -321,10 +379,29 @@ async function runAll(): Promise<void> {
 // ── Subcommands ───────────────────────────────────────────────────────────────
 
 async function cmdRun(): Promise<void> {
+  const sm = new StateManager(STATE_DIR, SECRETS_DIR);
   try {
-    await runAll();
+    await runAll(sm);
     process.exit(0);
   } catch (err) {
+    const category = (err as { errorCategory?: string }).errorCategory ?? "unknown";
+    if (TRANSIENT_CATEGORIES.has(category)) {
+      // Reload state to pick up any writes made during the failed phase
+      // (e.g. magicLinkRateLimitedUntil).
+      const state = sm.load();
+      const sleepMs = computeBackoffMs(state, category);
+      // Increment the attempt counter (incremented even if rate-limit reset time is known,
+      // so fallback exponential backoff is accurate after the rate limit expires).
+      state.attempt = (state.attempt ?? 0) + 1;
+      const nextRetryAt = new Date(Date.now() + sleepMs).toISOString();
+      state.nextRetryAt = nextRetryAt;
+      sm.save(state);
+      log(
+        `backoff: sleeping ${Math.ceil(sleepMs / 1000)}s before exit` +
+          ` (${category}; next retry ~${nextRetryAt})`,
+      );
+      await sleep(sleepMs);
+    }
     console.error(`[bootstrap] FAILED: ${redact(String(err))}`);
     process.exit(1);
   }
@@ -346,17 +423,18 @@ async function cmdDashboardLink(): Promise<void> {
   const sm = new StateManager(STATE_DIR, SECRETS_DIR);
   sm.load(); // Ensure state dir is accessible.
 
-  let sinkResult: { magicLink: string; stop(): void } | undefined;
-
   const jar = loadSession(SESSION_FILE);
-  [sinkResult] = await Promise.all([
-    startSmtpSink({ port: SMTP_PORT, timeoutMs: 60_000 }),
-    (async () => {
-      await sleep(200);
-      await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
-    })(),
-  ]);
-
+  const abort = new AbortController();
+  const sinkPromise = startSmtpSink({ port: SMTP_PORT, timeoutMs: 60_000, signal: abort.signal });
+  await sleep(200);
+  const mlResult = await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
+  if (mlResult.kind !== "sent") {
+    abort.abort();
+    throw new Error(
+      `magic link request failed (${mlResult.kind}); the webapp may be rate-limiting requests`,
+    );
+  }
+  const sinkResult = await sinkPromise;
   sinkResult.stop();
 
   // Print to stdout only — not to logs (link is a one-time URL).

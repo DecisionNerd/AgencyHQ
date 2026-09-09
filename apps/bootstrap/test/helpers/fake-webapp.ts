@@ -11,6 +11,12 @@ import type { AddressInfo } from "node:net";
 export interface FakeWebappConfig {
   /** Fail magic link route (POST /login/magic) — return 500. */
   failMagicLink?: boolean;
+  /**
+   * Simulate the Trigger.dev v4.5.16 rate-limit behaviour on POST /login/magic.
+   * Returns 302 to /login with x-ratelimit-remaining: 0 and x-ratelimit-reset.
+   * When truthy, the value is used as the reset epoch-ms (or Date.now()+3600000 if true).
+   */
+  rateLimitMagicLink?: boolean | number;
   /** Fail org creation (POST /orgs/new) — return 500. */
   failOrgCreate?: boolean;
   /** Fail project creation (POST /orgs/:org/projects/new) — return 500. */
@@ -29,6 +35,7 @@ export interface FakeWebappConfig {
 
 export interface FakeWebappState {
   magicLinkRequests: number;
+  rateLimitedRequests: number;
   orgsCreated: string[];
   projectsCreated: string[];
   patsCreated: string[];
@@ -81,6 +88,7 @@ export function startFakeWebapp(config: FakeWebappConfig = {}): Promise<FakeWeba
   return new Promise((resolve) => {
     const state: FakeWebappState = {
       magicLinkRequests: 0,
+      rateLimitedRequests: 0,
       orgsCreated: [],
       projectsCreated: [],
       patsCreated: [],
@@ -109,9 +117,32 @@ export function startFakeWebapp(config: FakeWebappConfig = {}): Promise<FakeWeba
           respond(res, 500, "internal error");
           return;
         }
+        if (config.rateLimitMagicLink) {
+          // Simulate Trigger.dev v4.5.16 rate-limit: 302 → /login with rate-limit headers.
+          // Observed 2026-09-09: {"limit":30,"reset":<epoch ms>,"remaining":0,"identifier":"<email>"}
+          state.rateLimitedRequests++;
+          const resetMs =
+            typeof config.rateLimitMagicLink === "number"
+              ? config.rateLimitMagicLink
+              : Date.now() + 3_600_000; // 1 hour
+          res.writeHead(302, {
+            Location: "/login",
+            "x-ratelimit-limit": "30",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(resetMs),
+          });
+          res.end();
+          return;
+        }
         // In real webapp: 302 redirect. We return 302.
         res.writeHead(302, { Location: "/" });
         res.end();
+        return;
+      }
+
+      // GET /login — login page (visited when rate-limited)
+      if (method === "GET" && pathname === "/login") {
+        respond(res, 200, "<html><body><p>Sign in</p></body></html>");
         return;
       }
 

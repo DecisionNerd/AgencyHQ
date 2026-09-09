@@ -17,12 +17,15 @@
  * Phases (in order): wait, smtp, org, project, credentials, deploy, verify, done
  * Status: running | done | failed
  * error: present only when status === "failed"; contains a category string, never a secret.
+ * nextRetryAt: ISO timestamp of the next retry attempt; set when the bootstrap is backing
+ *   off after a transient failure (e.g. login_rate_limited). Cleared on success.
  */
 export type BootstrapJson = {
   phase: string;
   status: "running" | "done" | "failed";
   error?: string;
   at: string; // ISO-8601 timestamp of the last write
+  nextRetryAt?: string; // ISO-8601 timestamp of the next retry attempt (backoff)
 };
 
 /**
@@ -58,6 +61,7 @@ export type BootstrapReadiness = {
   status: "running" | "done" | "failed";
   error?: string;
   at: string;
+  nextRetryAt?: string; // ISO timestamp of the next retry (backoff in progress)
 } | null;
 
 /**

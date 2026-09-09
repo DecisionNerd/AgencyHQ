@@ -102,7 +102,13 @@ export function readBootstrapJson(stateDir: string | undefined): BootstrapJson |
     if ("phases" in obj && typeof obj.phases === "object" && obj.phases !== null) {
       const at = typeof obj.updatedAt === "string" ? obj.updatedAt : new Date().toISOString();
       const phases = obj.phases as Record<string, Record<string, unknown>>;
-      return translateBootstrapState(phases, at);
+      const result = translateBootstrapState(phases, at);
+      // Surface the backoff timestamp so the coordinator nextAction can say when
+      // bootstrap will retry (e.g. after login_rate_limited).
+      if (result !== null && typeof obj.nextRetryAt === "string") {
+        result.nextRetryAt = obj.nextRetryAt;
+      }
+      return result;
     }
 
     // ── Legacy format: { phase, status, at } ────────────────────────────────

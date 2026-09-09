@@ -42,6 +42,9 @@ function deriveNextAction(inputs: ReadinessInputs): string {
 
   if (bootstrapJson.status === "failed") {
     const category = bootstrapJson.error ?? "unknown";
+    if (category === "login_rate_limited" && bootstrapJson.nextRetryAt) {
+      return `Bootstrap is backing off until ${bootstrapJson.nextRetryAt} (${category}); check \`docker compose logs bootstrap\``;
+    }
     return `Bootstrap failed at ${bootstrapJson.phase}: ${category}; run \`docker compose logs bootstrap\``;
   }
 
@@ -74,6 +77,9 @@ export function buildReadiness(inputs: ReadinessInputs): ReadinessResponse {
         status: bootstrapJson.status,
         ...(bootstrapJson.error !== undefined ? { error: bootstrapJson.error } : {}),
         at: bootstrapJson.at,
+        ...(bootstrapJson.nextRetryAt !== undefined
+          ? { nextRetryAt: bootstrapJson.nextRetryAt }
+          : {}),
       }
     : null;
 

@@ -119,10 +119,11 @@ describe("requestMagicLink — 303 after POST switches to GET", () => {
 
   after(() => stopServer());
 
-  it("follows 303 from POST /login/magic as GET and returns final status 200", async () => {
+  it("follows 303 from POST /login/magic as GET and classifies non-login result as sent", async () => {
     const jar = createJar();
-    const status = await requestMagicLink(serverUrl, "user@example.com", jar);
-    assert.equal(status, 200, "final status after 303 redirect should be 200");
+    const result = await requestMagicLink(serverUrl, "user@example.com", jar);
+    // The 303 redirect lands at "/" (not /login), so the link is considered sent.
+    assert.equal(result.kind, "sent", "303 redirect to non-login page should be kind=sent");
     assert.equal(finalMethod, "GET", "redirect after 303 should use GET");
   });
 });
@@ -171,13 +172,13 @@ describe("hasValidSession", () => {
 
   it("returns false when GET / returns a /login URL directly (no redirect)", async () => {
     // Edge case: server returns 200 but at /login path (unlikely but defensive).
-    const { url, stop } = await makeServer((_req, res) => {
+    const { url: _url, stop } = await makeServer((_req, res) => {
       res.writeHead(302, { Location: "/login" });
       res.end();
     });
     try {
       // Second server that handles /login
-      const { url: url2, stop: stop2 } = await makeServer((_req, res) => {
+      const { url: _url2, stop: stop2 } = await makeServer((_req, res) => {
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end("<html>login</html>");
       });

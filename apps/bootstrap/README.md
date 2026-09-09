@@ -48,6 +48,7 @@ bootstrap dashboard-link   # Request a fresh magic link and print it to stdout o
 | Phase | Error category | Meaning |
 | --- | --- | --- |
 | `wait_services` | `services_unavailable` | Webapp did not respond within the timeout. |
+| `login` | `login_rate_limited` | The webapp rejected the magic-link request because the per-address limit (30/hour, observed 2026-09-09) is exhausted. The bootstrap backs off until the reset time (up to 15 minutes) before exiting, so `restart: on-failure` does not hot-loop. The `nextRetryAt` field in `bootstrap.json` carries the ISO timestamp of the next attempt. |
 | `login` | `magic_link_timeout` | SMTP sink timed out; no magic-link email received. |
 | `login` | `login_failed` | Following the magic link returned a non-200 response. |
 | `login` | `login_required` | Session could not be re-established after a container restart (magic link not received within timeout). Rerun after 60 s or use `dashboard-link`. |
@@ -57,6 +58,39 @@ bootstrap dashboard-link   # Request a fresh magic link and print it to stdout o
 | `credentials` | `pat_create_failed` | Token creation endpoint returned an unexpected response. |
 | `deploy` | `deploy_failed` | `trigger deploy` exited non-zero; see output for details. Re-run to retry. |
 | `verify_deployment` | `verify_failed` | `GET /api/v1/deployments/current` returned non-200. |
+
+## Backoff behaviour
+
+On any **transient** failure (categories: `login_rate_limited`, `magic_link_timeout`, `services_unavailable`, `deploy_failed`) the bootstrap process sleeps before exiting non-zero. This prevents `restart: on-failure` from hot-looping.
+
+### Sleep duration
+
+| Condition | Duration |
+| --- | --- |
+| `login_rate_limited` with known reset time | Until reset time, capped at 15 minutes |
+| `login_rate_limited` without reset time | Exponential: `min(2^attempt × 15 s, 5 min)` |
+| Other transient failures | Exponential: `min(2^attempt × 15 s, 5 min)` |
+
+The **attempt counter** is persisted in `bootstrap.json` (field `attempt`) and **reset to 0 on any successful phase**. The `nextRetryAt` ISO field is written just before sleeping so the coordinator readiness endpoint can surface it (e.g. "Bootstrap is backing off until 2026-09-09T14:00:00Z (login_rate_limited)").
+
+### Rate-limit detection
+
+Trigger.dev v4.5.16 rate-limits `POST /login/magic` per email address. The observed server log line is:
+
+```
+{"limit":30,"reset":<epoch ms>,"remaining":0,"identifier":"<email>"}
+```
+
+The bootstrap detects this in three ways (checked in order):
+1. `x-ratelimit-remaining: 0` header on the initial response hop.
+2. `retry-after` header (RFC 7231 seconds) on the initial response hop.
+3. The final URL after redirect-following is `/login` (link not sent).
+
+The reset time is parsed from `x-ratelimit-reset` (epoch-seconds or epoch-ms, auto-detected by magnitude) or `retry-after` (seconds from now).
+
+### Fail fast
+
+The SMTP sink timeout (default 90 s) applies **only after a successful magic-link request**. If the request is rate-limited or otherwise failed, the SMTP sink is cancelled immediately via `AbortController` and the bootstrap sleeps before exiting — it does not wait the full SMTP timeout.
 
 ## Known open questions (L1 required to confirm)
 
