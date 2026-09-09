@@ -44,9 +44,6 @@ services:
         if [ -f /run/agencyhq/secrets/webapp.env ]; then
           set -a && . /run/agencyhq/secrets/webapp.env && set +a
         fi &&
-        if [ -z "$${API_ORIGIN:-}" ]; then
-          export API_ORIGIN="http://$$(hostname -i | awk '{print $$1}'):3000";
-        fi &&
         chown -R node:node /home/node/shared &&
         exec ./scripts/entrypoint.sh
       "
@@ -65,9 +62,12 @@ services:
     environment:
       APP_ORIGIN: ${APP_ORIGIN:-http://localhost:8030}
       LOGIN_ORIGIN: ${LOGIN_ORIGIN:-http://localhost:8030}
-      # agencyhq: empty by default so the wrapper above advertises the container IP.
-      # Host profile: set API_ORIGIN in the env file (e.g. http://localhost:8030).
-      API_ORIGIN: ${API_ORIGIN:-}
+      # agencyhq: the CLI and deployed runners take their API URL from this value
+      # (GET /api/v1/projects/:ref/:env). Inside the Compose stack the service
+      # name is reachable from the bootstrap and from runner containers and is
+      # stable across restarts (a container IP is not). Host profile: set
+      # API_ORIGIN=http://localhost:8030 in the env file.
+      API_ORIGIN: ${API_ORIGIN:-http://webapp:3000}
       ELECTRIC_ORIGIN: http://electric:3000
       # Realtime streams v2, backed by the bundled s2-lite service. This powers
       # AI-agent token streaming and run streams. Point the endpoint at a hosted

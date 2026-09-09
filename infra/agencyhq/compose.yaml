@@ -259,11 +259,23 @@ services:
       - docker-proxy-build
     environment:
       LOG_LEVEL: info
-      # Build operations only (no container management, no network writes)
+      # The Trigger CLI builds with a buildx docker-container builder: it pulls the
+      # buildkit image, creates and starts a (privileged) buildkit container plus
+      # its state volume, and drives it over exec. The daemon-side docker driver
+      # is not usable through the proxy (the daemon answers 500 to buildx's
+      # /grpc h2c upgrade behind haproxy; observed in L1, 2026-09-09), so the
+      # proxy allows the container/exec/volume endpoints the builder needs.
+      # Only the one-shot bootstrap container can reach this proxy.
       BUILD: 1
       SESSION: 1
       GRPC: 1
       IMAGES: 1
+      CONTAINERS: 1
+      EXEC: 1
+      VOLUMES: 1
+      NETWORKS: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
       POST: 1
       INFO: 1
       VERSION: 1
