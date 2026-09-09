@@ -235,6 +235,8 @@ services:
       AGENCYHQ_WORKSPACE_ROOT: /app
       AGENCYHQ_PLATFORM: ${AGENCYHQ_PLATFORM:-linux/arm64}
       DOCKER_HOST: tcp://docker-proxy-build:2375
+      # Docker CLI state (buildx builders) must not land in the read-only /app home.
+      DOCKER_CONFIG: /var/agencyhq/state/docker
       BOOTSTRAP_SMTP_PORT: "2525"
     command:
       - "node"

@@ -184,8 +184,15 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
     args.push(...extraArgs.split(/\s+/).filter(Boolean));
   }
 
+  // The Docker CLI writes buildx state under $DOCKER_CONFIG (default $HOME/.docker);
+  // HOME is /app in the image, which the runtime user cannot write to, so the CLI
+  // config lives under the writable state directory unless the operator set one.
+  const dockerConfigDir = process.env["DOCKER_CONFIG"] ?? join(stateDir, "docker");
+  mkdirSync(dockerConfigDir, { recursive: true });
+
   const env: NodeJS.ProcessEnv = {
     ...process.env,
+    DOCKER_CONFIG: dockerConfigDir,
     TRIGGER_ACCESS_TOKEN: accessToken,
     TRIGGER_API_URL: webappIpUrl,
     TRIGGER_PROJECT_REF: projectRef,
