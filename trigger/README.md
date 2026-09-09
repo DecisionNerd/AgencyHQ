@@ -9,7 +9,7 @@
 Task definitions run by `trigger dev` on the OpenCode host (host profile) and,
 by the deployed supervisor from a task image (container profile).
 Tasks: `lead.plan`, `worker.attempt`, `verify.run`, `lead.review`,
-`lead.accept`, `integrate.merge`, `runtime.probe`. Each is a thin adapter with
+`lead.accept`, `integrate.merge`, `runtime.probe`, `image.smoke`. Each is a thin adapter with
 no policy: it does the work, reports progress through run metadata, returns
 structured output, and throws `AbortTaskRunError` on contract failures so Trigger
 does not retry them. `worker.attempt` performs the worktree-scrub-run-diff-commit
@@ -82,6 +82,7 @@ Machine presets are set per task and verified against `MachinePresetName` in
 | `lead.review` | `small-2x` | Single OpenCode serve session with diff context |
 | `lead.accept` | `small-2x` | Single OpenCode serve session with criteria context |
 | `runtime.probe` | `small-1x` | Lightweight diagnostics; no model or git operations |
+| `image.smoke` | `small-2x` | Clone public fixture + run fixture-node-v1 checks; used by L1 image qualification only |
 
 ### Environment the deployed tasks expect
 

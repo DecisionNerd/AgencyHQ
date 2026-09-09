@@ -1,0 +1,77 @@
+# compose.override.example.yaml — optional user overrides for the AgencyHQ stack.
+#
+# Copy to compose.override.yaml and edit to change ports, platform, or model IDs.
+# Docker Compose automatically merges compose.override.yaml when it exists.
+#
+# This file documents all user-configurable knobs. No secrets go here.
+# All items are commented out; uncomment and edit as needed.
+
+# ── Platform ──────────────────────────────────────────────────────────────────
+# The default platform is linux/arm64 (this host). Change to linux/amd64 when
+# building on or for an x86-64 machine. All images must be built for the same
+# platform.
+# services:
+#   app:
+#     build:
+#       platforms:
+#         - linux/amd64
+#   opencode:
+#     build:
+#       platforms:
+#         - linux/amd64
+#   secrets-init:
+#     build:
+#       platforms:
+#         - linux/amd64
+#   bootstrap:
+#     build:
+#       platforms:
+#         - linux/amd64
+
+# ── Published ports ───────────────────────────────────────────────────────────
+# All ports default to 127.0.0.1 (loopback only). Override here if you need
+# a port accessible from another host on your network.
+# services:
+#   app:
+#     ports:
+#       - "0.0.0.0:8787:8787"
+#   webapp:
+#     ports:
+#       - "0.0.0.0:8030:3000"
+#   registry:
+#     ports:
+#       - "0.0.0.0:5001:5000"
+
+# ── Model IDs ─────────────────────────────────────────────────────────────────
+# Default models are opencode/big-pickle (OpenCode Zen, zero spend).
+# Change here to use OpenRouter or Anthropic models — requires provider login
+# with the corresponding provider (`docker compose exec opencode opencode auth login`).
+# services:
+#   app:
+#     environment:
+#       AGENCYHQ_WORKER_MODEL: openrouter/anthropic/claude-sonnet-4-5
+#       AGENCYHQ_LEAD_MODEL: openrouter/anthropic/claude-sonnet-4-5
+#       AGENCYHQ_REVIEWER_MODEL: openrouter/anthropic/claude-sonnet-4-5
+
+# ── Worker slots ──────────────────────────────────────────────────────────────
+# Number of concurrent task runner containers (default: 1).
+# Raise only after increasing Docker Desktop's VM memory (≥ 2 GiB per slot
+# for the medium-1x preset) and verifying available resources.
+# services:
+#   app:
+#     environment:
+#       AGENCYHQ_WORKER_SLOTS: "2"
+
+# ── Trigger webapp port ───────────────────────────────────────────────────────
+# The Trigger dashboard is published on 127.0.0.1:8030 by default.
+# services:
+#   webapp:
+#     ports:
+#       - "127.0.0.1:8031:3000"
+
+# ── Postgres debug access ─────────────────────────────────────────────────────
+# Publish the AgencyHQ postgres on a host port for inspection with psql.
+# services:
+#   agencyhq-postgres:
+#     ports:
+#       - "127.0.0.1:5435:5432"

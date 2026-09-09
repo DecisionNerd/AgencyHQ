@@ -121,6 +121,37 @@ export const PROFILE_CATALOG: Record<string, VerificationProfile> = {
     checks: ["pnpm-install@1", "pnpm-typecheck@1", "manifest-consumer@1"],
     protectedPaths: DEFAULT_PROTECTED_PATHS,
   },
+
+  /**
+   * fixture-node-v1: proves the task image toolchain against a public fixture
+   * repository.
+   *
+   * This profile is used exclusively by the `image.smoke` task (introduced in
+   * P16.2) to verify that the deployed task container image contains a working
+   * Node/pnpm/git toolchain.  It is NOT used for production StepContracts.
+   *
+   * The smoke task clones a public fixture repository inside the container,
+   * then runs this profile's checks in the cloned directory.  A passing run
+   * proves that:
+   *  - pnpm is on PATH and can install from a lockfile (pnpm-install@1)
+   *  - TypeScript type-checking works (pnpm-typecheck@1)
+   *  - The test suite runs successfully (pnpm-test@1)
+   *
+   * Checks (in order):
+   * 1. pnpm-install@1  — installs from lockfile; fails if lockfile is stale.
+   * 2. pnpm-typecheck@1 — TypeScript type check.
+   * 3. pnpm-test@1     — unit test suite.
+   *
+   * Same checks and protectedPaths as node-pnpm-v2 so the image smoke
+   * exercises the same toolchain gates as production verification.
+   * #16 BDD 2 — container integration test.
+   */
+  "fixture-node-v1": {
+    id: "fixture-node-v1",
+    version: "1",
+    checks: ["pnpm-install@1", "pnpm-typecheck@1", "pnpm-test@1"],
+    protectedPaths: DEFAULT_PROTECTED_PATHS,
+  },
 };
 
 // ---------------------------------------------------------------------------

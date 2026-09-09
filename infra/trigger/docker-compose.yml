@@ -15,7 +15,10 @@ services:
     restart: ${RESTART_POLICY:-unless-stopped}
     logging: *logging-config
     ports:
-      - ${WEBAPP_PUBLISH_IP:-0.0.0.0}:8030:3000
+      # agencyhq: default changed to 127.0.0.1 (loopback only); upstream default
+      # was 0.0.0.0. The .env.example already sets WEBAPP_PUBLISH_IP=127.0.0.1.
+      # See UPSTREAM.md § edit 7.
+      - ${WEBAPP_PUBLISH_IP:-127.0.0.1}:${WEBAPP_PORT:-8030}:3000
     depends_on:
       - postgres
       - redis
@@ -24,12 +27,26 @@ services:
     networks:
       - webapp
       - supervisor
+      # agencyhq: attach webapp to the agencyhq network so runner task
+      # containers (joined via DOCKER_RUNNER_NETWORKS) can reach it.
+      - agencyhq
     volumes:
       - shared:/home/node/shared
+      - secrets:/run/agencyhq/secrets:ro
     # Only needed for bootstrap
     user: root
     # Only needed for bootstrap
-    command: sh -c "chown -R node:node /home/node/shared && exec ./scripts/entrypoint.sh"
+    # agencyhq: tolerant secrets wrapper — sources webapp.env from the secrets
+    # volume if present (container profile), no-ops if absent (host profile).
+    # env.server.ts var names confirmed at v4.5.16, 2026-09-09 (see UPSTREAM.md).
+    command: >
+      sh -c "
+        if [ -f /run/agencyhq/secrets/webapp.env ]; then
+          set -a && . /run/agencyhq/secrets/webapp.env && set +a
+        fi &&
+        chown -R node:node /home/node/shared &&
+        exec ./scripts/entrypoint.sh
+      "
     healthcheck:
       test:
         [
@@ -58,12 +75,14 @@ services:
       REALTIME_STREAMS_S2_ACCESS_TOKEN: ${REALTIME_STREAMS_S2_ACCESS_TOKEN:-}
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/main?schema=public&sslmode=disable}
       DIRECT_URL: ${DIRECT_URL:-postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/main?schema=public&sslmode=disable}
-      SESSION_SECRET: ${SESSION_SECRET}
-      MAGIC_LINK_SECRET: ${MAGIC_LINK_SECRET}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
-      PROVIDER_SECRET: ${PROVIDER_SECRET}
-      COORDINATOR_SECRET: ${COORDINATOR_SECRET}
-      MANAGED_WORKER_SECRET: ${MANAGED_WORKER_SECRET}
+      # agencyhq: empty placeholders — container-profile webapp wrapper sources the
+      # real values from /run/agencyhq/secrets/webapp.env before exec-ing entrypoint.
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      MAGIC_LINK_SECRET: ${MAGIC_LINK_SECRET:-}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      PROVIDER_SECRET: ${PROVIDER_SECRET:-}
+      COORDINATOR_SECRET: ${COORDINATOR_SECRET:-}
+      MANAGED_WORKER_SECRET: ${MANAGED_WORKER_SECRET:-}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_TLS_DISABLED: true
@@ -74,8 +93,8 @@ services:
       DEPLOY_REGISTRY_HOST: ${DOCKER_REGISTRY_URL:-localhost:5001}
       DEPLOY_REGISTRY_NAMESPACE: ${DOCKER_REGISTRY_NAMESPACE:-trigger}
       OBJECT_STORE_BASE_URL: ${OBJECT_STORE_BASE_URL:-http://minio:9000}
-      OBJECT_STORE_ACCESS_KEY_ID: ${OBJECT_STORE_ACCESS_KEY_ID}
-      OBJECT_STORE_SECRET_ACCESS_KEY: ${OBJECT_STORE_SECRET_ACCESS_KEY}
+      OBJECT_STORE_ACCESS_KEY_ID: ${OBJECT_STORE_ACCESS_KEY_ID:-}
+      OBJECT_STORE_SECRET_ACCESS_KEY: ${OBJECT_STORE_SECRET_ACCESS_KEY:-}
       GRACEFUL_SHUTDOWN_TIMEOUT: 1000
       NODE_MAX_OLD_SPACE_SIZE: ${NODE_MAX_OLD_SPACE_SIZE}
       # Bootstrap - this will automatically set up a worker group for you
@@ -99,6 +118,31 @@ services:
       # DEFAULT_ORG_EXECUTION_CONCURRENCY_LIMIT: 100
       # Internal OTEL configuration
       INTERNAL_OTEL_TRACE_LOGGING_ENABLED: ${INTERNAL_OTEL_TRACE_LOGGING_ENABLED:-0}
+      # ── agencyhq container-profile settings ─────────────────────────────────
+      # Tolerant: sourced from secrets volume on container profile; overridable
+      # via host .env for the host profile. See UPSTREAM.md § edit 8.
+      # env.server.ts line 379: EMAIL_TRANSPORT z.enum(["resend","smtp","aws-ses"])
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-smtp}
+      # env.server.ts line 383: SMTP_HOST z.string().optional()
+      SMTP_HOST: ${SMTP_HOST:-bootstrap}
+      # env.server.ts line 384: SMTP_PORT z.coerce.number().optional()
+      SMTP_PORT: ${SMTP_PORT:-2525}
+      # env.server.ts line 385: SMTP_SECURE BoolEnv.optional()
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      # env.server.ts line 380: FROM_EMAIL z.string().optional()
+      FROM_EMAIL: ${FROM_EMAIL:-bootstrap@agencyhq.local}
+      # env.server.ts line 333: WHITELISTED_EMAILS optional regex.
+      # Container profile: set via webapp.env (secrets-init reads AGENCYHQ_BOOTSTRAP_EMAIL).
+      # Host profile: empty = no restriction.
+      WHITELISTED_EMAILS: ${WHITELISTED_EMAILS:-}
+      # env.server.ts line 337: ADMIN_EMAILS optional regex.
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      # env.server.ts line 152: NODE_ENV. Do not use development: weakens auth.
+      NODE_ENV: ${NODE_ENV:-production}
+      # env.server.ts line 815: DEPLOY_IMAGE_PLATFORM z.string().default("linux/amd64")
+      DEPLOY_IMAGE_PLATFORM: ${AGENCYHQ_PLATFORM:-linux/arm64}
+      # env.server.ts line 374: TRIGGER_TELEMETRY_DISABLED
+      TRIGGER_TELEMETRY_DISABLED: ${TRIGGER_TELEMETRY_DISABLED:-1}
 
   postgres:
     image: postgres:${POSTGRES_IMAGE_TAG:-14}
@@ -108,17 +152,29 @@ services:
       - ${POSTGRES_PUBLISH_IP:-127.0.0.1}:5433:5432
     volumes:
       - postgres:/var/lib/postgresql/data/
+      # agencyhq: secrets volume for tolerant password wrapper (see UPSTREAM.md § edit 8).
+      # For the host profile this volume is declared but empty; the wrapper is a no-op.
+      - secrets:/run/agencyhq/secrets:ro
     networks:
       - webapp
-    command:
+    # agencyhq: tolerant wrapper — reads password from secrets volume on
+    # container profile; falls back to POSTGRES_PASSWORD on host profile.
+    entrypoint:
+      - sh
       - -c
-      - wal_level=logical
+    command:
+      - >
+        if [ -f /run/agencyhq/secrets/trigger-db-password ]; then
+          export POSTGRES_PASSWORD=$(cat /run/agencyhq/secrets/trigger-db-password);
+        fi &&
+        exec docker-entrypoint.sh -c wal_level=logical
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       # agencyhq: upstream's `:?` guard fails `docker compose config` itself
       # (not just `up`) whenever .env.example's shipped blank is still in
       # place, which blocks validating this file before secrets exist.
-      # scripts/gen-env.sh is the actual guard: it fills this before `up`.
+      # Container profile: the entrypoint wrapper above reads the real password
+      # from the secrets volume (overrides this empty placeholder).
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       POSTGRES_DB: ${POSTGRES_DB:-postgres}
     healthcheck:
@@ -178,6 +234,8 @@ services:
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       # agencyhq: see the POSTGRES_PASSWORD comment above - same reasoning.
+      # Container profile: the entrypoint wrapper sources clickhouse.env from
+      # the secrets volume, which exports the real CLICKHOUSE_PASSWORD.
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
@@ -187,24 +245,27 @@ services:
       - ../clickhouse/data-paths.xml:/etc/clickhouse-server/config.d/data-paths.xml:ro
       - ../clickhouse/override.xml:/etc/clickhouse-server/config.d/override.xml:ro
       - ../clickhouse/users-override.xml:/etc/clickhouse-server/users.d/override.xml:ro
+      # agencyhq: secrets volume for tolerant password wrapper (see UPSTREAM.md § edit 8).
+      - secrets:/run/agencyhq/secrets:ro
     networks:
       - webapp
+    # agencyhq: tolerant entrypoint wrapper — sources clickhouse.env (which
+    # exports CLICKHOUSE_PASSWORD) from the secrets volume on the container
+    # profile; no-ops on the host profile when the file is absent.
+    entrypoint:
+      - /bin/bash
+      - -c
+    command:
+      - >
+        if [ -f /run/agencyhq/secrets/clickhouse.env ]; then
+          set -a && . /run/agencyhq/secrets/clickhouse.env && set +a
+        fi &&
+        exec /entrypoint.sh
     healthcheck:
-      test:
-        [
-          "CMD",
-          "clickhouse-client",
-          "--host",
-          "localhost",
-          "--port",
-          "9000",
-          "--user",
-          "${CLICKHOUSE_USER:-default}",
-          "--password",
-          "${CLICKHOUSE_PASSWORD}",
-          "--query",
-          "SELECT 1",
-        ]
+      # agencyhq: use the unauthenticated HTTP /ping endpoint instead of
+      # clickhouse-client with --password (not available at healthcheck time).
+      # See UPSTREAM.md § edit 8.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -220,13 +281,9 @@ services:
       - ${REGISTRY_PUBLISH_IP:-127.0.0.1}:5001:5000
     networks:
       - webapp
-    volumes:
-      # registry-user:very-secure-indeed
-      - ../registry/auth.htpasswd:/auth/htpasswd:ro
-    environment:
-      REGISTRY_AUTH: htpasswd
-      REGISTRY_AUTH_HTPASSWD_REALM: Registry Realm
-      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+    # agencyhq: no htpasswd authentication — the registry is published only on
+    # 127.0.0.1 (loopback), so network isolation is the access control.
+    # See UPSTREAM.md § edit 6 for the rationale.
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:5000/"]
       interval: 10s
@@ -248,9 +305,25 @@ services:
       - webapp
     volumes:
       - minio:/bitnami/minio/data
+      # agencyhq: secrets volume for tolerant password wrapper (see UPSTREAM.md § edit 8).
+      - secrets:/run/agencyhq/secrets:ro
+    # agencyhq: tolerant entrypoint wrapper — sources minio.env (which exports
+    # MINIO_ROOT_USER/PASSWORD) from the secrets volume on the container profile;
+    # no-ops on the host profile when the file is absent.
+    entrypoint:
+      - /bin/bash
+      - -c
+    command:
+      - >
+        if [ -f /run/agencyhq/secrets/minio.env ]; then
+          set -a && . /run/agencyhq/secrets/minio.env && set +a
+        fi &&
+        exec /opt/bitnami/scripts/minio/entrypoint.sh /opt/bitnami/scripts/minio/run.sh
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-${OBJECT_STORE_ACCESS_KEY_ID:-admin}}
       # agencyhq: see the POSTGRES_PASSWORD comment above - same reasoning.
+      # Container profile: the entrypoint wrapper sources minio.env from the
+      # secrets volume, which exports the real MINIO_ROOT_PASSWORD.
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-${OBJECT_STORE_SECRET_ACCESS_KEY:-}}
       MINIO_DEFAULT_BUCKETS: packets
       MINIO_BROWSER: "on"
@@ -320,6 +393,10 @@ volumes:
   minio:
   s2:
   s2-config:
+  # agencyhq: secrets volume shared with infra/agencyhq/compose.yaml.
+  # On the host profile this is declared but empty (wrapper is a no-op).
+  # On the container profile secrets-init populates it before any service starts.
+  secrets:
 
 networks:
   docker-proxy:
@@ -328,3 +405,8 @@ networks:
     name: supervisor
   webapp:
     name: webapp
+  # agencyhq: shared with infra/agencyhq/compose.yaml (same Docker network name).
+  # webapp joins this network so runner task containers (joined via
+  # DOCKER_RUNNER_NETWORKS) can reach http://webapp:3000 and http://app:8787.
+  agencyhq:
+    name: agencyhq

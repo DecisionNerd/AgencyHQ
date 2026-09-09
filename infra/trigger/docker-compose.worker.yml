@@ -39,12 +39,27 @@ services:
       - supervisor # trigger worker stack
       - docker-proxy
       - webapp
+      # agencyhq: trigger worker stack container joins the agencyhq network so that
+      # runner task containers (attached via DOCKER_RUNNER_NETWORKS below) can reach
+      # the coordinator at http://app:8787/internal/*.
+      - agencyhq
     volumes:
       - shared:/home/node/shared
+      # agencyhq: secrets volume for MANAGED_WORKER_SECRET wrapper (see UPSTREAM.md § edit 9).
+      - secrets:/run/agencyhq/secrets:ro
     # Only needed for bootstrap
     user: root
-    # Only needed for bootstrap
-    command: sh -c "chown -R node:node /home/node/shared && exec /usr/bin/dumb-init -- pnpm run --filter supervisor start"  # trigger worker stack container init
+    # Only needed for bootstrap.
+    # agencyhq: tolerant secrets wrapper — sources supervisor.env from the secrets
+    # volume if present (container profile), no-ops if absent (host profile).
+    command: >
+      sh -c "
+        if [ -f /run/agencyhq/secrets/supervisor.env ]; then
+          set -a && . /run/agencyhq/secrets/supervisor.env && set +a
+        fi &&
+        chown -R node:node /home/node/shared &&
+        exec /usr/bin/dumb-init -- pnpm run --filter supervisor start
+      "  # trigger worker stack container init
     environment:
       # This needs to match the token of the worker group you want to connect to.
       # Use the bootstrap token written by the webapp into the shared volume
@@ -64,13 +79,21 @@ services:
       ENFORCE_MACHINE_PRESETS: 1
       TRIGGER_DEQUEUE_INTERVAL_MS: 1000
       DOCKER_HOST: tcp://docker-proxy:2375
-      DOCKER_RUNNER_NETWORKS: webapp,supervisor # trigger worker stack networks
+      # agencyhq: include agencyhq so runner task containers can reach the
+      # coordinator at http://app:8787/internal/*. See UPSTREAM.md § edit 9.
+      # webapp     — Trigger API and object store
+      # supervisor — Trigger worker stack internal routing
+      # agencyhq   — coordinator at http://app:8787/internal/*
+      DOCKER_RUNNER_NETWORKS: webapp,supervisor,agencyhq
+      # agencyhq: propagate AGENCYHQ_PLATFORM to runner container image pulls.
+      DOCKER_PLATFORM: ${AGENCYHQ_PLATFORM:-linux/arm64}
       # agencyhq: default follows the registry's publish port (5001, not
       # upstream's 5000 — macOS AirPlay Receiver holds 5000 on this host).
       DOCKER_REGISTRY_URL: ${DOCKER_REGISTRY_URL:-localhost:5001}
       DOCKER_REGISTRY_USERNAME: ${DOCKER_REGISTRY_USERNAME:-}
       DOCKER_REGISTRY_PASSWORD: ${DOCKER_REGISTRY_PASSWORD:-}
-      DOCKER_AUTOREMOVE_EXITED_CONTAINERS: 0
+      # agencyhq: auto-remove runner containers on exit (1 = enabled).
+      DOCKER_AUTOREMOVE_EXITED_CONTAINERS: "1"
     healthcheck:
       test:
         [
@@ -110,6 +133,9 @@ services:
 
 volumes:
   shared:
+  # agencyhq: secrets volume shared with docker-compose.yml and infra/agencyhq/compose.yaml.
+  # On the host profile this is declared but empty; the supervisor wrapper is a no-op.
+  secrets:
 
 networks:
   docker-proxy:
@@ -118,3 +144,9 @@ networks:
     name: supervisor # trigger worker stack
   webapp:
     name: webapp
+  # agencyhq: shared with docker-compose.yml and infra/agencyhq/compose.yaml
+  # (same Docker network name). The trigger worker stack container (supervisor)
+  # joins this network so runner task containers (attached via DOCKER_RUNNER_NETWORKS)
+  # can reach the coordinator at http://app:8787/internal/*.
+  agencyhq:
+    name: agencyhq

@@ -1,0 +1,47 @@
+# .dockerignore — files excluded from the Docker build context.
+#
+# This file keeps sensitive data and unnecessary artifacts out of image layers.
+
+# ── Secrets and credentials ───────────────────────────────────────────────────
+# Never allow environment files, credential files, or local config into images.
+.env
+.env.*
+!.env.example
+auth.json
+**/auth.json
+
+# ── Node artefacts ────────────────────────────────────────────────────────────
+# node_modules are installed inside the image via pnpm; do not copy the host copy.
+node_modules
+**/node_modules
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+# Each stage builds what it needs; pre-built dist from the host is not used.
+apps/web/dist
+**/dist
+**/.cache
+
+# ── Version control ───────────────────────────────────────────────────────────
+.git
+.gitignore
+
+# ── Editor and OS artefacts ───────────────────────────────────────────────────
+.DS_Store
+*.swp
+*.swo
+**/.idea
+**/.vscode
+
+# ── Test and coverage outputs ─────────────────────────────────────────────────
+coverage
+*.lcov
+.nyc_output
+
+# ── Scratch and Claude outputs ────────────────────────────────────────────────
+"Claude outputs/"
+.claude/
+
+# ── Docker files (no recursion needed) ───────────────────────────────────────
+# The Dockerfile itself is included (by the build context); exclude infra
+# directories that are not needed in the image.
+infra/db/
