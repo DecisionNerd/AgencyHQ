@@ -8,7 +8,17 @@
  * Every request and response is logged with secrets and one-time URLs redacted.
  * No third-party dependencies — uses Node's built-in fetch.
  */
+
 import { lookup as dnsLookup } from "node:dns/promises";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+
+/**
+ * Character class for Trigger.dev slug characters.
+ * Trigger appends random mixed-case alphanumeric suffixes (e.g. agencyhq-MvNP),
+ * so slugs are [A-Za-z0-9_-]+, not the lowercase-only [a-z0-9-] pattern.
+ */
+const SLUG_CHARS = "A-Za-z0-9_-";
 
 /** Redact Trigger token values and magic-link URLs from a string. */
 export function redact(text: string): string {
@@ -141,20 +151,20 @@ async function doFetch(
 // ── HTML parsing helpers ─────────────────────────────────────────────────────
 
 function findOrgSlug(html: string, orgPrefix: string): string | null {
-  const re = new RegExp(`href="/orgs/(${escapeRe(orgPrefix)}[a-z0-9-]*)(?:/|")`, "i");
+  const re = new RegExp(`href="/orgs/(${escapeRe(orgPrefix)}[${SLUG_CHARS}]*)(?:/|")`, "i");
   return re.exec(html)?.[1] ?? null;
 }
 
 function findProjectSlug(html: string, orgSlug: string, projectPrefix: string): string | null {
   const re = new RegExp(
-    `href="/orgs/${escapeRe(orgSlug)}/projects/(${escapeRe(projectPrefix)}[a-z0-9-]*)/env/`,
+    `href="/orgs/${escapeRe(orgSlug)}/projects/(${escapeRe(projectPrefix)}[${SLUG_CHARS}]*)/env/`,
     "i",
   );
   return re.exec(html)?.[1] ?? null;
 }
 
 function findProjectRef(html: string): string | null {
-  return /\bproj_[a-z0-9]+\b/.exec(html)?.[0] ?? null;
+  return /\bproj_[A-Za-z0-9]+\b/.exec(html)?.[0] ?? null;
 }
 
 function findProdKey(html: string): string | null {
@@ -325,7 +335,7 @@ export async function findOrCreateOrgProject(
     const body = new URLSearchParams({ orgName });
     const r = await doFetch("POST", `${webappUrl}/orgs/new`, jar, body);
     // After creating, the redirect lands on /orgs/<slug>/projects/new
-    const createdSlug = /\/orgs\/([a-z0-9-]+)\/projects\/new/.exec(r.url)?.[1];
+    const createdSlug = /\/orgs\/([A-Za-z0-9_-]+)\/projects\/new/.exec(r.url)?.[1];
     if (!createdSlug) {
       throw new Error(`could not determine org slug after creation (landed: ${r.url})`);
     }
@@ -353,7 +363,7 @@ export async function findOrCreateOrgProject(
       goalsPositions: "[]",
     });
     const r = await doFetch("POST", `${webappUrl}/orgs/${orgSlug}/projects/new`, jar, body);
-    const createdSlug = /\/orgs\/[a-z0-9-]+\/projects\/([a-z0-9-]+)/.exec(r.url)?.[1];
+    const createdSlug = /\/orgs\/[A-Za-z0-9_-]+\/projects\/([A-Za-z0-9_-]+)/.exec(r.url)?.[1];
     if (!createdSlug) {
       throw new Error(`could not determine project slug after creation (landed: ${r.url})`);
     }
@@ -382,6 +392,9 @@ export async function findOrCreateOrgProject(
 
 /**
  * Read the prod environment secret key (tr_prod_...) from the apikeys page.
+ * If the apikeys page returns 404, visits /env/prod first to ensure the env
+ * is provisioned, then retries. On a second 404 fails with category
+ * `project_page_not_found` naming the path (no secret values in the message).
  */
 export async function readProdSecretKey(
   webappUrl: string,
@@ -389,11 +402,19 @@ export async function readProdSecretKey(
   projectSlug: string,
   jar: CookieJar,
 ): Promise<string> {
-  const r = await doFetch(
-    "GET",
-    `${webappUrl}/orgs/${orgSlug}/projects/${projectSlug}/env/prod/apikeys`,
-    jar,
-  );
+  const apikeysPath = `/orgs/${orgSlug}/projects/${projectSlug}/env/prod/apikeys`;
+  let r = await doFetch("GET", `${webappUrl}${apikeysPath}`, jar);
+  if (r.status === 404) {
+    // Visit /env/prod to ensure the environment is provisioned, then retry once.
+    log(`apikeys page 404; visiting env/prod to provision then retrying`);
+    await doFetch("GET", `${webappUrl}/orgs/${orgSlug}/projects/${projectSlug}/env/prod`, jar);
+    r = await doFetch("GET", `${webappUrl}${apikeysPath}`, jar);
+  }
+  if (r.status === 404) {
+    throw Object.assign(new Error(`project page not found: ${apikeysPath}`), {
+      errorCategory: "project_page_not_found",
+    });
+  }
   const key = findProdKey(r.text);
   if (!key) throw new Error("could not find prod secret key (tr_prod_...) on apikeys page");
   log("prod secret key found");
@@ -458,6 +479,44 @@ export async function hasValidSession(webappUrl: string, jar: CookieJar): Promis
 /** Create a fresh cookie jar. */
 export function createJar(): CookieJar {
   return new Map();
+}
+
+/**
+ * Serialise the cookie jar to a JSON file at sessionPath (mode 0600).
+ * The file is treated as secret — never log its path or contents.
+ */
+export function saveSession(jar: CookieJar, sessionPath: string): void {
+  mkdirSync(dirname(sessionPath), { recursive: true });
+  writeFileSync(sessionPath, JSON.stringify(Object.fromEntries(jar)), { mode: 0o600 });
+}
+
+/**
+ * Load a previously-saved session file into a new cookie jar.
+ * Returns an empty jar if the file does not exist or cannot be parsed.
+ */
+export function loadSession(sessionPath: string): CookieJar {
+  const jar: CookieJar = new Map();
+  if (!existsSync(sessionPath)) return jar;
+  try {
+    const obj = JSON.parse(readFileSync(sessionPath, "utf-8")) as Record<string, string>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof k === "string" && typeof v === "string") jar.set(k, v);
+    }
+  } catch {
+    // Corrupt file — return empty jar; caller will re-login.
+  }
+  return jar;
+}
+
+/**
+ * Delete a persisted session file (idempotent, best-effort).
+ */
+export function deleteSession(sessionPath: string): void {
+  try {
+    if (existsSync(sessionPath)) unlinkSync(sessionPath);
+  } catch {
+    // Best-effort.
+  }
 }
 
 function sleep(ms: number): Promise<void> {

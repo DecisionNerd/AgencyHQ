@@ -70,9 +70,11 @@ function redirect(res: ServerResponse, location: string): void {
 // Fixed tokens — never real secrets; built from parts so no literal matches the grep criterion.
 const FAKE_PROD_KEY = ["tr", "prod", "FAKEKEY1234567890"].join("_");
 const FAKE_PAT_VALUE = ["tr", "pat", "FAKEPAT1234567890"].join("_");
-const FAKE_PROJECT_REF = "proj_fakeref1234";
-const ORG_SLUG = "agencyhq";
-const PROJECT_SLUG = "agencyhq";
+// proj_... ref with mixed-case suffix to verify findProjectRef handles [A-Za-z0-9]+
+const FAKE_PROJECT_REF = "proj_fakeRefABC123";
+// Mixed-case slugs matching Trigger.dev behaviour (random suffix after the prefix)
+const ORG_SLUG = "agencyhq-f0be";
+const PROJECT_SLUG = "agencyhq-MvNP";
 
 /** Start a fake webapp on a random port and return its URL and state tracker. */
 export function startFakeWebapp(config: FakeWebappConfig = {}): Promise<FakeWebapp> {
@@ -138,7 +140,9 @@ export function startFakeWebapp(config: FakeWebappConfig = {}): Promise<FakeWeba
         }
         const body = await readBody(req);
         const orgName = body.get("orgName") ?? "agencyhq";
-        const slug = orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        // Append a fixed mixed-case suffix to simulate Trigger.dev randomised slugs.
+        const base = orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        const slug = `${base}-f0be`;
         if (!state.orgsCreated.includes(slug)) {
           state.orgsCreated.push(slug);
         }
@@ -148,7 +152,7 @@ export function startFakeWebapp(config: FakeWebappConfig = {}): Promise<FakeWeba
       }
 
       // POST /orgs/:org/projects/new — create project
-      const projNewMatch = /^\/orgs\/([a-z0-9-]+)\/projects\/new$/.exec(pathname);
+      const projNewMatch = /^\/orgs\/([A-Za-z0-9_-]+)\/projects\/new$/.exec(pathname);
       if (method === "POST" && projNewMatch) {
         if (config.failProjectCreate) {
           respond(res, 500, "project creation failed");
@@ -156,22 +160,20 @@ export function startFakeWebapp(config: FakeWebappConfig = {}): Promise<FakeWeba
         }
         const body = await readBody(req);
         const projectName = body.get("projectName") ?? "agencyhq";
-        const slug = projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        // Append a fixed mixed-case suffix to simulate Trigger.dev randomised slugs.
+        const base = projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        const slug = `${base}-MvNP`;
         const orgSlug = projNewMatch[1] ?? ORG_SLUG;
         if (!state.projectsCreated.includes(slug)) {
           state.projectsCreated.push(slug);
         }
-        // Respond with HTML that contains the project ref and slug.
-        const html =
-          `<a href="/orgs/${orgSlug}/projects/${slug}/env/prod">proj</a>` +
-          `<!-- ${FAKE_PROJECT_REF} -->`;
+        // Redirect to env/prod; the env page exposes the project ref.
         redirect(res, `/orgs/${orgSlug}/projects/${slug}/env/prod`);
-        void html; // Suppress unused; we use redirect instead.
         return;
       }
 
       // GET /orgs/:org/projects/:proj/env/prod — project env page
-      const envProdMatch = /^\/orgs\/([a-z0-9-]+)\/projects\/([a-z0-9-]+)\/env\/prod$/.exec(
+      const envProdMatch = /^\/orgs\/([A-Za-z0-9_-]+)\/projects\/([A-Za-z0-9_-]+)\/env\/prod$/.exec(
         pathname,
       );
       if (method === "GET" && envProdMatch) {
@@ -186,7 +188,7 @@ export function startFakeWebapp(config: FakeWebappConfig = {}): Promise<FakeWeba
 
       // GET /orgs/:org/projects/:proj/env/prod/apikeys — prod key page
       const apikeysMatch =
-        /^\/orgs\/([a-z0-9-]+)\/projects\/([a-z0-9-]+)\/env\/prod\/apikeys$/.exec(pathname);
+        /^\/orgs\/([A-Za-z0-9_-]+)\/projects\/([A-Za-z0-9_-]+)\/env\/prod\/apikeys$/.exec(pathname);
       if (method === "GET" && apikeysMatch) {
         if (config.failApiKeys) {
           respond(res, 500, "internal error");
@@ -259,17 +261,16 @@ export function startFakeWebapp(config: FakeWebappConfig = {}): Promise<FakeWeba
 }
 
 function buildDashboard(state: FakeWebappState): string {
-  const orgLinks = state.orgsCreated
-    .map(
-      (org) =>
-        `<a href="/orgs/${org}/projects/${PROJECT_SLUG}/env/prod">` +
-        `<a href="/orgs/${org}">org</a>`,
-    )
-    .join("\n");
-  const projLinks = state.projectsCreated
-    .map((proj) => `<a href="/orgs/${ORG_SLUG}/projects/${proj}/env/prod">project</a>`)
-    .join("\n");
-  return `<html><body>${orgLinks}${projLinks}</body></html>`;
+  // Emit links that let findOrgSlug and findProjectSlug parse the slugs.
+  // Each org entry is paired with the first project created for it.
+  const links = state.orgsCreated.flatMap((org, idx) => {
+    const proj = state.projectsCreated[idx] ?? PROJECT_SLUG;
+    return [
+      `<a href="/orgs/${org}">org</a>`,
+      `<a href="/orgs/${org}/projects/${proj}/env/prod">project</a>`,
+    ];
+  });
+  return `<html><body>${links.join("\n")}</body></html>`;
 }
 
 /** Token values used by the fake webapp — for test assertions. */

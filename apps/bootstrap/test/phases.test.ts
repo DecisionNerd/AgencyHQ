@@ -134,16 +134,17 @@ describe("fake webapp — org and project creation tracking", () => {
   });
 
   it("reuses existing org and project without duplicating", async () => {
+    // Pre-seed with the same mixed-case slugs the fake webapp produces on creation.
     const webapp = await startFakeWebapp({
-      existingOrgSlug: "agencyhq",
-      existingProjectSlug: "agencyhq",
+      existingOrgSlug: FAKE.ORG_SLUG,
+      existingProjectSlug: FAKE.PROJECT_SLUG,
     });
     try {
       const jar = new Map<string, string>();
       // Dashboard shows the existing org/project, so nothing new is created.
       const result = await findOrCreateOrgProject(webapp.url, "agencyhq", "agencyhq", jar);
-      assert.ok(result.orgSlug);
-      assert.ok(result.projectSlug);
+      assert.ok(result.orgSlug.startsWith("agencyhq"));
+      assert.ok(result.projectSlug.startsWith("agencyhq"));
       // No new creation should have happened.
       assert.equal(webapp.state.orgsCreated.length, 1); // only the pre-seeded one
     } finally {

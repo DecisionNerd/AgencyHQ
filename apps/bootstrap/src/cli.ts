@@ -14,20 +14,24 @@
  *   AGENCYHQ_PLATFORM      Target platform (e.g. linux/arm64).
  */
 
+import { join } from "node:path";
 import { enrichDeployment, runDeploy } from "./deploy.ts";
 import { startSmtpSink } from "./smtp-sink.ts";
+import type { BootstrapState } from "./state.ts";
 import { StateManager } from "./state.ts";
 import {
   confirmBasicDetailsIfNeeded,
-  createJar,
+  deleteSession,
   findOrCreateOrgProject,
   followMagicLink,
   hasValidSession,
+  loadSession,
   mintPAT,
   readProdSecretKey,
   redact,
   requestMagicLink,
   resolveWebappIp,
+  saveSession,
   waitForReadiness,
 } from "./trigger-web.ts";
 import { verifyDeployment } from "./verify.ts";
@@ -47,6 +51,26 @@ const WORKSPACE_ROOT = process.env["AGENCYHQ_WORKSPACE_ROOT"] ?? "/app";
 const PLATFORM = process.env["AGENCYHQ_PLATFORM"] ?? "linux/arm64";
 const SMTP_PORT = Number(process.env["BOOTSTRAP_SMTP_PORT"] ?? "2525");
 
+/**
+ * How long to wait for the magic-link email to arrive in the SMTP sink (ms).
+ * Configurable because the webapp throttles repeated magic links to the same
+ * address; operators can increase this if the email consistently arrives late.
+ */
+const BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS = Number(
+  process.env["BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS"] ?? "90000",
+);
+
+/** Minimum interval between magic-link requests to the same address (ms). */
+const MAGIC_LINK_THROTTLE_MS = 60_000;
+
+/**
+ * Persisted session cookie file (0600).
+ * Loaded on every run; deleted when the session is detected as invalid.
+ * Stored in the state directory so it survives container restarts on the
+ * same volume, but never included in bootstrap.json (which is non-secret).
+ */
+const SESSION_FILE = join(STATE_DIR, "webapp-session.json");
+
 // File names for secrets written to the state volume (0600 files).
 // Must match what the coordinator reads: apps/coordinator/src/config.ts readTriggerKeyFromState.
 const SECRET_PROD_KEY = "trigger-prod.key";
@@ -54,6 +78,26 @@ const SECRET_PAT = "trigger-pat.key";
 
 function log(msg: string): void {
   console.log(`[bootstrap] ${redact(msg)}`);
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Wait until at least MAGIC_LINK_THROTTLE_MS has elapsed since the last
+ * magic-link request, then record the new request timestamp in the state.
+ */
+async function enforceMagicLinkThrottle(state: BootstrapState, sm: StateManager): Promise<void> {
+  const lastReqAt = state.lastMagicLinkRequestAt
+    ? new Date(state.lastMagicLinkRequestAt).getTime()
+    : 0;
+  const sinceLastReq = Date.now() - lastReqAt;
+  if (sinceLastReq < MAGIC_LINK_THROTTLE_MS) {
+    const waitMs = MAGIC_LINK_THROTTLE_MS - sinceLastReq;
+    log(`throttle: waiting ${Math.ceil(waitMs / 1000)}s before requesting a new magic link`);
+    await sleep(waitMs);
+  }
+  state.lastMagicLinkRequestAt = new Date().toISOString();
+  sm.save(state);
 }
 
 // ── Phase runner ─────────────────────────────────────────────────────────────
@@ -77,14 +121,18 @@ async function runAll(): Promise<void> {
     log("phase: wait_services — already done");
   }
 
-  // ── Phase: login ─────────────────────────────────────────────────────────
-  const jar = createJar();
+  // ── Phase: login ───────────────────────────────────────────────────────────
+  // Load the persisted session cookie jar (empty if no file exists yet).
+  const jar = loadSession(SESSION_FILE);
+
   if (!sm.isDone(state, "login")) {
     sm.setRunning(state, "login");
     log("phase: login — starting SMTP sink and requesting magic link");
     try {
+      // Enforce throttle before sending the magic-link request.
+      await enforceMagicLinkThrottle(state, sm);
       const [sinkResult, status] = await Promise.all([
-        startSmtpSink({ port: SMTP_PORT, timeoutMs: 60_000 }),
+        startSmtpSink({ port: SMTP_PORT, timeoutMs: BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS }),
         (async () => {
           // Give the sink a moment to start before requesting the link.
           await sleep(200);
@@ -101,6 +149,8 @@ async function runAll(): Promise<void> {
       log("magic link captured from SMTP sink");
       const landingPath = await followMagicLink(sinkResult.magicLink, WEBAPP_URL, jar);
       await confirmBasicDetailsIfNeeded(WEBAPP_URL, BOOTSTRAP_EMAIL, jar, landingPath);
+      // Persist the authenticated session so restarts do not need to re-login.
+      saveSession(jar, SESSION_FILE);
       sm.setDone(state, "login");
     } catch (err) {
       const category = (err as { errorCategory?: string }).errorCategory ?? "login_failed";
@@ -110,13 +160,16 @@ async function runAll(): Promise<void> {
   } else {
     log("phase: login — already done; checking session validity");
     // "done" means a valid session must exist now.
-    // Verify by GET / — if we are redirected to /login the session is absent.
+    // Verify by GET / — if we are redirected to /login the session is absent or expired.
     const sessionValid = await hasValidSession(WEBAPP_URL, jar).catch(() => false);
     if (!sessionValid) {
-      log("session invalid — obtaining fresh magic link (never reusing a captured link)");
+      log("session invalid — deleting stale file and obtaining fresh magic link");
+      deleteSession(SESSION_FILE);
+      // Fail hard if re-establishment fails — do not continue to later phases.
       try {
+        await enforceMagicLinkThrottle(state, sm);
         const [sinkResult] = await Promise.all([
-          startSmtpSink({ port: SMTP_PORT, timeoutMs: 60_000 }),
+          startSmtpSink({ port: SMTP_PORT, timeoutMs: BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS }),
           (async () => {
             await sleep(200);
             await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
@@ -125,8 +178,15 @@ async function runAll(): Promise<void> {
         sinkResult.stop();
         const landingPath = await followMagicLink(sinkResult.magicLink, WEBAPP_URL, jar);
         await confirmBasicDetailsIfNeeded(WEBAPP_URL, BOOTSTRAP_EMAIL, jar, landingPath);
-      } catch (err) {
-        log(`session re-establishment failed: ${String(err)}; continuing`);
+        saveSession(jar, SESSION_FILE);
+      } catch (_err) {
+        const timeoutSec = Math.round(BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS / 1000);
+        const msg =
+          `Trigger webapp login could not be re-established (magic link not received within ` +
+          `${timeoutSec}s); rerun \`docker compose up -d bootstrap\` after 60 s or run ` +
+          `\`docker compose run --rm bootstrap dashboard-link\``;
+        sm.setFailed(state, "login", "login_required", msg);
+        throw Object.assign(new Error(msg), { errorCategory: "login_required" });
       }
     } else {
       log("session valid — continuing without re-login");
@@ -288,7 +348,7 @@ async function cmdDashboardLink(): Promise<void> {
 
   let sinkResult: { magicLink: string; stop(): void } | undefined;
 
-  const jar = createJar();
+  const jar = loadSession(SESSION_FILE);
   [sinkResult] = await Promise.all([
     startSmtpSink({ port: SMTP_PORT, timeoutMs: 60_000 }),
     (async () => {

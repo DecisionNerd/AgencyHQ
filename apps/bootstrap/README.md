@@ -7,7 +7,7 @@ Bootstraps a self-hosted Trigger.dev webapp into a usable AgencyHQ execution env
 ## What it does
 
 1. **wait_services** — Polls `GET /healthcheck` until the webapp responds HTTP 200.
-2. **login** — Starts a minimal SMTP sink on port 2525, requests a magic link for the bootstrap email address, captures the link from the incoming email (MIME-decoded: quoted-printable soft breaks and `=XX` sequences are resolved; HTML entities such as `&amp;` and `&#x3D;` in HTML parts are unescaped; the first URL with a non-empty `token` query parameter wins), follows it to establish an authenticated session. On rerun, the phase checks whether a valid session already exists (GET `/` must not redirect to `/login`); if not, a fresh magic link is requested — a previously captured link is never reused.
+2. **login** — Starts a minimal SMTP sink on port 2525, requests a magic link for the bootstrap email address, captures the link from the incoming email (MIME-decoded: quoted-printable soft breaks and `=XX` sequences are resolved; HTML entities such as `&amp;` and `&#x3D;` in HTML parts are unescaped; the first URL with a non-empty `token` query parameter wins), follows it to establish an authenticated session. The authenticated cookie jar is saved to `webapp-session.json` (0600) in `AGENCYHQ_STATE_DIR` so container restarts do not need to re-login. On rerun, the phase loads the session file; if the session is invalid (GET `/` redirects to `/login`), the file is deleted and a fresh magic link is requested. If the magic link is not received within `BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS`, the run fails with category `login_required` and an actionable message rather than silently continuing. A 60-second throttle between requests prevents the webapp from rejecting rapid repeated requests.
 3. **org_project** — Finds or creates the organisation and project by slug prefix (`agencyhq`). Reuses existing resources if already present; never creates duplicates.
 4. **credentials** — Reads the prod environment secret key (`tr_prod_...`) from the webapp's API keys page. Mints a personal access token (`tr_pat_...`) only when none is already stored. Both are persisted as separate 0600 files in `AGENCYHQ_SECRETS_DIR`, never in the state JSON.
 5. **deploy** — Runs `trigger deploy --local-build --external-id <sha256>` from the workspace `trigger/` directory with `TRIGGER_ACCESS_TOKEN` (the PAT file) and `TRIGGER_API_URL` (webapp with DNS-resolved IP, to avoid the CLI's `localhost` → `host.docker.internal` rewrite). Skips the build when `deployment.json` already records the same external ID.
@@ -25,6 +25,7 @@ Each phase is idempotent and resumable: restarting the container picks up from t
 | `TRIGGER_WEBAPP_URL` | `http://webapp:3000` | Internal URL of the Trigger.dev webapp container. |
 | `BOOTSTRAP_EMAIL` | `agencyhq@example.com` | Email address for the magic-link login. Must match `WHITELISTED_EMAILS`/`ADMIN_EMAILS`. |
 | `BOOTSTRAP_SMTP_PORT` | `2525` | Port for the built-in SMTP sink (the webapp sends to this host). |
+| `BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS` | `90000` | How long to wait for the magic-link email (ms). Increase if the email consistently arrives late; note the webapp throttles repeated requests to the same address (see throttle below). |
 | `AGENCYHQ_ORG_NAME` | `agencyhq` | Organisation name to find or create. |
 | `AGENCYHQ_PROJECT_NAME` | `agencyhq` | Project name to find or create. |
 | `AGENCYHQ_TOKEN_NAME` | `agencyhq-bootstrap` | Personal access token name. |
@@ -49,8 +50,10 @@ bootstrap dashboard-link   # Request a fresh magic link and print it to stdout o
 | `wait_services` | `services_unavailable` | Webapp did not respond within the timeout. |
 | `login` | `magic_link_timeout` | SMTP sink timed out; no magic-link email received. |
 | `login` | `login_failed` | Following the magic link returned a non-200 response. |
+| `login` | `login_required` | Session could not be re-established after a container restart (magic link not received within timeout). Rerun after 60 s or use `dashboard-link`. |
 | `org_project` | `org_create_failed` | Org or project creation failed. |
 | `credentials` | `secret_key_missing` | Prod key or PAT not found in the webapp response. |
+| `credentials` | `project_page_not_found` | API keys page returned 404 after env/prod provisioning attempt. Check that the org and project slugs are correct. |
 | `credentials` | `pat_create_failed` | Token creation endpoint returned an unexpected response. |
 | `deploy` | `deploy_failed` | `trigger deploy` exited non-zero; see output for details. Re-run to retry. |
 | `verify_deployment` | `verify_failed` | `GET /api/v1/deployments/current` returned non-200. |

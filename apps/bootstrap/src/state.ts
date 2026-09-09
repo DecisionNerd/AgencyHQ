@@ -39,6 +39,11 @@ export interface BootstrapState {
   version: 1;
   phases: Partial<Record<Phase, PhaseState>>;
   updatedAt: string;
+  /**
+   * ISO timestamp of the most recent magic-link request.
+   * Used to enforce a 60-second throttle between requests to the same address.
+   */
+  lastMagicLinkRequestAt?: string;
 }
 
 export const PHASES: readonly Phase[] = [
