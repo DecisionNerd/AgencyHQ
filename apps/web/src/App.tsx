@@ -40,6 +40,7 @@ import {
   formatTimestamp,
   lifecycleIcon,
   parseRoute,
+  pickLatestAttempt,
   pickOpenDecision,
 } from "./control-plane-helpers.js";
 import { ExecutionState } from "./ExecutionState.js";
@@ -1110,8 +1111,9 @@ function WorkItemPage({
   const openDecision = pickOpenDecision(openPendingDecisions ?? null);
   const openDecisionsAbsent = item !== null && openPendingDecisions === undefined;
 
-  // Find the first attempt id for stop/invalidate (evidence-based, not decision-based)
-  const latestAttempt = evidence?.attempts[0];
+  // Pick the best attempt for stop/pause/invalidate actions: prefer an active
+  // (dispatched/running/stopping) attempt; otherwise the highest-version, most-recent one.
+  const latestAttempt = pickLatestAttempt(evidence?.attempts);
 
   return (
     <div className="layout">

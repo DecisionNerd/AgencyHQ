@@ -367,6 +367,48 @@ export function pickOpenDecision(
 }
 
 // ---------------------------------------------------------------------------
+// Latest-attempt picker
+// ---------------------------------------------------------------------------
+
+/** Minimal shape needed to pick the "latest" attempt. Mirrors EvidenceAttempt from api.ts. */
+export interface LatestAttemptCandidate {
+  id: string;
+  contractVersion?: number | null | undefined;
+  status: string;
+  updatedAt: string;
+}
+
+/**
+ * Pick the "latest" attempt from an evidence attempts array.
+ *
+ * Preference order:
+ * 1. An attempt whose status is `dispatched`, `running`, or `stopping` (i.e. actively
+ *    executing) — there is normally at most one such attempt at a time.
+ * 2. Among those, or when none are active, the highest (contractVersion, updatedAt)
+ *    attempt (both descending), treating a null contractVersion as 0.
+ *
+ * Returns `undefined` when the array is empty or absent.
+ *
+ * Unit-tested in control-plane-helpers.test.ts.
+ */
+export function pickLatestAttempt<T extends LatestAttemptCandidate>(
+  attempts: T[] | null | undefined,
+): T | undefined {
+  if (!Array.isArray(attempts) || attempts.length === 0) return undefined;
+  const ACTIVE_STATUSES = new Set(["dispatched", "running", "stopping"]);
+  const active = attempts.filter((a) => ACTIVE_STATUSES.has(a.status));
+  const pool = active.length > 0 ? active : attempts;
+  return pool.reduce<T | undefined>((best, a) => {
+    if (!best) return a;
+    const aVersion = a.contractVersion ?? 0;
+    const bVersion = best.contractVersion ?? 0;
+    if (aVersion !== bVersion) return aVersion > bVersion ? a : best;
+    // Same version — compare updatedAt lexicographically (ISO 8601 is comparable).
+    return a.updatedAt > best.updatedAt ? a : best;
+  }, undefined);
+}
+
+// ---------------------------------------------------------------------------
 // Confirmation message builder
 // ---------------------------------------------------------------------------
 

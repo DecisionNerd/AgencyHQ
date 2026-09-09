@@ -18,6 +18,7 @@ import {
   formatTimestamp,
   lifecycleIcon,
   parseRoute,
+  pickLatestAttempt,
   pickOpenDecision,
 } from "../src/control-plane-helpers.ts";
 
@@ -550,4 +551,132 @@ test("pickOpenDecision: returns first of multiple decisions", () => {
     at: "2026-09-08T11:00:00.000Z",
   };
   assert.deepEqual(pickOpenDecision([first, second]), first);
+});
+
+// ---- pickLatestAttempt -----------------------------------------------------
+
+test("pickLatestAttempt: returns undefined for empty array", () => {
+  assert.equal(pickLatestAttempt([]), undefined);
+});
+
+test("pickLatestAttempt: returns undefined for null", () => {
+  assert.equal(pickLatestAttempt(null), undefined);
+});
+
+test("pickLatestAttempt: returns undefined for undefined", () => {
+  assert.equal(pickLatestAttempt(undefined), undefined);
+});
+
+test("pickLatestAttempt: v1 completed + v2 running → returns the running v2 attempt", () => {
+  const v1Completed = {
+    id: "att-v1-completed",
+    contractVersion: 1,
+    status: "completed",
+    updatedAt: "2026-09-01T10:00:00.000Z",
+  };
+  const v2Running = {
+    id: "att-v2-running",
+    contractVersion: 2,
+    status: "running",
+    updatedAt: "2026-09-01T11:00:00.000Z",
+  };
+  // Evidence route returns ascending by contractVersion, so v1 first.
+  assert.deepEqual(pickLatestAttempt([v1Completed, v2Running]), v2Running);
+});
+
+test("pickLatestAttempt: two completed attempts → returns the one with the higher contract version", () => {
+  const v1 = {
+    id: "att-v1",
+    contractVersion: 1,
+    status: "completed",
+    updatedAt: "2026-09-01T10:00:00.000Z",
+  };
+  const v2 = {
+    id: "att-v2",
+    contractVersion: 2,
+    status: "completed",
+    updatedAt: "2026-09-01T11:00:00.000Z",
+  };
+  assert.deepEqual(pickLatestAttempt([v1, v2]), v2);
+});
+
+test("pickLatestAttempt: same version, two completed → returns the one with later updatedAt", () => {
+  const older = {
+    id: "att-older",
+    contractVersion: 1,
+    status: "completed",
+    updatedAt: "2026-09-01T09:00:00.000Z",
+  };
+  const newer = {
+    id: "att-newer",
+    contractVersion: 1,
+    status: "completed",
+    updatedAt: "2026-09-01T10:00:00.000Z",
+  };
+  assert.deepEqual(pickLatestAttempt([older, newer]), newer);
+});
+
+test("pickLatestAttempt: dispatched attempt preferred over higher-version completed", () => {
+  const dispatched = {
+    id: "att-dispatched",
+    contractVersion: 1,
+    status: "dispatched",
+    updatedAt: "2026-09-01T08:00:00.000Z",
+  };
+  const completed = {
+    id: "att-completed",
+    contractVersion: 2,
+    status: "completed",
+    updatedAt: "2026-09-01T12:00:00.000Z",
+  };
+  // dispatched is active → preferred despite lower version
+  assert.deepEqual(pickLatestAttempt([dispatched, completed]), dispatched);
+});
+
+test("pickLatestAttempt: stopping attempt is treated as active", () => {
+  const stopping = {
+    id: "att-stopping",
+    contractVersion: 1,
+    status: "stopping",
+    updatedAt: "2026-09-01T08:00:00.000Z",
+  };
+  const completed = {
+    id: "att-completed",
+    contractVersion: 3,
+    status: "completed",
+    updatedAt: "2026-09-01T12:00:00.000Z",
+  };
+  assert.deepEqual(pickLatestAttempt([stopping, completed]), stopping);
+});
+
+test("pickLatestAttempt: pause confirm message names version when there is no open decision (unit coverage for X-3)", () => {
+  // Verifies the pause path: no openDecision, so pause uses latestAttempt directly.
+  // pickLatestAttempt picks the running attempt; confirmMessage uses its version.
+  const v1Completed = {
+    id: "att-v1",
+    contractVersion: 1,
+    status: "completed",
+    updatedAt: "2026-09-01T10:00:00.000Z",
+  };
+  const v2Running = {
+    id: "att-v2",
+    contractVersion: 2,
+    status: "running",
+    updatedAt: "2026-09-01T11:00:00.000Z",
+  };
+  const latest = pickLatestAttempt([v1Completed, v2Running]);
+  assert.equal(latest?.id, "att-v2");
+
+  // No open decision → pause uses latestAttempt's version and id.
+  const msg = confirmMessage({
+    action: "pause",
+    projectId: "prj-1",
+    workItemId: "wi-1",
+    attemptId: latest?.id,
+    contractVersion: latest?.contractVersion,
+    consequence: "pauses dispatch for this work item; running attempts continue",
+  });
+  assert.match(msg, /contract v2/);
+  assert.ok(msg.includes("att-v2"), "pause message should include the running attempt id");
+  assert.ok(msg.includes("pauses dispatch"), "pause message should include consequence");
 });
