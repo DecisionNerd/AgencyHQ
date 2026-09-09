@@ -25,11 +25,13 @@ or in any tracked file; they live only in the `secrets` Docker volume.
 | File | Purpose |
 | --- | --- |
 | `secrets-init.mjs` | Node.js secret generator (no deps). Writes all secret files with mode 0600. |
-| `entrypoint-webapp.sh` | Wrapper for the Trigger.dev webapp container; sources `webapp.env`. |
-| `entrypoint-trigger-worker.sh` | Wrapper for the Trigger worker stack container; sources `supervisor.env`. |
 | `entrypoint-app.sh` | Wrapper for the AgencyHQ coordinator container; sources `agencyhq.env`. |
-| `entrypoint-clickhouse.sh` | Wrapper for Clickhouse; sources `clickhouse.env`. |
-| `entrypoint-minio.sh` | Wrapper for MinIO (bitnami); sources `minio.env`. |
+
+The Trigger webapp, the worker stack container, ClickHouse, MinIO, Electric and
+the Trigger Postgres run their upstream images, so they source their files
+through inline `command:`/`entrypoint:` wrappers in `infra/trigger/docker-compose.yml`,
+`infra/trigger/docker-compose.worker.yml` and `infra/agencyhq/trigger-overrides.yaml`
+(each tolerant of a missing file so the host profile is unaffected).
 
 ## Secrets generated
 

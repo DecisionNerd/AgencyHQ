@@ -146,17 +146,10 @@ RUN apt-get update \
  && apt-get purge -y gnupg && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy entrypoint wrappers used by other container roles.
-COPY infra/secrets/entrypoint-webapp.sh         /usr/local/bin/entrypoint-webapp.sh
-COPY infra/secrets/entrypoint-trigger-worker.sh /usr/local/bin/entrypoint-trigger-worker.sh
-COPY infra/secrets/entrypoint-clickhouse.sh     /usr/local/bin/entrypoint-clickhouse.sh
-COPY infra/secrets/entrypoint-minio.sh          /usr/local/bin/entrypoint-minio.sh
+# The Trigger, ClickHouse and MinIO containers source their secret files through
+# inline command wrappers in infra/trigger/docker-compose*.yml and the override
+# layers (they run other images); only the secrets generator ships here.
 COPY infra/secrets/secrets-init.mjs             /usr/local/bin/secrets-init.mjs
-
-RUN chmod +x /usr/local/bin/entrypoint-webapp.sh \
-             /usr/local/bin/entrypoint-trigger-worker.sh \
-             /usr/local/bin/entrypoint-clickhouse.sh \
-             /usr/local/bin/entrypoint-minio.sh
 
 # ── Bootstrap source (apps/bootstrap) ─────────────────────────────────────────
 # Copied into the tools target (not app) so the bootstrap CLI can run in-container.
