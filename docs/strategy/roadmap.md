@@ -123,8 +123,7 @@ on it.
   Hash-router web app (`#/`, `#/decisions`, `#/work-items/:id`,
   `#/projects/:id/authority`, `#/return`) with bearer-auth token prompt on 401;
   work-item actions (approve, reject, stop, invalidate, pause) each show a confirm
-  dialog naming the project, work item, contract version (where available), and
-  consequence phrase. Playwright browser tests: 20 journeys on a
+  dialog naming the project, work item, contract version, and consequence phrase. Playwright browser tests: 20 journeys on a
   fake-runtime seeded coordinator (return after interruption; four state-card
   source/timestamp checks; six work-item states; approve from decisions and
   work-item pages; reject to halted; authority invalid/valid/parse-error flows;

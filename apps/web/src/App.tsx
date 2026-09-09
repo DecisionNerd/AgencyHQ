@@ -1298,7 +1298,8 @@ function WorkItemPage({
                           openDecision?.contractVersion ??
                           evidence?.decisions.find(
                             (d) => d.attemptId === latestAttempt.id && d.contractVersion != null,
-                          )?.contractVersion,
+                          )?.contractVersion ??
+                          latestAttempt.contractVersion,
                         consequence: "stops the running attempt; the checkpoint is kept",
                       }),
                       () =>
@@ -1328,8 +1329,9 @@ function WorkItemPage({
                       action: "pause",
                       projectId: projectId ?? "unknown",
                       workItemId: item.workItemId,
-                      attemptId: openDecision?.attemptId,
-                      contractVersion: openDecision?.contractVersion,
+                      attemptId: openDecision?.attemptId ?? latestAttempt?.id,
+                      contractVersion:
+                        openDecision?.contractVersion ?? latestAttempt?.contractVersion,
                       consequence: "pauses dispatch for this work item; running attempts continue",
                     }),
                     () =>

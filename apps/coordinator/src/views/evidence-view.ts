@@ -90,6 +90,7 @@ export type EvidenceManifestRowLike = {
 export type EvidenceAttemptLike = {
   id: string;
   contractId: string;
+  contractVersion?: number | null;
   status: string;
   runId?: string | null;
   checkpointCommit?: string | null;
