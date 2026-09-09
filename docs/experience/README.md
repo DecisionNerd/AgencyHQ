@@ -18,6 +18,17 @@ when its evidence and the resulting decision are explicit.
 - **Recoverable history** — retries and corrections preserve prior attempts and
   causation.
 
+## Startup requirement from the project owner (2026-09-08)
+
+The owner rejected an onboarding path requiring manually assembled services
+and host development processes. The requested experience is one Compose startup,
+OpenCode provider login with persisted state, and reusable worker images that
+support additional task containers. This is direct product input, not a
+validated usability study. R-021–R-025 and
+[ADR-0008](../engineering/adrs/0008-compose-first-container-runtime.md) turn it
+into a target; [C1–C7](../engineering/TESTING.md#compose-runtime-qualification)
+define the observable success criteria.
+
 ## Artifact shape
 
 A future opportunity, journey, or study should record observed need and

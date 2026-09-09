@@ -8,6 +8,22 @@ StepContracts, Attempts, Decisions, and evidence. Agent conversations and Trigge
 implementation details attached to those objects; live run state comes from
 Trigger Realtime and raw logs live in the Trigger dashboard, linked, not copied.
 
+## First run and worker readiness
+
+The accepted target is one Compose startup command and OpenCode's own first-use
+provider login. Do not make users assemble services, run migrations, copy
+internal tokens, keep a host development runner open, or seed the database.
+Provider authorization and repository access are the only user-supplied access;
+show each missing setup action without exposing secrets. Preserve login and
+project state across normal restarts.
+
+Show service readiness, provider readiness, and eligible worker capacity
+separately. The UI must remain usable for setup when no provider is connected.
+Adding capacity uses the existing task image and configured provider access;
+it does not introduce a per-task login journey. Container recreation must not
+make accepted evidence or available checkpoints disappear. These flows are
+pending implementation under [ADR-0008](engineering/adrs/0008-compose-first-container-runtime.md).
+
 ## Primary workspace
 
 Lead with changed outcomes, decisions needed, and work that continues. The

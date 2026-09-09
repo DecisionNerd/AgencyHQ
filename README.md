@@ -1,10 +1,143 @@
 # AgencyHQ
 
-AgencyHQ is an engineering coordination control plane. It turns intent into
-bounded, durable work while keeping completion tied to source-controlled
-changes and reproducible evidence.
+AgencyHQ helps you coordinate AI coding agents across your repositories.
+Describe a repair, set the scope and permissions, and follow the work from
+planning through verification, review, and acceptance. Use the web interface
+to see progress, inspect evidence, resolve decisions, and approve changes.
 
-Slices 1–3 are implemented (execution spike, domain kernel, and one complete bounded repair through acceptance). Slice 4 is next. See the [roadmap](docs/strategy/roadmap.md) for the current state.
+Work stays tied to Git revisions and reproducible evidence. You can organize
+work into campaigns, prioritize across projects, and return after an
+interruption to see what changed and what needs your attention.
+
+AgencyHQ is under active development and runs from source. The current
+implementation includes bounded repairs, merge integration, work spanning
+multiple repositories, an operator dashboard, and capacity-aware scheduling.
+Real coding runs use the host runtime profile; container execution remains
+partially qualified. See the [roadmap](docs/strategy/roadmap.md) for progress
+and recorded trial limitations.
+
+## Installation and quick start target
+
+The accepted installation experience is:
+
+```sh
+git clone https://github.com/DecisionNerd/AgencyHQ.git
+cd AgencyHQ
+docker compose up -d
+docker compose exec opencode opencode auth login
+```
+
+**Implementation pending:** there is no root Compose file or `opencode`
+service yet. These commands define the target, not today's runnable setup.
+Only Git, Docker with Compose, and a browser are required on the host. Docker
+will build and start the full stack, run migrations, configure internal
+credentials, bootstrap Trigger, and register the worker image. OpenCode handles
+first-use provider login; authentication and project data survive restarts.
+
+Open AgencyHQ, complete any remaining provider or repository setup, and start
+work. The UI will distinguish service health, provider login, and available
+workers. Trigger will launch disposable task containers from the same image as
+eligible concurrency grows, preserving evidence and checkpoints outside the
+containers. No separate host runner or per-task login is required by default.
+
+See [ADR-0008](docs/engineering/adrs/0008-compose-first-container-runtime.md)
+for the specification and the [implementation roadmap](docs/strategy/roadmap.md#compose-first-container-runtime)
+for tracked work. The host setup below remains a fallback while this is built.
+
+## Current installation (host fallback)
+
+You will need:
+
+- Git.
+- Node.js 24 or newer.
+- pnpm 11 (the repository pins version 11.25.0).
+- Docker with Docker Compose for the local PostgreSQL database.
+
+Clone the repository and install its dependencies:
+
+```sh
+git clone https://github.com/DecisionNerd/AgencyHQ.git
+cd AgencyHQ
+pnpm install
+cp .env.example .env
+```
+
+If you already have a checkout or `.env`, keep it and update the settings as
+needed. In `.env`, set a writable location for worktrees:
+
+```dotenv
+AGENCYHQ_WORKTREE_BASE=/tmp/agencyhq-worktrees
+```
+
+Keep `RUNTIME=fake` for the local walkthrough below. The supplied database
+URL uses `127.0.0.1:5434`, matching the bundled Compose configuration. The
+model settings can stay at their defaults for this walkthrough; it does not
+require OpenCode, model credentials, or Trigger.dev.
+
+## Current local walkthrough (fake runtime)
+
+Run these commands from the repository root with Docker running:
+
+```sh
+docker compose -f infra/db/compose.yaml up -d --wait
+pnpm --filter @agencyhq/web build
+WEB_DIST="$PWD/apps/web/dist" RUNTIME=fake pnpm --filter @agencyhq/coordinator start
+```
+
+The coordinator applies database migrations on startup and serves the web
+interface at [http://127.0.0.1:8787](http://127.0.0.1:8787). The `WEB_DIST`
+override gives it the absolute path to the built interface. A new database
+opens with an empty overview.
+
+To explore a populated dashboard, run the following in a second terminal
+from the repository root, then refresh the page:
+
+```sh
+node --env-file=.env apps/coordinator/scripts/seed-control-plane.ts
+```
+
+This loads the browser-test sample campaign, projects, work items, evidence,
+and pending decisions into your local database. Use it with the fake runtime
+for a walkthrough. Each run creates a fresh sample project and expires
+pending decisions from earlier sample projects.
+
+- Open a work item to inspect its contract, execution, verification,
+  acceptance, and integration state.
+- Open **Decisions** to review pending approvals and their supporting evidence.
+- Open the return view at
+  [/#/return](http://127.0.0.1:8787/#/return) to see changes and attention items.
+
+The fake runtime lets you explore the interface and stored sample evidence;
+it does not run coding agents or carry out real repairs. The local default
+binds to loopback without an API token. To enable token authentication, set
+`AGENCYHQ_API_TOKEN` in `.env`, restart the coordinator, and enter that token
+when the web interface prompts for it.
+
+Stop the coordinator with Ctrl+C. To stop PostgreSQL while keeping its data:
+
+```sh
+pnpm db:down
+```
+
+### Current real execution (host profile)
+
+Real execution additionally requires a self-hosted Trigger.dev instance,
+OpenCode configured with access to your chosen models, and a local clone of
+the repository you want AgencyHQ to work on.
+
+1. Follow the [Trigger.dev setup](infra/trigger/README.md) to start the stack
+   and configure its project and credentials.
+2. Configure the [task adapters](trigger/README.md) and keep
+   `pnpm trigger:dev` running on the OpenCode host.
+3. Set `RUNTIME=real`, `TRIGGER_API_URL`, and `TRIGGER_SECRET_KEY` in the root
+   `.env`, and choose the worker, Lead, and reviewer models.
+4. Follow the [coordinator guide](apps/coordinator/README.md#seeding-a-project-for-local-work)
+   to register a repository and repair intent. Start the coordinator with
+   `WEB_DIST="$PWD/apps/web/dist" pnpm --filter @agencyhq/coordinator start`
+   so it uses the runtime selected in `.env`.
+
+The [coordinator guide](apps/coordinator/README.md) also documents commands,
+authority settings, scheduling, and authentication.
 
 ## System boundary
 
@@ -18,7 +151,9 @@ Slices 1–3 are implemented (execution spike, domain kernel, and one complete b
 
 Trigger.dev is trusted for how work runs and whether it is still running. It is
 never trusted for whether work is done. OpenCode is the agent runtime, not the
-coordinator. Workers hold no credentials and cause no external effects.
+coordinator. Coding agents hold no upstream push, merge, publish, or deploy
+credentials; provider access goes through OpenCode. Only integration tasks
+advance shared refs after acceptance.
 
 ## Repository map
 
@@ -42,13 +177,11 @@ docs/
   engineering/       architecture, domain, execution, testing, ADRs
 ```
 
-Directories contain boundary notes only. Production code is added one slice at
-a time, starting with the execution spike in the
-[roadmap](docs/strategy/roadmap.md).
+Each package includes implementation and boundary notes. The
+[documentation index](docs/README.md) links to the product, architecture,
+requirements, and operating contracts.
 
 ## Baseline check
-
-Requires Node.js 24+ and pnpm 11+.
 
 ```sh
 pnpm check
@@ -76,12 +209,16 @@ revision.
 
 ## Development
 
-Requires Node.js 24+ and pnpm 11+.
+After installation, run the repository checks and tests:
 
 ```sh
-pnpm install
 pnpm check
 pnpm test
-pnpm db:up && DATABASE_URL=postgres://agencyhq:agencyhq@localhost:5432/agencyhq_test pnpm test:integration
-pnpm trigger:dev
+pnpm db:up
+DATABASE_URL=postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test pnpm test:integration
 ```
+
+For live UI development, keep the coordinator running and start
+`pnpm --filter @agencyhq/web dev` in another terminal. Open the URL printed
+by Vite; it proxies `/api` requests to the coordinator on port 8787. See the
+[web guide](apps/web/README.md) for build and browser-test details.

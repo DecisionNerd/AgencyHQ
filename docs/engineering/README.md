@@ -12,6 +12,10 @@ system design and deterministic evidence.
 | [`TESTING.md`](TESTING.md) | Scenarios, completion rule, evidence records, Lead metrics, execution trial. |
 | [`adrs/`](adrs/) | Durable reasons for significant technical decisions. |
 
-Publishing is deferred until a deployment path exists. Execution observability
-comes from Trigger.dev; AgencyHQ-level telemetry is added with the first
-running slice.
+The local deployment target is Compose (ADR-0008); implementation and runtime
+qualification are pending. Release distribution and promotion remain undecided.
+Execution observability comes from Trigger.dev and coordinator evidence views.
+
+[ADR-0008](adrs/0008-compose-first-container-runtime.md) defines the accepted
+Compose-first deployment and portable task-runtime refactor. Implementation
+and qualification are pending; see the [roadmap](../strategy/roadmap.md#compose-first-container-runtime).

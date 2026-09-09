@@ -4,6 +4,25 @@ Trigger.dev supplies durability, isolation, limits, retries, cancellation, and
 observation (ADR-0005). This document defines what the coordinator adds and how
 the two compose. Anything Trigger already does is referenced, not reimplemented.
 
+## Container target and current implementation
+
+[ADR-0008](adrs/0008-compose-first-container-runtime.md) makes the deployed
+container profile the default target; implementation is pending. Current
+lifecycle mechanics below use host worktrees and local evidence files.
+Container task inputs must use project/revision/artifact identities, not host
+paths. Each stage materializes its own checkout, and trusted adapters export
+Git objects, manifests, and stop evidence durably so the next stage can run on
+a different worker. The coordinator validates provenance, versions, digests,
+and generation before recording evidence. Coding agents never gain upstream
+push authority through artifact transport.
+
+Cancellation must export available checkpoint/stop evidence before normal
+teardown. On abrupt loss, record missing unexported work honestly and obtain
+trusted termination/isolation evidence before replacement. Host `stop.ndjson`
+reads remain a fallback implementation detail; a stopped container's filesystem
+is not durable transport. Existing host records must be imported or retained
+explicitly, never silently interpreted as container-accessible paths.
+
 ## Lifecycle of one step
 
 1. **Plan.** The coordinator dispatches `lead.plan` for the WorkItem, tagged
@@ -29,8 +48,9 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    environment and the contract's permission rules, publishes progress to run
    metadata, and on exit diffs, path-checks, commits
    `agencyhq/attempts/<attempt-id>` locally, and returns the report as run
-   output. (Container profile: fresh clone, then push with a generation-bound
-   token.)
+   output. (Target container profile: materialize exact source, commit and
+   export attempt-scoped Git objects through the trusted adapter; no upstream
+   push from the coding worker. Only integration advances shared refs.)
 5. **Observe.** The coordinator polls open DispatchIntents and retrieves each
    run by id; tags are used by the operator view's realtime subscription. On a
    final status it stores the report and classifies the outcome (below).
@@ -276,6 +296,12 @@ serialized per repository and compare-and-set on the target ref; an unknown
 outcome is resolved by reading the ref, never by retrying blindly.
 
 ## Contact loss
+
+For the container target, contact loss with a Trigger worker has the same
+uncertain-state semantics. Reconcile using trusted runtime identity/status and
+durable artifacts, never coordinator-local PID/file checks for a remote run.
+No fresh attempt can reuse the old container or grant authority to an unfenced
+execution. The following describes the current host fallback.
 
 If the coordinator cannot reach the Trigger API, or Trigger cannot reach the
 `trigger dev` process on the host, observations are marked stale, dispatch

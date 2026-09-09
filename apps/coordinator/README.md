@@ -1,5 +1,11 @@
 # Coordinator
 
+> Deployment direction: [ADR-0008](../../docs/engineering/adrs/0008-compose-first-container-runtime.md) makes root Compose startup,
+> persistent OpenCode login, and disposable deployed task containers the default
+> target. Implementation is pending. The procedures and trial notes below
+> describe the current host fallback and partial container spike; they do not
+> qualify the new startup path.
+
 Application boundary for the ledger and policy: authority subset checks,
 transition validation, DispatchIntents, run observation, worktree retention,
 and recording Lead and human decisions. It triggers Trigger.dev tasks only

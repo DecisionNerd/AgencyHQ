@@ -139,15 +139,15 @@ on it.
   trial record §Rework). 20 browser tests. Full record:
   [trials/2026-09-slice5.md](../engineering/trials/2026-09-slice5.md).
 
-## Slice 6 — capacity (current)
+## Slice 6 — capacity (host implementation and partial container spike)
 
 - Multiple worker machines and concurrent attempts using Trigger queues and
   environment limits; ProviderCapacity observations with conservative stale
   handling; Lead quality metrics dashboard.
 - Container runtime profile: deployed supervisor/worker stack, task image
-  with pinned Git and OpenCode, API-key providers, generation-bound push
-  tokens; then a model gateway with per-attempt keys, upgrading isolation,
-  egress, and spend from advisory to enforced.
+  with pinned Git and OpenCode. The earlier API-key-only and gateway-gated
+  direction is superseded by ADR-0008 below; no unproved isolation, egress,
+  or spend control is upgraded to enforced.
 - Outcome (2026-09-08): on admission the worker intent is recorded `queued` and `BoundedRepairFlow.onLeadPlanOutput` calls `scheduleQueuedIntents` (`apps/coordinator/src/flow/schedule.ts`) directly, applying every gate at admission time; dispatch errors are per-intent: own-intent failure fires recovery (failure row + `pending_human` + worker intent `failed`), other-intent failures are logged and retried on the next poll; the reconciler polling wrapper also calls `scheduleQueuedIntents` on every polling pass; batch scheduler (`selectDispatch`) wired into the coordinator polling loop; `AGENCYHQ_WORKER_SLOTS` environment limit; per-pass slot counting deducts active attempts (attempts in `stopping` status or with an in-flight `worker.attempt` intent, whose work item is not halted/completed/done — `listActiveAttemptsForScheduling`); the overview uses `listActiveAttemptCountsPerProject` with the same rule; repository serialization release point confirmed as worker-run completion; provider capacity gate (`ProviderCapacity` aggregate with conservative stale handling) precedes the slot gate in `selectDispatch`; gate skipped entirely when the `provider_capacity` table is empty (unconstrained); operator `set_capacity` command and `/api/capacity` route;
   Lead quality metrics via `lead_metrics` SQL view and `/api/metrics/lead` route;
   `AGENCYHQ_REALTIME_WAKEUP` subscription follows non-terminal work items and
@@ -164,3 +164,37 @@ on it.
   Multi-machine, generation-bound push tokens, and model gateway are deferred
   with evidence requirements.
   Full record: [trials/2026-09-slice6.md](../engineering/trials/2026-09-slice6.md).
+
+## Compose-first container runtime
+
+**Current priority; implementation pending.**
+[ADR-0008](../engineering/adrs/0008-compose-first-container-runtime.md) records
+the accepted default: `docker compose up -d` plus first-use OpenCode login,
+with persistent state and disposable deployed task containers. Slices 1–6
+above remain historical implementation/trial evidence. They do not qualify
+container coding, restart-safe authentication, or multi-machine workers.
+
+Implementation is split into bootstrap/packaging, the executable task image,
+provider authentication, portable source/artifacts and recovery, worker capacity,
+and the final operator/qualification flow. Bootstrap and image work can begin
+independently; authentication and portable execution build on the image;
+capacity uses those contracts; the final journey qualifies the complete stack.
+The issue links below define scope, dependencies, and closure evidence.
+
+Tracker: [#14 — Compose-first container runtime](https://github.com/DecisionNerd/AgencyHQ/issues/14).
+
+| Issue | Work | Blocked by |
+| --- | --- | --- |
+| [#15](https://github.com/DecisionNerd/AgencyHQ/issues/15) | Package and bootstrap the full local stack with one Docker Compose command | None |
+| [#16](https://github.com/DecisionNerd/AgencyHQ/issues/16) | Build and register a runnable pinned task image for all AgencyHQ execution stages | None |
+| [#17](https://github.com/DecisionNerd/AgencyHQ/issues/17) | Persist OpenCode provider login and deliver it to disposable task containers | [#16](https://github.com/DecisionNerd/AgencyHQ/issues/16), [#15](https://github.com/DecisionNerd/AgencyHQ/issues/15) |
+| [#18](https://github.com/DecisionNerd/AgencyHQ/issues/18) | Refactor task inputs and recovery around portable Git artifacts and durable evidence | [#16](https://github.com/DecisionNerd/AgencyHQ/issues/16) |
+| [#19](https://github.com/DecisionNerd/AgencyHQ/issues/19) | Enable replicated deployed task execution with verified runtime capabilities | [#17](https://github.com/DecisionNerd/AgencyHQ/issues/17), [#18](https://github.com/DecisionNerd/AgencyHQ/issues/18) |
+| [#20](https://github.com/DecisionNerd/AgencyHQ/issues/20) | Complete operator onboarding and qualify the Compose container runtime end to end | [#15](https://github.com/DecisionNerd/AgencyHQ/issues/15), [#16](https://github.com/DecisionNerd/AgencyHQ/issues/16), [#17](https://github.com/DecisionNerd/AgencyHQ/issues/17), [#18](https://github.com/DecisionNerd/AgencyHQ/issues/18), [#19](https://github.com/DecisionNerd/AgencyHQ/issues/19) |
+
+The [qualification matrix C1–C7](../engineering/TESTING.md#compose-runtime-qualification)
+and R-021–R-025 are the release gate. Preserve the host fallback and existing
+volumes/projects until explicit migration and compatibility tests pass. Mark
+the Compose path as implemented only after real repair, approved integration,
+restart, provider login, parallelism, and stop/replacement evidence exists.
+Hard spend/egress gateways and multi-tenant operation are separate work.

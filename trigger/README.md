@@ -1,5 +1,11 @@
 # Trigger.dev task adapters
 
+> Deployment direction: [ADR-0008](../docs/engineering/adrs/0008-compose-first-container-runtime.md) makes root Compose startup,
+> persistent OpenCode login, and disposable deployed task containers the default
+> target. Implementation is pending. The procedures and trial notes below
+> describe the current host fallback and partial container spike; they do not
+> qualify the new startup path.
+
 Task definitions run by `trigger dev` on the OpenCode host (host profile) and,
 later, by the deployed supervisor from a task image (container profile).
 Tasks: `lead.plan`, `worker.attempt`, `verify.run`, `lead.review`,
@@ -62,9 +68,11 @@ read 2026-09-08). The JSDoc for `additionalPackages` states "when deploying".
 
 Provider credentials (API keys for model providers) must be supplied as Trigger
 environment variables in the dashboard — they are never baked into the image.
-The container profile uses API-key providers only; subscription-based logins
-from `~/.local/share/opencode/auth.json` are host-bound and not available
-inside task containers.
+The earlier spike supplied no host authentication to task containers. ADR-0008
+supersedes the API-key-only target: OpenCode-managed API-key and supported
+interactive login flows must persist through a setup service and be explicitly
+delivered to the actual task containers, with refresh/logout tests. This is
+pending implementation; do not assume supervisor mounts reach task containers.
 
 ### Slice 6 container spike (2026-09-08, partial)
 

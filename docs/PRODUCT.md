@@ -6,7 +6,7 @@ AgencyHQ helps an engineering lead coordinate software projects and coding
 agents without losing scope, source-of-truth discipline, or acceptance
 evidence. The operator works in a React web control plane; a coordinator
 records intent, authority, and evidence; self-hosted Trigger.dev runs every
-unit of work as a durable run on the machine where OpenCode is configured;
+unit of work as a durable run in the selected runtime profile;
 OpenCode is the agent runtime for both workers and the Lead.
 
 ## Primary jobs
@@ -43,15 +43,31 @@ change criteria, push, or accept their own work.
 - Lead decision quality is measured (escalation rate, reversal rate, review
   yield) rather than assumed.
 
+## Installation and operation target
+
+The default experience is `docker compose up -d`, followed by first-use
+`docker compose exec opencode opencode auth login`. Docker manages the full
+stack, task images, migrations, internal credentials, and Trigger setup.
+Provider login persists; the UI identifies remaining setup and worker readiness.
+Operators can link repositories and set authority without seed scripts or SQL.
+New disposable task containers reuse the configured provider access and retain
+source artifacts and evidence outside their lifetime. No host agent process is
+required by default; a host profile is an optional compatibility path.
+
+This is an accepted target, not shipped behavior. The current host profile and
+partial container spike are recorded in the [roadmap](strategy/roadmap.md).
+[ADR-0008](engineering/adrs/0008-compose-first-container-runtime.md) defines
+startup, authentication, portability, replication, and qualification.
+
 ## Scope
 
-Initial: one operator, one or more linked repositories, one self-hosted
-Trigger webapp with `trigger dev` on the operator's OpenCode host, and
-OpenCode workers in per-attempt worktrees. The first
-executable proof is one repository, the bounded repair process, and one
-concurrent attempt, including stop/replace, verification, review, acceptance,
-and a minimal operator view. Merge and deploy boundaries, multi-repository
-WorkItems, Campaigns, and capacity observations follow in later slices.
+One operator, one or more linked repositories, a Compose-managed AgencyHQ and
+Trigger stack, and OpenCode workers in disposable task containers. Same-host
+parallel work is the initial container capacity target; multiple worker hosts
+require additional qualification. The earlier host-based slices established
+bounded repair, merge integration, multi-repository work, campaigns, and
+capacity observations; they remain useful evidence, not proof of the new
+container runtime. Deploy-boundary execution remains outside this change.
 
 Multi-tenant billing, a marketplace, a workflow designer, and generalized
 process authoring are out of scope.

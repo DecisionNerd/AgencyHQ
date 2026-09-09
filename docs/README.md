@@ -14,7 +14,7 @@ tests, delivery, and eventually production learning.
 | [`REQUIREMENTS.md`](REQUIREMENTS.md) | What must the delivered system demonstrably do? |
 | [`engineering/ARCHITECTURE.md`](engineering/ARCHITECTURE.md) | How do the components and the Trigger.dev runtime satisfy those requirements? |
 | [`engineering/TESTING.md`](engineering/TESTING.md) | Which checks, review, trial, and integration evidence qualify completion? |
-| Publishing | Deferred until AgencyHQ has a chosen deployment and promotion path. |
+| Deployment / publishing | Compose deployment target selected in ADR-0008; implementation and qualification pending. Release distribution and promotion remain undecided. |
 | Observability | Trigger's dashboard and Realtime cover execution; AgencyHQ-level telemetry is deferred until the first slice runs. |
 
 ## Supporting detail
@@ -42,3 +42,10 @@ defines the Lead role and delegated authority
 ([ADR-0006](engineering/adrs/0006-lead-role-and-delegated-authority.md)), and
 removes worker-side external effects
 ([ADR-0007](engineering/adrs/0007-worker-effect-model.md)).
+
+The accepted Compose/container target is recorded in
+[ADR-0008](engineering/adrs/0008-compose-first-container-runtime.md), with
+[implementation tracking](strategy/roadmap.md#compose-first-container-runtime)
+and [qualification scenarios](engineering/TESTING.md#compose-runtime-qualification).
+Root Compose startup and persistent container login are not implemented yet;
+current host procedures remain a fallback until qualification passes.

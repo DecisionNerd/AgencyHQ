@@ -10,27 +10,34 @@ coordinator decides *whether* and *within what bounds* work runs and *whether
 its evidence satisfies acceptance*; Trigger decides *how* it runs and *whether
 it is still running*.
 
-Slices 1–3 use the **host runtime profile** (ADR-0005): `trigger dev` on the
-machine where OpenCode is configured, real Git worktrees per attempt. The
-**container profile** is the later hardening path.
+The accepted default is the **Compose/container runtime** in
+[ADR-0008](adrs/0008-compose-first-container-runtime.md): persistent services,
+OpenCode provider setup, and disposable Trigger task containers. It is not yet
+implemented or qualified. The exercised **host profile** (`trigger dev` and
+host worktrees) remains the current fallback. Component details and the host
+enforcement evidence below describe current code unless marked target.
+
+Target topology (implementation pending):
 
 ```mermaid
 flowchart LR
-    Operator --> Web[React web control plane]
-    Web --> Coordinator
-    Web -. Realtime run state .-> TriggerAPI
-    Coordinator --> Postgres[(AgencyHQ Postgres)]
-    Coordinator -- trigger / cancel / retrieve --> TriggerAPI[Trigger.dev webapp]
-    TriggerAPI --> Dev[trigger dev on the OpenCode host]
-    subgraph Host machine
-      Dev --> Adapter[Task adapter process]
-      Adapter --> OpenCode[OpenCode child process]
-      OpenCode --> Worktree[(attempt worktree)]
-      Adapter --> Worktree
-    end
-    Adapter -- output, metadata, status --> TriggerAPI
-    Integrate[integrate.merge task] -- push after acceptance --> Repos[Linked repositories]
+    Operator --> Web[AgencyHQ web and coordinator]
+    Web --> DB[(AgencyHQ Postgres)]
+    Web -- dispatch / cancel / observe --> Trigger[Trigger webapp stack]
+    Login[OpenCode setup and login] --> Auth[(Persistent provider state)]
+    Trigger --> TriggerSupervisor[Trigger worker supervisor]
+    TriggerSupervisor --> TaskA[Disposable task container A]
+    TriggerSupervisor --> TaskB[Disposable task container B]
+    Auth -. authorized provider access .-> TaskA
+    Auth -. authorized provider access .-> TaskB
+    TaskA --> Artifacts[(Durable Git artifacts and evidence)]
+    TaskB --> Artifacts
+    Web --> Artifacts
+    Web -- accepted integration intent --> Trigger
+    Integrate[Integration task] -- authorized CAS push --> Repos[Linked repositories]
+    TriggerSupervisor --> Integrate
 ```
+
 
 Arrows are commands and observations. Authority lives where the table in the
 [README](../../README.md) says it does.
@@ -195,6 +202,12 @@ remains UI-only; the coordinator's observation path is polling.
 
 ## Enforcement boundaries
 
+The table records observed host behavior and the earlier container spike, not
+qualification of the ADR-0008 target. In that target, provider credentials are
+separate from upstream push credentials; persistent artifact transfer and stop
+evidence replace host-file coupling. Authentication alone does not enforce
+egress or hard spend, and a container smoke run does not prove task isolation.
+
 Host profile as declared. A contract that requires a boundary the profile
 marks advisory is rejected at dispatch. A spend estimate is advisory on the
 host profile and does not cause R-016 rejection; only contracts that enable
@@ -211,7 +224,7 @@ host profile and does not cause R-016 rejection; only contracts that enable
 | Output paths | Adapter diff check against `paths.allow/deny`; violations quarantine the attempt. | On output | Same. not observed. |
 | Git pushes from the worker | Scrubbed child environment (no SSH agent, no tokens, empty credential helper) plus `deny` on `git push`/`git remote`. | Before action | No credential exists. spike-observed (2026-09-08): env = TRIGGER_*/OTEL_*/NODE_* only; SSH_AUTH_SOCK and GIT_* credential helper variables not present in the environment. |
 | Merge, deploy, publish | Only `integrate.merge`, after acceptance, serialized, compare-and-set. | Before action | Same, with operation-scoped token. not observed. |
-| Termination | Generation revoked → `runs.cancel` → `onCancel` checkpoint commit and process-group kill → adapter confirms no survivors → Trigger final status. | Trusted observation | Supervisor removes the container. not observed (DOCKER_AUTOREMOVE_EXITED_CONTAINERS=0 was set; the exited container remained). |
+| Termination | Generation revoked → `runs.cancel` → `onCancel` checkpoint commit and process-group kill → adapter confirms no survivors → Trigger final status. | Trusted observation | Target: trusted runtime confirmation of termination/isolation plus durable stop evidence before replacement. Not observed; the Trigger supervisor left the spike container after exit (`DOCKER_AUTOREMOVE_EXITED_CONTAINERS=0`). |
 | Egress and provider spend | None; spend is an estimate. | Advisory | Gateway with per-attempt keys (deferred; evidence requirement: ADR plus measured spend baseline). not observed. |
 | Nested agents | OpenCode `task` tool denied for worker agents. | Before action | Same. not observed. |
 
@@ -223,6 +236,26 @@ clients. `trigger/` and `packages/db` depend on `packages/contracts` and
 `tests/dependency-rules.test.mjs` (6 cases), which runs as part of `pnpm check`.
 
 ## Deployment shape
+
+**Target, pending implementation:** one root Compose application starts AgencyHQ,
+its separate Postgres, the Trigger webapp and deployed worker stack, and an
+OpenCode login service backed by persistent provider state. Bootstrap/migrations,
+image build/deploy/registration, and internal credentials are idempotent startup
+work. Task images include runnable Node, pnpm, Git, and OpenCode for the actual
+user and declared platform. Do not require host-local runtimes, dev runners, or
+manual network forwarders. The full operator and state contract is in
+[ADR-0008](adrs/0008-compose-first-container-runtime.md).
+
+The runtime refactor replaces host absolute paths and local stop-file reads
+with revision-addressed source/artifact materialization and durable execution
+evidence. Task-image registration, auth delivery into each actual task
+container, and observed capacity are required before dispatch readiness.
+Repository onboarding, private read access, and integration credentials have
+operator setup flows distinct from model login. Same-host replicas must pass
+concurrency and isolation tests before the target is default; second-host
+execution requires separate evidence.
+
+**Current fallback and historical spike:**
 
 Host profile: one AgencyHQ process (web + coordinator), one AgencyHQ Postgres,
 the Trigger webapp stack (webapp, Postgres, Redis, Electric, ClickHouse, S2
@@ -252,6 +285,14 @@ but does not add the binary to PATH); `worker.attempt` was not attempted in a
 container. See [trials/2026-09-slice6.md](trials/2026-09-slice6.md).
 
 ## Security baseline
+
+The target separates provider state, source-control read/integration authority,
+and Trigger/AgencyHQ control credentials. Coding containers receive no upstream
+push or application-database credentials and no host home/Docker socket mount.
+Only trusted integration advances shared refs after acceptance. Provider
+credential visibility and refresh behavior must be declared and tested; the
+Compose target does not imply hard egress/spend enforcement. The following
+host-profile facts remain relevant until migration is qualified.
 
 - The coordinator holds AgencyHQ secrets and the Trigger secret key. Worker
   processes inherit the host's OpenCode credentials by design of the host

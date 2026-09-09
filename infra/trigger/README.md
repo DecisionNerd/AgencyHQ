@@ -1,5 +1,11 @@
 # Self-hosted Trigger.dev webapp stack
 
+> Deployment direction: [ADR-0008](../../docs/engineering/adrs/0008-compose-first-container-runtime.md) makes root Compose startup,
+> persistent OpenCode login, and disposable deployed task containers the default
+> target. Implementation is pending. The procedures and trial notes below
+> describe the current host fallback and partial container spike; they do not
+> qualify the new startup path.
+
 This folder holds the self-hosted Trigger.dev **webapp stack** for
 AgencyHQ's host runtime profile ([ADR-0005](../../docs/engineering/adrs/0005-trigger-as-execution-runtime.md),
 [ARCHITECTURE.md § Deployment shape](../../docs/engineering/ARCHITECTURE.md)):
@@ -39,8 +45,9 @@ off the host.
 
 The AgencyHQ coordinator API (default port 8787, bound to
 `AGENCYHQ_BIND_HOST` which defaults to `127.0.0.1`) runs on the same host
-and has no authentication; it must not be exposed beyond the host. Bearer
-auth for the coordinator API is planned but not yet implemented.
+supports bearer authentication through `AGENCYHQ_API_TOKEN`. Non-loopback
+binding without a token fails closed. The Compose target must wire internal
+and operator authentication without manual dashboard token copying.
 
 ## Operator procedure
 
