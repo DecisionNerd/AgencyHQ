@@ -48,6 +48,7 @@ import {
   formatTimestamp,
   lifecycleIcon,
   parseRoute,
+  pickOpenDecision,
   type SinceWindow,
   sinceWindowToISO,
 } from "./control-plane-helpers.js";
@@ -872,6 +873,8 @@ function DecisionsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized:
         projectId: pid,
         workItemId: wid,
         contractVersion: impact.contractVersion,
+        attemptId: impact.attemptId,
+        consequence: "records acceptance; integration may push to target branch",
       }),
       () =>
         runAction(
@@ -891,13 +894,17 @@ function DecisionsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized:
     const wid = entry.workItemId ?? entry.impact.workItemId;
     if (!wid) return;
     const pid = workItemProjectMap[wid] ?? "unknown";
-    const reason = rejectReasons[entry.id] ?? "operator rejected";
+    // U-7: no placeholder — require a non-empty reason (button is also disabled).
+    const reason = rejectReasons[entry.id] ?? "";
+    if (!reason.trim()) return;
     confirmThen(
       confirmMessage({
         action: "reject",
         projectId: pid,
         workItemId: wid,
         contractVersion: entry.impact.contractVersion,
+        attemptId: entry.impact.attemptId,
+        consequence: "halts the work item; no further attempts",
       }),
       () =>
         runAction(
@@ -1030,7 +1037,7 @@ function DecisionsPage({ hash, onUnauthorized }: { hash: string; onUnauthorized:
                           type="button"
                           className="btn-danger"
                           data-testid={`reject-btn-${entry.id}`}
-                          disabled={actionInFlight !== null}
+                          disabled={actionInFlight !== null || !rejectReasons[entry.id]?.trim()}
                           onClick={() => handleReject(entry)}
                         >
                           {actionInFlight === `reject-${entry.id}` ? "Rejecting..." : "Reject"}
@@ -1328,12 +1335,13 @@ function WorkItemPage({
     setConfirm({ message, onConfirm: fn });
   };
 
-  // Find the first pending decision from evidence to prefill approve
-  const pendingDecision = evidence?.decisions.find(
-    (d) => d.outcome === "pending_human" || d.outcome == null,
-  );
+  // U-1: use openPendingDecisions from the view as the source of truth for action availability.
+  // If the field is absent (older coordinator), treat as no open decisions and show a note.
+  const openPendingDecisions = item?.openPendingDecisions;
+  const openDecision = pickOpenDecision(openPendingDecisions ?? null);
+  const openDecisionsAbsent = item !== null && openPendingDecisions === undefined;
 
-  // Find the first attempt id for stop/invalidate
+  // Find the first attempt id for stop/invalidate (evidence-based, not decision-based)
   const latestAttempt = evidence?.attempts[0];
 
   return (
@@ -1408,8 +1416,15 @@ function WorkItemPage({
               Actions
             </h2>
             <div className="action-group">
-              {/* Approve — prefill from pending decision */}
-              {pendingDecision && (
+              {/* U-1: when openPendingDecisions is absent (old server), show a note */}
+              {openDecisionsAbsent && (
+                <p className="empty-notice" data-testid="no-open-decisions-note">
+                  No open decisions — approval actions unavailable.
+                </p>
+              )}
+
+              {/* Approve — shown only when there is an open pending decision */}
+              {openDecision && (
                 <button
                   type="button"
                   className="btn-primary"
@@ -1418,17 +1433,19 @@ function WorkItemPage({
                   onClick={() => {
                     // Look up contractId and artifact revision from evidence
                     const attemptForDecision = evidence?.attempts.find(
-                      (a) => a.id === pendingDecision.attemptId,
+                      (a) => a.id === openDecision.attemptId,
                     );
                     const artifactForAttempt = evidence?.artifacts.find(
-                      (a) => a.attemptId === pendingDecision.attemptId,
+                      (a) => a.attemptId === openDecision.attemptId,
                     );
                     confirmThen(
                       confirmMessage({
                         action: "approve",
                         projectId: projectId ?? "unknown",
                         workItemId: item.workItemId,
-                        contractVersion: pendingDecision.contractVersion,
+                        contractVersion: openDecision.contractVersion,
+                        attemptId: openDecision.attemptId,
+                        consequence: "records acceptance; integration may push to target branch",
                       }),
                       () =>
                         runAction(
@@ -1437,7 +1454,7 @@ function WorkItemPage({
                             commandId: crypto.randomUUID(),
                             workItemId: item.workItemId,
                             contractId: attemptForDecision?.contractId ?? "",
-                            contractVersion: pendingDecision.contractVersion ?? 0,
+                            contractVersion: openDecision.contractVersion ?? 0,
                             attemptRevision: artifactForAttempt?.revision ?? "",
                           }),
                         ),
@@ -1448,46 +1465,51 @@ function WorkItemPage({
                 </button>
               )}
 
-              {/* Reject with reason */}
-              <span className="reject-group">
-                <input
-                  type="text"
-                  placeholder="Reject reason"
-                  aria-label="Reject reason"
-                  data-testid="action-reject-reason"
-                  value={rejectReason}
-                  onChange={(e) => setRejectReason(e.target.value)}
-                />
-                <button
-                  type="button"
-                  className="btn-danger"
-                  data-testid="action-reject"
-                  disabled={actionInFlight !== null || !pendingDecision}
-                  onClick={() => {
-                    if (!pendingDecision) return;
-                    confirmThen(
-                      confirmMessage({
-                        action: "reject",
-                        projectId: projectId ?? "unknown",
-                        workItemId: item.workItemId,
-                        contractVersion: pendingDecision.contractVersion,
-                      }),
-                      () =>
-                        runAction(
-                          "reject",
-                          buildRejectBody({
-                            commandId: crypto.randomUUID(),
-                            workItemId: item.workItemId,
-                            decisionId: pendingDecision.id,
-                            reason: rejectReason || "operator rejected",
-                          }),
-                        ),
-                    );
-                  }}
-                >
-                  Reject
-                </button>
-              </span>
+              {/* Reject with reason — shown only when there is an open pending decision.
+                  U-7: confirm button disabled until reason is non-empty (trimmed). */}
+              {openDecision && (
+                <span className="reject-group">
+                  <input
+                    type="text"
+                    placeholder="Reject reason"
+                    aria-label="Reject reason"
+                    data-testid="action-reject-reason"
+                    value={rejectReason}
+                    onChange={(e) => setRejectReason(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="btn-danger"
+                    data-testid="action-reject"
+                    disabled={actionInFlight !== null || !rejectReason.trim()}
+                    onClick={() => {
+                      if (!rejectReason.trim()) return;
+                      confirmThen(
+                        confirmMessage({
+                          action: "reject",
+                          projectId: projectId ?? "unknown",
+                          workItemId: item.workItemId,
+                          contractVersion: openDecision.contractVersion,
+                          attemptId: openDecision.attemptId,
+                          consequence: "halts the work item; no further attempts",
+                        }),
+                        () =>
+                          runAction(
+                            "reject",
+                            buildRejectBody({
+                              commandId: crypto.randomUUID(),
+                              workItemId: item.workItemId,
+                              decisionId: openDecision.id,
+                              reason: rejectReason,
+                            }),
+                          ),
+                      );
+                    }}
+                  >
+                    Reject
+                  </button>
+                </span>
+              )}
 
               {/* Stop */}
               {latestAttempt && (
@@ -1502,6 +1524,13 @@ function WorkItemPage({
                         action: "stop",
                         projectId: projectId ?? "unknown",
                         workItemId: item.workItemId,
+                        attemptId: latestAttempt.id,
+                        contractVersion:
+                          openDecision?.contractVersion ??
+                          evidence?.decisions.find(
+                            (d) => d.attemptId === latestAttempt.id && d.contractVersion != null,
+                          )?.contractVersion,
+                        consequence: "stops the running attempt; the checkpoint is kept",
                       }),
                       () =>
                         runAction(
@@ -1530,6 +1559,9 @@ function WorkItemPage({
                       action: "pause",
                       projectId: projectId ?? "unknown",
                       workItemId: item.workItemId,
+                      attemptId: openDecision?.attemptId,
+                      contractVersion: openDecision?.contractVersion,
+                      consequence: "pauses dispatch for this work item; running attempts continue",
                     }),
                     () =>
                       runAction(
@@ -1597,7 +1629,7 @@ function WorkItemPage({
                 </button>
               )}
 
-              {/* Invalidate acceptance */}
+              {/* Invalidate acceptance — U-7: disabled until reason is non-empty. */}
               {latestAttempt && (
                 <span className="reject-group">
                   <input
@@ -1612,14 +1644,21 @@ function WorkItemPage({
                     type="button"
                     className="btn-danger"
                     data-testid="action-invalidate"
-                    disabled={actionInFlight !== null}
-                    onClick={() =>
+                    disabled={actionInFlight !== null || !invalidateReason.trim()}
+                    onClick={() => {
+                      if (!invalidateReason.trim()) return;
                       confirmThen(
                         confirmMessage({
                           action: "invalidate",
                           projectId: projectId ?? "unknown",
                           workItemId: item.workItemId,
-                          contractVersion: pendingDecision?.contractVersion,
+                          attemptId: latestAttempt.id,
+                          contractVersion:
+                            openDecision?.contractVersion ??
+                            evidence?.decisions.find(
+                              (d) => d.attemptId === latestAttempt.id && d.contractVersion != null,
+                            )?.contractVersion,
+                          consequence: "invalidates the recorded acceptance; the item reopens",
                         }),
                         () =>
                           runAction(
@@ -1628,11 +1667,11 @@ function WorkItemPage({
                               commandId: crypto.randomUUID(),
                               workItemId: item.workItemId,
                               attemptId: latestAttempt.id,
-                              reason: invalidateReason || "acceptance invalidated",
+                              reason: invalidateReason,
                             }),
                           ),
-                      )
-                    }
+                      );
+                    }}
                   >
                     Invalidate acceptance
                   </button>
@@ -1665,7 +1704,18 @@ function AuthorityPage({
   const [loading, setLoading] = useState(true);
   const [editorValue, setEditorValue] = useState("");
   const [saving, setSaving] = useState(false);
+  // JSON parse errors and unexpected network errors
   const [saveError, setSaveError] = useState<string | null>(null);
+  // 422 schema validation errors — shown under data-testid="authority-errors"
+  const [authorityErrors, setAuthorityErrors] = useState<Array<{
+    message: string;
+    path?: string[];
+  }> | null>(null);
+  // 409 version conflict — shown under data-testid="authority-conflict"
+  const [authorityConflict, setAuthorityConflict] = useState<{
+    reason: string;
+    currentVersion: number;
+  } | null>(null);
   const [confirm, setConfirm] = useState<{
     message: string;
     onConfirm: () => void;
@@ -1674,6 +1724,9 @@ function AuthorityPage({
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
+    setSaveError(null);
+    setAuthorityErrors(null);
+    setAuthorityConflict(null);
     fetchAuthority(projectId)
       .then((data) => {
         setView(data);
@@ -1703,18 +1756,38 @@ function AuthorityPage({
       return;
     }
 
-    const newVersion = view ? `v${Number(view.currentVersion.replace(/[^0-9]/g, "")) + 1}` : "v1";
+    // U-2: send the numeric version the editor loaded, never a hand-typed value.
+    const expectedVersion = view ? Number(view.currentVersion.replace(/[^0-9]/g, "")) : 0;
+    const newVersionNum = expectedVersion + 1;
+    const confirmMsg = [
+      `Update authority for project ${projectId} to v${newVersionNum}`,
+      `creates authority version ${newVersionNum}; frozen contracts are unaffected`,
+    ].join("\n");
+
     setConfirm({
-      message: `Update authority for project ${projectId} to ${newVersion}?`,
+      message: `${confirmMsg}?`,
       onConfirm: async () => {
         setSaving(true);
         setSaveError(null);
+        setAuthorityErrors(null);
+        setAuthorityConflict(null);
         try {
-          const result = await putAuthority(projectId, { authority: parsed });
-          if ("errors" in result && Array.isArray(result.errors)) {
-            setSaveError(
-              formatAuthorityErrors(result.errors as Array<{ message: string; path?: string[] }>),
-            );
+          const result = await putAuthority(projectId, {
+            authority: parsed,
+            expectedVersion,
+          });
+          if ("errors" in result && Array.isArray(result.errors) && result.errors.length > 0) {
+            // 422 schema errors — display under authority-errors
+            setAuthorityErrors(result.errors);
+          } else if (
+            "result" in result &&
+            result.result &&
+            typeof result.result === "object" &&
+            "ok" in result.result &&
+            !result.result.ok
+          ) {
+            // 409 version conflict — display under authority-conflict
+            setAuthorityConflict(result.result as { reason: string; currentVersion: number });
           } else {
             load();
           }
@@ -1784,6 +1857,20 @@ function AuthorityPage({
             {saveError && (
               <div className="error-box" role="alert" data-testid="authority-save-error">
                 {saveError}
+              </div>
+            )}
+            {authorityErrors && authorityErrors.length > 0 && (
+              <div className="error-box" role="alert" data-testid="authority-errors">
+                {formatAuthorityErrors(authorityErrors)}
+              </div>
+            )}
+            {authorityConflict && (
+              <div className="error-box" role="alert" data-testid="authority-conflict">
+                Version conflict: {authorityConflict.reason} (server version:{" "}
+                {authorityConflict.currentVersion}).{" "}
+                <button type="button" className="btn-primary" onClick={load}>
+                  Reload
+                </button>
               </div>
             )}
 

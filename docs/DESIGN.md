@@ -67,7 +67,6 @@ worker logs. The initial view is small; Campaign navigation was added in Slice 5
 ## Accessibility and safety
 
 All state distinctions require text and iconography rather than color alone.
-Potentially destructive actions show a confirmation naming the Project, WorkItem,
-and contract version (approve, reject, invalidate) or the Project and proposed
-authority version (authority edits), and require the coordinator to revalidate
-authority and generation at command time.
+Potentially destructive actions identify the exact Project, WorkItem, attempt
+(where applicable), contract version, and consequence, and require the coordinator
+to revalidate authority and generation at command time.

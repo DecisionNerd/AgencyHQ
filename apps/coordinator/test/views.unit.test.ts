@@ -10,6 +10,7 @@ import { buildAuthorityView } from "../src/views/authority-view.ts";
 import { buildDecisionsView } from "../src/views/decisions-view.ts";
 import { buildEvidenceView } from "../src/views/evidence-view.ts";
 import { buildOverviewView } from "../src/views/overview-view.ts";
+import { isOpenPending } from "../src/views/pending.ts";
 
 // ---------------------------------------------------------------------------
 // buildOverviewView tests
@@ -86,7 +87,9 @@ describe("buildOverviewView", () => {
       decisions: [
         { workItemId: "wi-1", outcome: "pending_human" },
         { workItemId: "wi-1", outcome: "pending_human" },
-        { workItemId: "wi-1", outcome: "approved" }, // not counted
+        // approved is attempt-scoped (attemptId set) so it does not resolve the
+        // no-attempt pending decisions above (U-4 sameSubject rule).
+        { workItemId: "wi-1", outcome: "approved", attemptId: "att-1" },
       ],
     });
 
@@ -485,5 +488,167 @@ describe("open pending decisions (resolved rows are history)", () => {
     const item = view.projects[0]?.workItems[0];
     assert.ok(item);
     assert.equal(item.pendingDecisionCount, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// U-4: no-attempt pending resolution
+// ---------------------------------------------------------------------------
+
+describe("U-4: no-attempt pending decisions resolve by kind+workItem+contractVersion", () => {
+  it("plan-stage pending resolved by a later plan rejected (null attempt)", () => {
+    const pending = {
+      id: "d1",
+      workItemId: "wi-1",
+      kind: "plan",
+      outcome: "pending_human",
+      attemptId: null,
+      contractVersion: null,
+      at: "2026-01-01T00:00:00Z",
+    };
+    const rejected = {
+      id: "d2",
+      workItemId: "wi-1",
+      kind: "plan",
+      outcome: "rejected",
+      attemptId: null,
+      contractVersion: null,
+      at: "2026-01-02T00:00:00Z",
+    };
+    assert.equal(
+      isOpenPending(pending, [pending, rejected]),
+      false,
+      "plan pending resolved by later plan rejected",
+    );
+  });
+
+  it("plan-stage pending resolved by a later plan accepted (null attempt)", () => {
+    const pending = {
+      id: "d1",
+      workItemId: "wi-1",
+      kind: "plan",
+      outcome: "pending_human",
+      attemptId: null,
+      contractVersion: 1,
+      at: "2026-01-01T00:00:00Z",
+    };
+    const accepted = {
+      id: "d2",
+      workItemId: "wi-1",
+      kind: "plan",
+      outcome: "accepted",
+      attemptId: null,
+      contractVersion: 1,
+      at: "2026-01-02T00:00:00Z",
+    };
+    assert.equal(
+      isOpenPending(pending, [pending, accepted]),
+      false,
+      "plan pending resolved by later plan accepted",
+    );
+  });
+
+  it("review pending resolved by a later rejected (null attempt)", () => {
+    const pending = {
+      id: "d1",
+      workItemId: "wi-1",
+      kind: "review",
+      outcome: "pending_human",
+      attemptId: null,
+      contractVersion: null,
+      at: "2026-01-01T00:00:00Z",
+    };
+    const rejected = {
+      id: "d2",
+      workItemId: "wi-1",
+      kind: "review",
+      outcome: "rejected",
+      attemptId: null,
+      contractVersion: null,
+      at: "2026-01-02T00:00:00Z",
+    };
+    assert.equal(
+      isOpenPending(pending, [pending, rejected]),
+      false,
+      "review pending resolved by later review rejected",
+    );
+  });
+
+  it("plan pending NOT resolved by a review rejected (different kind)", () => {
+    const pending = {
+      id: "d1",
+      workItemId: "wi-1",
+      kind: "plan",
+      outcome: "pending_human",
+      attemptId: null,
+      contractVersion: null,
+      at: "2026-01-01T00:00:00Z",
+    };
+    const rejected = {
+      id: "d2",
+      workItemId: "wi-1",
+      kind: "review",
+      outcome: "rejected",
+      attemptId: null,
+      contractVersion: null,
+      at: "2026-01-02T00:00:00Z",
+    };
+    assert.equal(
+      isOpenPending(pending, [pending, rejected]),
+      true,
+      "plan pending NOT resolved by review rejected (different kind)",
+    );
+  });
+
+  it("no-attempt pending NOT resolved by an attempt-scoped resolving decision", () => {
+    const pending = {
+      id: "d1",
+      workItemId: "wi-1",
+      kind: "accept",
+      outcome: "pending_human",
+      attemptId: null,
+      contractVersion: null,
+      at: "2026-01-01T00:00:00Z",
+    };
+    const approved = {
+      id: "d2",
+      workItemId: "wi-1",
+      kind: "accept",
+      outcome: "approved",
+      attemptId: "att-1", // attempt-scoped; does not resolve the no-attempt pending
+      contractVersion: null,
+      at: "2026-01-02T00:00:00Z",
+    };
+    assert.equal(
+      isOpenPending(pending, [pending, approved]),
+      true,
+      "no-attempt pending NOT resolved by attempt-scoped approved (different subject type)",
+    );
+  });
+
+  it("attempt-scoped pending still resolved by attempt-scoped approved (existing behavior preserved)", () => {
+    const pending = {
+      id: "d1",
+      workItemId: "wi-1",
+      kind: "accept",
+      outcome: "pending_human",
+      attemptId: "att-1",
+      contractVersion: 1,
+      at: "2026-01-01T00:00:00Z",
+    };
+    const approved = {
+      id: "d2",
+      workItemId: "wi-1",
+      kind: "accept",
+      outcome: "approved",
+      attemptId: "att-1",
+      contractVersion: 1,
+      at: "2026-01-02T00:00:00Z",
+    };
+    assert.equal(
+      isOpenPending(pending, [pending, approved]),
+      false,
+      "attempt-scoped pending resolved by same-attempt approved (existing behavior)",
+    );
   });
 });

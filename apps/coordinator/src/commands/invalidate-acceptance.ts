@@ -71,7 +71,7 @@ export async function invalidateAcceptance(
        FROM decisions d
        WHERE d.attempt_id = $1
          AND d.kind = 'accept'
-         AND d.outcome IN ('approved', 'completed')
+         AND d.outcome IN ('approved', 'accepted')
          AND d.work_item_id = $2
        ORDER BY d.at DESC
        LIMIT 1`,

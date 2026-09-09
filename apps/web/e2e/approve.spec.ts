@@ -42,6 +42,7 @@ test("decisions page: approve pending_human decision removes it from the list", 
   expect(message).toContain(ids.projectId);
   expect(message).toContain(ids.wiApprove);
   expect(message).toMatch(/v\d+/i);
+  expect(message).toMatch(/records acceptance/i);
   await page.getByTestId("confirm-ok").click();
 
   // After approve, the page reloads the decisions list and the entry is gone.
@@ -68,6 +69,7 @@ test("work item page: approve via confirm dialog updates the item", async ({ pag
   expect(message).toContain(ids.projectId);
   expect(message).toContain(ids.wiApprove2);
   expect(message).toMatch(/v\d+/i);
+  expect(message).toMatch(/records acceptance/i);
   await page.getByTestId("confirm-ok").click();
   await expect(dialog).not.toBeVisible({ timeout: 10_000 });
   await expect(page.getByTestId("work-item-action-error")).not.toBeVisible();

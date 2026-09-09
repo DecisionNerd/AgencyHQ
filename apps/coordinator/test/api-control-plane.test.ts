@@ -9,10 +9,12 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { HOST_TRIAL_AUTHORITY } from "@agencyhq/contracts";
 import type {
   CommandsLike,
   FlowLike,
   LedgerSnapshot,
+  PoolClientLike,
   PoolLike,
   ReconcilerLike,
   RuntimeLike,
@@ -51,6 +53,20 @@ function makeFakePool(): PoolLike {
     connect: async () => {
       throw new Error("FakePool.connect should not be called when loadSnapshot is injected");
     },
+    end: async () => {},
+  };
+}
+
+/** Pool that returns a fake project authority_version on any query (for 409 tests). */
+function makeVersionedPool(authorityVersion: number): PoolLike {
+  const client: PoolClientLike = {
+    query: async (_sql: string, _params?: unknown[]) => ({
+      rows: [{ authority_version: String(authorityVersion) }],
+    }),
+    release: () => {},
+  };
+  return {
+    connect: async () => client,
     end: async () => {},
   };
 }
@@ -317,19 +333,148 @@ describe("PUT /api/projects/:id/authority — bearer auth and validation", () =>
       commands: makeControlPlaneCommands(),
     });
 
+    // U-2: authority must be a valid AuthoritySchema object; use HOST_TRIAL_AUTHORITY
+    // with version bumped to "2". The route validates before calling the command.
+    const validAuthority = { ...HOST_TRIAL_AUTHORITY, version: "2" };
     const res = await app.request("/api/projects/prj-123/authority", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ commandId: "cmd-1", authority: { version: "2" }, actor: "operator" }),
+      body: JSON.stringify({ commandId: "cmd-1", authority: validAuthority, actor: "operator" }),
     });
     assert.equal(res.status, 200);
     const body = (await res.json()) as {
       commandId: string;
-      result: { ok: boolean; version: string };
+      result: { ok: boolean; version: number };
     };
     assert.equal(body.commandId, "cmd-1");
     assert.equal(body.result.ok, true);
-    assert.equal(body.result.version, "2");
+    // U-2: version is returned as a number, not a string.
+    assert.equal(typeof body.result.version, "number", "U-2: version is a number");
+    assert.equal(body.result.version, 2, "U-2: version value = 2");
+  });
+
+  it("U-2: returns 200 with expectedVersion injecting next version", async () => {
+    const app = createApp({
+      pool: makeFakePool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeControlPlaneCommands(),
+    });
+
+    // Send authority without version field + expectedVersion=1 → server injects version "2".
+    const authorityWithoutVersion = { ...HOST_TRIAL_AUTHORITY } as Record<string, unknown>;
+    delete authorityWithoutVersion.version;
+    const res = await app.request("/api/projects/prj-123/authority", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-exp",
+        authority: authorityWithoutVersion,
+        actor: "operator",
+        expectedVersion: 1,
+      }),
+    });
+    assert.equal(res.status, 200, "expectedVersion injects version '2' → valid authority → 200");
+    const body = (await res.json()) as { result: { ok: boolean; version: number } };
+    assert.equal(body.result.ok, true);
+    assert.equal(body.result.version, 2, "U-2: version computed from expectedVersion+1");
+  });
+
+  it("U-2: returns 422 with errors array when authority fails AuthoritySchema", async () => {
+    const app = createApp({
+      pool: makeFakePool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeControlPlaneCommands(),
+    });
+
+    const res = await app.request("/api/projects/prj-123/authority", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-1",
+        authority: { version: "2" }, // missing required fields → 422
+        actor: "operator",
+      }),
+    });
+    assert.equal(res.status, 422, "U-2: invalid authority → 422");
+    const body = (await res.json()) as {
+      commandId: string;
+      errors: Array<{ path: string[]; message: string }>;
+    };
+    assert.equal(body.commandId, "cmd-1");
+    assert.ok(Array.isArray(body.errors), "U-2: errors is an array");
+    assert.ok(body.errors.length > 0, "U-2: errors array is non-empty");
+    assert.ok(
+      body.errors.every((e) => Array.isArray(e.path) && typeof e.message === "string"),
+      "U-2: each error has path (array) and message (string)",
+    );
+  });
+
+  it("U-2: returns 409 with currentVersion when CAS fails (version_not_increasing)", async () => {
+    const commandsWithCasFail: CommandsLike = {
+      ...makeControlPlaneCommands(),
+      updateAuthority: async () => ({ ok: false, reason: "version_not_increasing" as const }),
+    };
+    const app = createApp({
+      pool: makeVersionedPool(1),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: commandsWithCasFail,
+    });
+
+    const validAuthority = { ...HOST_TRIAL_AUTHORITY, version: "2" };
+    const res = await app.request("/api/projects/prj-123/authority", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commandId: "cmd-cas", authority: validAuthority, actor: "op" }),
+    });
+    assert.equal(res.status, 409, "U-2: CAS failure → 409");
+    const body = (await res.json()) as {
+      commandId: string;
+      result: { ok: boolean; reason: string; currentVersion: number };
+    };
+    assert.equal(body.commandId, "cmd-cas");
+    assert.equal(body.result.ok, false);
+    assert.equal(body.result.reason, "version_not_increasing");
+    assert.equal(body.result.currentVersion, 1, "U-2: currentVersion returned in 409");
+  });
+
+  it("U-2: returns 404 for unknown project", async () => {
+    const commandsWithNotFound: CommandsLike = {
+      ...makeControlPlaneCommands(),
+      updateAuthority: async () => ({ ok: false, reason: "project_not_found" as const }),
+    };
+    const app = createApp({
+      pool: makeFakePool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: commandsWithNotFound,
+    });
+
+    const validAuthority = { ...HOST_TRIAL_AUTHORITY, version: "2" };
+    const res = await app.request("/api/projects/unknown-prj/authority", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commandId: "cmd-404", authority: validAuthority, actor: "op" }),
+    });
+    assert.equal(res.status, 404, "U-2: project_not_found → 404");
   });
 
   it("returns 400 when commands not wired", async () => {
@@ -484,6 +629,34 @@ describe("POST /api/commands kind=reject — field validation", () => {
     const body = (await res.json()) as { result: { ok: boolean; decisionId: string } };
     assert.equal(body.result.ok, true);
   });
+
+  it("U-7: returns 400 reason_required when reason is whitespace-only", async () => {
+    const app = createApp({
+      pool: makeFakePool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeControlPlaneCommands(),
+    });
+
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-1",
+        kind: "reject",
+        workItemId: "wi-1",
+        decisionId: "dec-1",
+        reason: "   ", // whitespace-only → trimmed to "" → reason_required
+      }),
+    });
+    assert.equal(res.status, 400, "U-7: whitespace-only reason → 400");
+    const body = (await res.json()) as { reason: string };
+    assert.equal(body.reason, "reason_required", "U-7: reason_required for whitespace reason");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -539,7 +712,7 @@ describe("POST /api/commands kind=invalidate_acceptance — field validation", (
     assert.equal(res.status, 400);
   });
 
-  it("returns 200 when all required fields are present", async () => {
+  it("U-7: returns 400 reason_required when reason is missing", async () => {
     const app = createApp({
       pool: makeFakePool(),
       flow: makeFakeFlow(),
@@ -559,6 +732,35 @@ describe("POST /api/commands kind=invalidate_acceptance — field validation", (
         kind: "invalidate_acceptance",
         workItemId: "wi-1",
         attemptId: "att-1",
+        // no reason → reason_required
+      }),
+    });
+    assert.equal(res.status, 400, "U-7: missing reason → 400");
+    const body = (await res.json()) as { reason: string };
+    assert.equal(body.reason, "reason_required", "U-7: reason_required for invalidate_acceptance");
+  });
+
+  it("returns 200 when all required fields are present (including reason)", async () => {
+    const app = createApp({
+      pool: makeFakePool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeControlPlaneCommands(),
+    });
+
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-1",
+        kind: "invalidate_acceptance",
+        workItemId: "wi-1",
+        attemptId: "att-1",
+        reason: "defect found",
       }),
     });
     assert.equal(res.status, 200);

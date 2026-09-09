@@ -304,3 +304,90 @@ test("GET /api/work-items/:id/view — pending merge item shows integration.stat
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// U-4: after approve, /api/work-items/:id/view exposes openPendingDecisions: []
+// ---------------------------------------------------------------------------
+
+test("U-4: after approve /api/work-items/:id/view has openPendingDecisions: []", async (t) => {
+  if (!DATABASE_URL) {
+    console.warn("[db] DATABASE_URL unset; skipping integration test");
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(DATABASE_URL, ctx.schema);
+    try {
+      const projectId = `prj-${randomUUID()}`;
+      const workItemId = `wi-${randomUUID()}`;
+      const contractId = `sc-${randomUUID()}`;
+      const attemptId = `att-${randomUUID()}`;
+      const baseRevision = "0000000000000000000000000000000000000000";
+
+      await ctx.client.query(
+        `INSERT INTO projects (id, remote, clone_path, worktree_base, allowed_refs, authority, authority_version, profile_catalog)
+         VALUES ($1, NULL, '/repo', '/worktrees', '{"main":"${baseRevision}"}'::jsonb, '{}'::jsonb, '1', '["default"]'::jsonb)`,
+        [projectId],
+      );
+      await ctx.client.query(
+        `INSERT INTO work_items (id, project_id, rank, intent, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 1, 'test', 'artifact', 'completed', 'nominal', true, 1)`,
+        [workItemId, projectId],
+      );
+      await ctx.client.query(
+        `INSERT INTO step_contracts
+           (id, work_item_id, project_id, version, base_revision, inputs, criteria,
+            criteria_digest, profile_id, profile_digest, bounds, required_boundaries, human_required, status)
+         VALUES ($1, $2, $3, 1, $4, '{}', '[]', 'cd', 'p', 'pd', '{"paths":{"allow":["src/**"],"deny":[]},"capabilities":{"bash":{"allow":[],"deny":[]},"tools":{"edit":true,"webfetch":false,"websearch":false,"task":false,"external_directory":false,"skill":false}},"boundary":"artifact","budget":{"maxAttempts":2,"maxDurationSeconds":300,"estimatedSpendUsd":2},"review":"adversarial","changeClass":"behavior","models":{"worker":"claude/claude-sonnet-4-5","reviewer":"claude/claude-sonnet-4-5"}}'::jsonb, '[]', false, 'active')`,
+        [contractId, workItemId, projectId, baseRevision],
+      );
+      await ctx.client.query(
+        `INSERT INTO attempts (id, contract_id, contract_version, generation, status, budget_remaining)
+         VALUES ($1, $2, 1, 1, 'completed', 0)`,
+        [attemptId, contractId],
+      );
+
+      // Seed a pending_human decision and an approved decision for the same attempt.
+      // After approve, the pending should no longer be open.
+      await ctx.client.query(
+        `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
+         VALUES ($1, 'accept', 'coordinator', $2, $3, 'pending_human', now() - interval '1 second')`,
+        [`dec-pending-${randomUUID()}`, workItemId, attemptId],
+      );
+      await ctx.client.query(
+        `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
+         VALUES ($1, 'accept', 'human', $2, $3, 'approved', now())`,
+        [`dec-approved-${randomUUID()}`, workItemId, attemptId],
+      );
+
+      const app = createApp({
+        pool,
+        flow: makeFakeFlow(),
+        reconciler: makeFakeReconciler(),
+        runtime: makeFakeRuntime(),
+        config: makeConfig(),
+        clock: () => NOW,
+      });
+
+      const res = await app.request(`/api/work-items/${encodeURIComponent(workItemId)}/view`);
+      assert.equal(res.status, 200, "view responds 200");
+
+      const body = (await res.json()) as {
+        openPendingDecisions: Array<{ id: string; kind: string | null; at: string }>;
+      };
+
+      assert.ok(
+        Array.isArray(body.openPendingDecisions),
+        "U-4: openPendingDecisions is an array in the response",
+      );
+      assert.equal(
+        body.openPendingDecisions.length,
+        0,
+        "U-4: after approve, openPendingDecisions is empty",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});

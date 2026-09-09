@@ -346,6 +346,33 @@ export function buildInvalidateAcceptanceBody(
 }
 
 // ---------------------------------------------------------------------------
+// Open pending decisions helper
+// ---------------------------------------------------------------------------
+
+/** Mirrors OpenPendingDecision from api.ts — defined here to keep helpers pure. */
+export interface OpenPendingDecisionHelper {
+  id: string;
+  kind: string;
+  attemptId: string | null;
+  contractVersion: number | null;
+  at: string;
+}
+
+/**
+ * Pick the first open pending decision from the list, or null if none.
+ * Returns null both when the array is absent (old server) and when it is empty.
+ * Used to determine whether Approve/Reject actions should be shown.
+ *
+ * Unit-tested in control-plane-helpers.test.ts.
+ */
+export function pickOpenDecision(
+  openPendingDecisions: OpenPendingDecisionHelper[] | undefined | null,
+): OpenPendingDecisionHelper | null {
+  if (!Array.isArray(openPendingDecisions) || openPendingDecisions.length === 0) return null;
+  return openPendingDecisions[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Confirmation message builder
 // ---------------------------------------------------------------------------
 
@@ -358,20 +385,33 @@ export interface ConfirmMessageParams {
   workItemId: string;
   /** The contract version, if available. Rendered as "contract v<n>". */
   contractVersion?: number | null | undefined;
+  /** The attempt id, if available. Rendered as "attempt <id>". */
+  attemptId?: string | null | undefined;
+  /**
+   * Plain-words consequence of the action. Shown on its own line after the
+   * action/project/version context so the operator knows what will happen.
+   * E.g. "records acceptance; integration may push to target branch".
+   */
+  consequence?: string;
 }
 
 /**
  * Build the text shown in the ConfirmDialog for every destructive action.
  * The returned string always names the action, the project and the work item;
- * and appends the contract version when provided.
+ * appends the contract version when provided; appends the attempt id when
+ * provided; and appends the consequence on a new line when provided.
  *
  * Unit-tested in control-plane-helpers.test.ts.
  */
 export function confirmMessage(params: ConfirmMessageParams): string {
-  const { action, projectId, workItemId, contractVersion } = params;
+  const { action, projectId, workItemId, contractVersion, attemptId, consequence } = params;
   const head = `${action.charAt(0).toUpperCase()}${action.slice(1)} work item ${workItemId} · project ${projectId}`;
-  const versionSuffix = contractVersion != null ? ` · contract v${contractVersion}` : "";
-  return `${head}${versionSuffix}?`;
+  const suffixParts: string[] = [];
+  if (contractVersion != null) suffixParts.push(`contract v${contractVersion}`);
+  if (attemptId) suffixParts.push(`attempt ${attemptId}`);
+  const context = suffixParts.length > 0 ? ` · ${suffixParts.join(" · ")}` : "";
+  const consequencePart = consequence ? `\n${consequence}` : "";
+  return `${head}${context}${consequencePart}?`;
 }
 
 // ---------------------------------------------------------------------------

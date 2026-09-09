@@ -59,7 +59,15 @@ export async function rejectWorkItem(
       return { ...stored, replayed: true };
     }
 
-    // 2. Load the pending decision for this work item (by id and outcome)
+    // 2. Load the pending decision for this work item (by id and outcome),
+    // guarded by NOT EXISTS for any resolving decision on the same subject.
+    // Mirror approve.ts:90-98: for attempt-scoped rows, same attempt must have
+    // no resolving outcome; for no-attempt rows, same work_item + kind +
+    // contract_version (nulls equal via IS NOT DISTINCT FROM) must have none.
+    // This ensures reject-after-approve and double-reject both return state_mismatch.
+    // d2.at >= d.at: only count resolving decisions created at or after the pending,
+    // so that a later no-attempt pending (e.g. a second plan) is not blocked by a
+    // resolved row from a prior pending on the same work item + kind (V-2 fix).
     const { rows: decisionRows } = await client.query<{
       id: string;
       kind: string | null;
@@ -67,8 +75,22 @@ export async function rejectWorkItem(
       contract_id: string | null;
       contract_version: number | null;
     }>(
-      `SELECT id, kind, attempt_id, contract_id, contract_version FROM decisions
-       WHERE id = $1 AND work_item_id = $2 AND outcome = 'pending_human'
+      `SELECT d.id, d.kind, d.attempt_id, d.contract_id, d.contract_version
+       FROM decisions d
+       WHERE d.id = $1 AND d.work_item_id = $2 AND d.outcome = 'pending_human'
+         AND NOT EXISTS (
+           SELECT 1 FROM decisions d2
+           WHERE d2.outcome IN ('approved', 'rejected', 'accepted', 'invalidated')
+             AND (d2.kind IS NOT DISTINCT FROM d.kind)
+             AND d2.work_item_id = d.work_item_id
+             AND d2.at >= d.at
+             AND (
+               (d.attempt_id IS NOT NULL AND d2.attempt_id = d.attempt_id)
+               OR
+               (d.attempt_id IS NULL AND d2.attempt_id IS NULL
+                AND d2.contract_version IS NOT DISTINCT FROM d.contract_version)
+             )
+         )
        LIMIT 1`,
       [decisionId, workItemId],
     );
