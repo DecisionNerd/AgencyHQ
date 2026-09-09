@@ -15,7 +15,7 @@
  */
 
 import { join } from "node:path";
-import { enrichDeployment, runDeploy } from "./deploy.ts";
+import { deploymentIsCurrent, enrichDeployment, runDeploy } from "./deploy.ts";
 import { startSmtpSink } from "./smtp-sink.ts";
 import type { BootstrapState } from "./state.ts";
 import { StateManager } from "./state.ts";
@@ -314,6 +314,13 @@ async function runAll(sm: StateManager): Promise<void> {
   }
 
   // ── Phase: deploy ────────────────────────────────────────────────────────
+  // A completed deploy phase is only current while deployment.json carries the
+  // external id of this toolchain; a changed trigger/ tree or lockfile reopens
+  // deploy, verify_deployment and done.
+  if (sm.isDone(state, "deploy") && !deploymentIsCurrent(WORKSPACE_ROOT, STATE_DIR)) {
+    log("phase: deploy — toolchain changed since the last deployment; redeploying");
+    sm.reopen(state, ["deploy", "verify_deployment", "done"]);
+  }
   if (!sm.isDone(state, "deploy")) {
     sm.setRunning(state, "deploy");
     log("phase: deploy");

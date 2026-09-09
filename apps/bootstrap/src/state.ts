@@ -125,6 +125,16 @@ export class StateManager {
     this.save(state);
   }
 
+  /** Marks completed phases pending again so the next run repeats them (e.g. a redeploy). */
+  reopen(state: BootstrapState, phases: readonly Phase[]): void {
+    for (const phase of phases) {
+      if (state.phases[phase]?.status === "done") {
+        state.phases[phase] = { status: "pending" };
+      }
+    }
+    this.save(state);
+  }
+
   setDone(state: BootstrapState, phase: Phase, meta?: Partial<PhaseState>): void {
     state.phases[phase] = {
       ...state.phases[phase],

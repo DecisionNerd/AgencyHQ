@@ -211,6 +211,18 @@ export function ensureBuilder(dockerConfigDir: string, network: string): void {
   log(`buildx builder '${BUILDER_NAME}' created on network ${network}`);
 }
 
+/**
+ * True when deployment.json records a deployment of the current toolchain
+ * (same external id as the workspace hashes to). A changed trigger/ tree or
+ * lockfile yields a new external id, so a restart redeploys even though the
+ * deploy phase was completed once (observed 2026-09-09: a bootstrap rerun
+ * skipped the deploy phase after a toolchain change).
+ */
+export function deploymentIsCurrent(workspaceRoot: string, stateDir: string): boolean {
+  const existing = readDeploymentRecord(stateDir);
+  return existing !== null && existing.externalId === computeExternalId(workspaceRoot);
+}
+
 export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> {
   const { workspaceRoot, stateDir, accessToken, webappIpUrl, projectRef, platform } = opts;
   const triggerDir = join(workspaceRoot, "trigger");
