@@ -33,6 +33,7 @@ COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json ./
 
 # Copy each package's manifest so pnpm can resolve the workspace graph.
 COPY apps/coordinator/package.json apps/coordinator/
+COPY apps/bootstrap/package.json   apps/bootstrap/
 COPY apps/web/package.json         apps/web/
 COPY packages/contracts/package.json packages/contracts/
 COPY packages/db/package.json        packages/db/
@@ -134,6 +135,27 @@ RUN chmod +x /usr/local/bin/entrypoint-webapp.sh \
              /usr/local/bin/entrypoint-trigger-worker.sh \
              /usr/local/bin/entrypoint-clickhouse.sh \
              /usr/local/bin/entrypoint-minio.sh
+
+# ── Bootstrap source (apps/bootstrap) ─────────────────────────────────────────
+# Copied into the tools target (not app) so the bootstrap CLI can run in-container.
+# The deps stage already installed apps/bootstrap's dependencies via its package.json.
+COPY --chown=agencyhq:agencyhq apps/bootstrap/ apps/bootstrap/
+
+# ── Trigger workspace for `trigger deploy` ────────────────────────────────────
+# The app target already has trigger/src/ and trigger/package.json.
+# The tools target adds the remaining files needed by the Trigger CLI deployer:
+#   - trigger/build/    (toolchain extension and build helpers)
+#   - trigger/scripts/  (image-smoke and other scripts)
+#   - trigger/trigger.config.ts + trigger/tsconfig.json
+# .trigger/ (CLI build cache) and .env are excluded via .dockerignore.
+COPY --chown=agencyhq:agencyhq trigger/build/ trigger/build/
+COPY --chown=agencyhq:agencyhq trigger/scripts/ trigger/scripts/
+COPY --chown=agencyhq:agencyhq trigger/trigger.config.ts trigger/
+COPY --chown=agencyhq:agencyhq trigger/tsconfig.json trigger/
+
+# Create the .trigger directory so the CLI can write its build output there.
+# Owned by agencyhq (uid 1000) to avoid permission errors at deploy time.
+RUN mkdir -p /app/trigger/.trigger && chown agencyhq:agencyhq /app/trigger/.trigger
 
 # Default: run the secrets initialiser. Bootstrap overrides CMD.
 USER agencyhq

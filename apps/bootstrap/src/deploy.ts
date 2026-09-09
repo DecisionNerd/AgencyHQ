@@ -28,14 +28,25 @@ export interface DeployOptions {
   webappIpUrl: string;
   /** Trigger project ref (proj_...), set as TRIGGER_PROJECT_REF. */
   projectRef: string;
+  /** Target platform (e.g. linux/arm64). Written to deployment.json. */
+  platform: string;
   /** Registry URL for the task image push (e.g. http://registry:5000/v2/). */
   registryUrl?: string;
 }
 
 export interface DeploymentRecord {
+  /** Version from the Trigger API (enriched after verify phase). */
   version?: string;
+  /** Image reference (enriched after verify phase). */
+  imageRef?: string;
+  /** Digest from the registry (enriched after verify phase). */
+  digest?: string;
+  /** External ID: sha256 fingerprint of trigger/ tree + lockfile. */
   externalId: string;
+  /** Resolved webapp IP URL used at deploy time. */
   webappIpUrl: string;
+  /** Target platform (e.g. linux/arm64). */
+  platform: string;
   at: string;
   skipped?: boolean;
 }
@@ -109,8 +120,22 @@ function log(msg: string): void {
  *
  * Skips the build when deployment.json already records the same externalId.
  */
+/**
+ * Resolve the `trigger` CLI binary path.
+ * Prefers the trigger package's own .bin (trigger/node_modules/.bin/trigger),
+ * falls back to the workspace-root hoisted binary (node_modules/.bin/trigger),
+ * then falls back to PATH.
+ */
+function resolveTriggerBin(workspaceRoot: string): string {
+  const triggerPkg = join(workspaceRoot, "trigger", "node_modules", ".bin", "trigger");
+  const hoisted = join(workspaceRoot, "node_modules", ".bin", "trigger");
+  if (existsSync(triggerPkg)) return triggerPkg;
+  if (existsSync(hoisted)) return hoisted;
+  return "trigger"; // fallback to PATH
+}
+
 export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> {
-  const { workspaceRoot, stateDir, accessToken, webappIpUrl, projectRef } = opts;
+  const { workspaceRoot, stateDir, accessToken, webappIpUrl, projectRef, platform } = opts;
   const triggerDir = join(workspaceRoot, "trigger");
 
   if (!existsSync(triggerDir)) {
@@ -129,7 +154,15 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
 
   log("running trigger deploy --local-build");
 
-  const args = ["deploy", "--local-build", "--external-id", externalId];
+  const args = [
+    "deploy",
+    "--env",
+    "prod",
+    "--local-build",
+    "--external-id",
+    externalId,
+    "--skip-update-check",
+  ];
 
   /**
    * NOTE (open question): The Trigger.dev docs (read 2026-09-09) do not list a
@@ -137,7 +170,7 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
    * they could not be confirmed from the v4.5.16 docs. The --local-build flag
    * handles the local build; registry push behaviour is internal to the CLI.
    * If --network is required for RUN steps to reach the webapp, the operator
-   * must configure TRIGGER_DEPLOY_EXTRA_ARGS or use the socat fallback.
+   * must configure TRIGGER_DEPLOY_ARGS or use the socat fallback.
    *
    * Extra flags can be injected via TRIGGER_DEPLOY_ARGS env var (space-separated).
    */
@@ -153,10 +186,11 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
     TRIGGER_PROJECT_REF: projectRef,
   };
 
+  const triggerBin = resolveTriggerBin(workspaceRoot);
   // Ensure the token is never visible in process listing.
-  log(`spawning: trigger ${args.filter((a) => a !== accessToken).join(" ")}`);
+  log(`spawning: ${triggerBin} ${args.filter((a) => a !== accessToken).join(" ")}`);
 
-  const result = spawnSync("trigger", args, {
+  const result = spawnSync(triggerBin, args, {
     cwd: triggerDir,
     env,
     stdio: "inherit",
@@ -185,10 +219,34 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
   const record: DeploymentRecord = {
     externalId,
     webappIpUrl,
+    platform,
     at: new Date().toISOString(),
   };
   writeDeploymentRecord(stateDir, record);
   return record;
+}
+
+/**
+ * Enrich an existing deployment.json with version/imageRef/externalId from
+ * the verify phase. Never throws — enrichment is best-effort.
+ */
+export function enrichDeployment(
+  stateDir: string,
+  fields: { version?: string; imageRef?: string; externalId?: string },
+): void {
+  try {
+    const existing = readDeploymentRecord(stateDir);
+    if (!existing) return;
+    const enriched: DeploymentRecord = {
+      ...existing,
+      ...(fields.version !== undefined ? { version: fields.version } : {}),
+      ...(fields.imageRef !== undefined ? { imageRef: fields.imageRef } : {}),
+      ...(fields.externalId !== undefined ? { externalId: fields.externalId } : {}),
+    };
+    writeDeploymentRecord(stateDir, enriched);
+  } catch {
+    // Enrichment failure is non-fatal; the coordinator will re-probe the API.
+  }
 }
 
 /**
@@ -212,9 +270,13 @@ export function readDeployment(stateDir: string): DeploymentRecord | null {
   return readDeploymentRecord(stateDir);
 }
 
-/** Check if trigger binary is present on PATH (sanity check). */
-export function triggerBinaryAvailable(): boolean {
-  const result = spawnSync("trigger", ["--version"], { stdio: "pipe" });
+/**
+ * Check if trigger binary is present (sanity check).
+ * @param workspaceRoot Optional: resolve from workspace first.
+ */
+export function triggerBinaryAvailable(workspaceRoot?: string): boolean {
+  const bin = workspaceRoot ? resolveTriggerBin(workspaceRoot) : "trigger";
+  const result = spawnSync(bin, ["--version"], { stdio: "pipe" });
   return result.status === 0;
 }
 

@@ -9,6 +9,9 @@
 !.env.example
 auth.json
 **/auth.json
+# Trigger.dev local env and CLI build cache — never copied into image layers.
+trigger/.env
+trigger/.trigger/
 
 # ── Node artefacts ────────────────────────────────────────────────────────────
 # node_modules are installed inside the image via pnpm; do not copy the host copy.

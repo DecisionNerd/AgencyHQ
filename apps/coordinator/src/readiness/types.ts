@@ -27,12 +27,19 @@ export type BootstrapJson = {
 
 /**
  * Shape of <AGENCYHQ_STATE_DIR>/deployment.json.
- * Written by the bootstrap after a successful `trigger deploy`.
+ * Written by the bootstrap deploy phase; enriched with version/imageRef
+ * after the verify phase calls GET /api/v1/deployments/current.
+ *
+ * Fields are optional because the file may be read between the deploy phase
+ * (which writes platform/externalId/at) and the verify phase (which adds
+ * version/imageRef). Consumers should treat absent fields as "not yet available".
  */
 export type DeploymentJson = {
-  version: string;
-  platform: string;
+  version?: string;
+  platform?: string;
+  imageRef?: string;
   digest?: string;
+  externalId?: string;
   at: string; // ISO-8601 timestamp of the deployment
 };
 
@@ -55,11 +62,15 @@ export type BootstrapReadiness = {
 
 /**
  * Image readiness: null means the deployment.json file is absent (not yet deployed).
+ * Fields mirror DeploymentJson — version/platform may be absent if the verify
+ * phase has not completed yet.
  */
 export type ImageReadiness = {
-  version: string;
-  platform: string;
+  version?: string;
+  platform?: string;
+  imageRef?: string;
   digest?: string;
+  externalId?: string;
   at: string;
 } | null;
 

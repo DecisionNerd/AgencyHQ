@@ -22,6 +22,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -380,7 +381,72 @@ test("only the two Docker socket files are host bind mounts (read-only)", () => 
   );
 });
 
-// ── C6: agencyhq-postgres not on agencyhq network ────────────────────────────
+// ── C7: bootstrap service env names are correct ──────────────────────────────
+// These names must match what apps/bootstrap/src/cli.ts reads.
+test("bootstrap service has the required env variable names", () => {
+  // Extract the bootstrap service's environment block.
+  // docker compose config renders the merged config; we look for the bootstrap
+  // service section and check that the required keys appear.
+  const requiredBootstrapEnv = [
+    "TRIGGER_WEBAPP_URL",
+    "BOOTSTRAP_EMAIL",
+    "AGENCYHQ_STATE_DIR",
+    "AGENCYHQ_WORKSPACE_ROOT",
+    "AGENCYHQ_PLATFORM",
+    "DOCKER_HOST",
+    "BOOTSTRAP_SMTP_PORT",
+  ];
+
+  // Find the bootstrap service section in the rendered config.
+  // docker compose config renders service names at 2-space indent under `services:`.
+  const bootstrapSection = configYaml.match(
+    /\n  bootstrap:([\s\S]*?)(?=\n  [a-z]|\nnetworks:|\nvolumes:|$)/,
+  );
+  assert.ok(
+    bootstrapSection !== null,
+    "bootstrap service not found in rendered compose config",
+  );
+
+  const section = bootstrapSection[1];
+
+  for (const envName of requiredBootstrapEnv) {
+    assert.ok(
+      section.includes(envName),
+      `bootstrap service is missing required env var: ${envName} (must match apps/bootstrap/src/cli.ts)`,
+    );
+  }
+
+  // Negative: old env names that must NOT be present in bootstrap's env block.
+  // Check the environment: subsection only (not other fields like command).
+  const envMatch = section.match(/\n    environment:([\s\S]*?)(?=\n    [a-z]|$)/);
+  const envSection = envMatch ? envMatch[1] : "";
+  const forbiddenBootstrapEnv = [
+    "TRIGGER_API_URL",          // renamed to TRIGGER_WEBAPP_URL
+    "AGENCYHQ_BOOTSTRAP_EMAIL", // renamed to BOOTSTRAP_EMAIL at the service level
+  ];
+  for (const envName of forbiddenBootstrapEnv) {
+    assert.equal(
+      envSection.includes(`${envName}:`),
+      false,
+      `bootstrap service must NOT use old env name: ${envName}`,
+    );
+  }
+});
+
+// ── C8: bootstrap command file exists in repo ─────────────────────────────────
+test("bootstrap command file apps/bootstrap/src/cli.ts exists in the repo", () => {
+  const cliPath = resolve(root, "apps/bootstrap/src/cli.ts");
+  let exists = false;
+  try {
+    statSync(cliPath);
+    exists = true;
+  } catch {
+    exists = false;
+  }
+  assert.ok(exists, `apps/bootstrap/src/cli.ts not found at ${cliPath}`);
+});
+
+// ── C9: agencyhq-postgres not on agencyhq network (was C6 before P15.5) ──────
 test("agencyhq-postgres is not attached to the agencyhq network", () => {
   // The domain ledger is on agencyhq-internal only; runners on the agencyhq
   // network must not be able to reach it directly.

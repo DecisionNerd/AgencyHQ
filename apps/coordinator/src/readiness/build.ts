@@ -79,10 +79,14 @@ export function buildReadiness(inputs: ReadinessInputs): ReadinessResponse {
 
   const image: ImageReadiness = deploymentJson
     ? {
-        version: deploymentJson.version,
-        platform: deploymentJson.platform,
-        ...(deploymentJson.digest !== undefined ? { digest: deploymentJson.digest } : {}),
         at: deploymentJson.at,
+        ...(deploymentJson.version !== undefined ? { version: deploymentJson.version } : {}),
+        ...(deploymentJson.platform !== undefined ? { platform: deploymentJson.platform } : {}),
+        ...(deploymentJson.imageRef !== undefined ? { imageRef: deploymentJson.imageRef } : {}),
+        ...(deploymentJson.digest !== undefined ? { digest: deploymentJson.digest } : {}),
+        ...(deploymentJson.externalId !== undefined
+          ? { externalId: deploymentJson.externalId }
+          : {}),
       }
     : null;
 

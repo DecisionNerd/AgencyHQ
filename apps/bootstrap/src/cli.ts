@@ -14,7 +14,7 @@
  *   AGENCYHQ_PLATFORM      Target platform (e.g. linux/arm64).
  */
 
-import { runDeploy } from "./deploy.ts";
+import { enrichDeployment, runDeploy } from "./deploy.ts";
 import { startSmtpSink } from "./smtp-sink.ts";
 import { StateManager } from "./state.ts";
 import {
@@ -33,18 +33,23 @@ import { verifyDeployment } from "./verify.ts";
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-const STATE_DIR = process.env["AGENCYHQ_STATE_DIR"] ?? "/var/run/agencyhq/state";
-const SECRETS_DIR = process.env["AGENCYHQ_SECRETS_DIR"] ?? "/var/run/agencyhq/secrets";
+const STATE_DIR = process.env["AGENCYHQ_STATE_DIR"] ?? "/var/agencyhq/state";
+// Bootstrap-minted secret files (trigger-prod.key, trigger-pat.key) are written
+// into the state directory — the same agencyhq-state volume the coordinator reads.
+const SECRETS_DIR = process.env["AGENCYHQ_SECRETS_DIR"] ?? STATE_DIR;
 const WEBAPP_URL = process.env["TRIGGER_WEBAPP_URL"] ?? "http://webapp:3000";
-const BOOTSTRAP_EMAIL = process.env["BOOTSTRAP_EMAIL"] ?? "agencyhq@example.com";
+const BOOTSTRAP_EMAIL = process.env["BOOTSTRAP_EMAIL"] ?? "bootstrap@agencyhq.local";
 const ORG_NAME = process.env["AGENCYHQ_ORG_NAME"] ?? "agencyhq";
 const PROJECT_NAME = process.env["AGENCYHQ_PROJECT_NAME"] ?? "agencyhq";
 const TOKEN_NAME = process.env["AGENCYHQ_TOKEN_NAME"] ?? "agencyhq-bootstrap";
-const WORKSPACE_ROOT = process.env["AGENCYHQ_WORKSPACE_ROOT"] ?? "/workspace";
+const WORKSPACE_ROOT = process.env["AGENCYHQ_WORKSPACE_ROOT"] ?? "/app";
+const PLATFORM = process.env["AGENCYHQ_PLATFORM"] ?? "linux/arm64";
 const SMTP_PORT = Number(process.env["BOOTSTRAP_SMTP_PORT"] ?? "2525");
 
-const SECRET_PROD_KEY = "trigger-prod-key";
-const SECRET_PAT = "trigger-pat";
+// File names for secrets written to the state volume (0600 files).
+// Must match what the coordinator reads: apps/coordinator/src/config.ts readTriggerKeyFromState.
+const SECRET_PROD_KEY = "trigger-prod.key";
+const SECRET_PAT = "trigger-pat.key";
 
 function log(msg: string): void {
   console.log(`[bootstrap] ${redact(msg)}`);
@@ -196,6 +201,7 @@ async function runAll(): Promise<void> {
         accessToken,
         webappIpUrl,
         projectRef,
+        platform: PLATFORM,
       });
       sm.setDone(state, "deploy", record.skipped ? { deploymentVersion: "skipped" } : {});
     } catch (err) {
@@ -217,6 +223,15 @@ async function runAll(): Promise<void> {
       const doneMeta: Record<string, string> = {};
       if (info.version !== undefined) doneMeta["deploymentVersion"] = info.version;
       sm.setDone(state, "verify_deployment", doneMeta as Partial<import("./state.ts").PhaseState>);
+      // Enrich deployment.json with version and imageRef from the API response
+      // so the coordinator readiness loader can surface them without re-reading the API.
+      if (info.version !== undefined || info.imageRef !== undefined) {
+        const enrichFields: { version?: string; imageRef?: string; externalId?: string } = {};
+        if (info.version !== undefined) enrichFields.version = info.version;
+        if (info.imageRef !== undefined) enrichFields.imageRef = info.imageRef;
+        if (info.externalId !== undefined) enrichFields.externalId = info.externalId;
+        enrichDeployment(STATE_DIR, enrichFields);
+      }
     } catch (err) {
       const category = (err as { errorCategory?: string }).errorCategory ?? "verify_failed";
       sm.setFailed(state, "verify_deployment", category, String(err));

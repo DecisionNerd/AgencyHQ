@@ -32,6 +32,8 @@
  *   1 — unexpected error (message in stderr)
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { configure, runs, tasks } from "@trigger.dev/sdk";
 
 import { OPENCODE_VERSION, PNPM_VERSION } from "../build/toolchain.ts";
@@ -59,10 +61,15 @@ const FINAL_STATUSES = new Set([
 
 const REQUIRED_ENV = [
   "TRIGGER_API_URL",
-  "TRIGGER_SECRET_KEY",
   "AGENCYHQ_FIXTURE_REMOTE",
   "AGENCYHQ_FIXTURE_REVISION",
 ] as const;
+
+// TRIGGER_SECRET_KEY is required but may be absent from the environment when
+// running inside the stack (exec form) — in that case read it from the state
+// volume file written by bootstrap: <AGENCYHQ_STATE_DIR>/trigger-prod.key.
+// The env var always wins if present.
+const OPTIONAL_SECRET_ENV = ["TRIGGER_SECRET_KEY"] as const;
 
 // ---------------------------------------------------------------------------
 // Env helpers
@@ -78,15 +85,41 @@ function readEnv(name: string): string | null {
 }
 
 /**
+ * Read TRIGGER_SECRET_KEY from the environment or, as a fallback when running
+ * inside the container stack, from <AGENCYHQ_STATE_DIR>/trigger-prod.key.
+ * Never logs the value. Returns null if neither source has a value.
+ */
+function readSecretKey(): string | null {
+  const fromEnv = readEnv("TRIGGER_SECRET_KEY");
+  if (fromEnv !== null) return fromEnv;
+  // Fallback: read from the state volume (exec form; no key leaves containers).
+  const stateDir = readEnv("AGENCYHQ_STATE_DIR");
+  if (stateDir !== null) {
+    try {
+      const val = readFileSync(join(stateDir, "trigger-prod.key"), "utf-8").trim();
+      if (val.length > 0) return val;
+    } catch {
+      // File not yet written; will fail the requireEnvVars check below.
+    }
+  }
+  return null;
+}
+
+/**
  * Validate all required env vars are present.
  * Prints the missing names (not values) and exits 1 if any are absent.
  */
 function requireEnvVars(): void {
-  const missing = REQUIRED_ENV.filter((name) => readEnv(name) === null);
+  const missing: string[] = REQUIRED_ENV.filter((name) => readEnv(name) === null);
+  // Check TRIGGER_SECRET_KEY separately (may come from state file).
+  if (readSecretKey() === null) {
+    missing.push("TRIGGER_SECRET_KEY");
+  }
   if (missing.length > 0) {
-    // C4: script refuses to run without the four env names; prints names only.
+    // C4: script refuses to run without required env names; prints names only.
     console.error(`image-smoke: missing required environment variables: ${missing.join(", ")}`);
-    console.error(`Required: ${REQUIRED_ENV.join(", ")}`);
+    console.error(`Required: ${[...REQUIRED_ENV, ...OPTIONAL_SECRET_ENV].join(", ")}`);
+    console.error("TRIGGER_SECRET_KEY may also be read from <AGENCYHQ_STATE_DIR>/trigger-prod.key");
     process.exit(1);
   }
 }
@@ -136,10 +169,11 @@ async function main(): Promise<void> {
   // C4: refuse without the four env names.
   requireEnvVars();
 
-  // All four required vars are present after requireEnvVars() — use ?? "" to
+  // All required vars are present after requireEnvVars() — use ?? "" to
   // satisfy exactOptionalPropertyTypes without a non-null assertion.
   const apiUrl = readEnv("TRIGGER_API_URL") ?? "";
-  const secretKey = readEnv("TRIGGER_SECRET_KEY") ?? "";
+  // TRIGGER_SECRET_KEY may come from the environment or the state file.
+  const secretKey = readSecretKey() ?? "";
   const fixtureRemote = readEnv("AGENCYHQ_FIXTURE_REMOTE") ?? "";
   const fixtureRevision = readEnv("AGENCYHQ_FIXTURE_REVISION") ?? "";
   // Platform defaults to linux/arm64 (ADR-0008 §3, assumption 12).

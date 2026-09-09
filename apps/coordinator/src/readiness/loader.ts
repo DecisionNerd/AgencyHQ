@@ -15,7 +15,78 @@ import type { BootstrapJson, DeploymentJson, ReadinessInputs, TriggerStatus } fr
 // ---------------------------------------------------------------------------
 
 /**
+ * Phase order matching apps/bootstrap/src/state.ts PHASES constant.
+ * Used to derive the "current" phase when reading BootstrapState format.
+ */
+const BOOTSTRAP_PHASE_ORDER = [
+  "wait_services",
+  "login",
+  "org_project",
+  "credentials",
+  "deploy",
+  "verify_deployment",
+  "done",
+] as const;
+
+/**
+ * Translate a BootstrapState (new format written by StateManager) into the
+ * BootstrapJson shape used by the coordinator readiness subsystem.
+ *
+ * Rules:
+ *   1. If phases.done.status === "done" → { phase: "done", status: "done" }
+ *   2. If any phase has status "failed" → { phase: <that phase>, status: "failed", error: errorCategory }
+ *   3. If any phase has status "running" → { phase: <that phase>, status: "running" }
+ *   4. Otherwise: next after last "done" (or first phase) → { status: "running" }
+ */
+function translateBootstrapState(
+  phases: Record<string, Record<string, unknown>>,
+  at: string,
+): BootstrapJson | null {
+  // Rule 1: fully done
+  if (phases.done?.status === "done") {
+    return { phase: "done", status: "done", at };
+  }
+  // Rule 2: any failed phase (iterate in order; last failed wins)
+  let failedPhase: string | null = null;
+  let failedError: string | undefined;
+  for (const name of BOOTSTRAP_PHASE_ORDER) {
+    const p = phases[name];
+    if (p?.status === "failed") {
+      failedPhase = name;
+      failedError = typeof p.errorCategory === "string" ? p.errorCategory : undefined;
+    }
+  }
+  if (failedPhase !== null) {
+    const result: BootstrapJson = { phase: failedPhase, status: "failed", at };
+    if (failedError !== undefined) result.error = failedError;
+    return result;
+  }
+  // Rule 3: running phase
+  for (const name of BOOTSTRAP_PHASE_ORDER) {
+    const p = phases[name];
+    if (p?.status === "running") {
+      return { phase: name, status: "running", at };
+    }
+  }
+  // Rule 4: next after last done (phases object exists but nothing is running/failed)
+  let lastDoneIdx = -1;
+  for (let i = 0; i < BOOTSTRAP_PHASE_ORDER.length; i++) {
+    const name = BOOTSTRAP_PHASE_ORDER[i];
+    if (name !== undefined && phases[name]?.status === "done") lastDoneIdx = i;
+  }
+  const currentIdx = Math.min(lastDoneIdx + 1, BOOTSTRAP_PHASE_ORDER.length - 1);
+  const currentPhase = BOOTSTRAP_PHASE_ORDER[currentIdx] ?? BOOTSTRAP_PHASE_ORDER[0];
+  return { phase: currentPhase, status: "running", at };
+}
+
+/**
  * Read and parse <stateDir>/bootstrap.json.
+ *
+ * Handles two formats:
+ *  - BootstrapState (new): { version: 1, phases: {...}, updatedAt: string }
+ *    Written by apps/bootstrap/src/state.ts StateManager.
+ *  - Legacy: { phase: string, status: string, at: string }
+ *
  * Returns null if the file is missing, unreadable, or not valid JSON with the
  * expected shape.  Never throws; never logs file contents.
  */
@@ -24,16 +95,18 @@ export function readBootstrapJson(stateDir: string | undefined): BootstrapJson |
   try {
     const raw = readFileSync(join(stateDir, "bootstrap.json"), "utf-8");
     const parsed: unknown = JSON.parse(raw);
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      !("phase" in parsed) ||
-      !("status" in parsed) ||
-      !("at" in parsed)
-    ) {
-      return null;
-    }
+    if (typeof parsed !== "object" || parsed === null) return null;
     const obj = parsed as Record<string, unknown>;
+
+    // ── New format: BootstrapState ──────────────────────────────────────────
+    if ("phases" in obj && typeof obj.phases === "object" && obj.phases !== null) {
+      const at = typeof obj.updatedAt === "string" ? obj.updatedAt : new Date().toISOString();
+      const phases = obj.phases as Record<string, Record<string, unknown>>;
+      return translateBootstrapState(phases, at);
+    }
+
+    // ── Legacy format: { phase, status, at } ────────────────────────────────
+    if (!("phase" in obj) || !("status" in obj) || !("at" in obj)) return null;
     if (
       typeof obj.phase !== "string" ||
       (obj.status !== "running" && obj.status !== "done" && obj.status !== "failed") ||
@@ -57,7 +130,16 @@ export function readBootstrapJson(stateDir: string | undefined): BootstrapJson |
 
 /**
  * Read and parse <stateDir>/deployment.json.
- * Returns null if the file is missing, unreadable, or not valid JSON.
+ *
+ * Handles two formats:
+ *  - DeploymentRecord (new): { externalId, webappIpUrl, platform, at, version?, imageRef?, digest? }
+ *    Written by apps/bootstrap/src/deploy.ts runDeploy / enrichDeployment.
+ *  - Legacy: { version, platform, at, digest? }
+ *
+ * Only `at` is required; all other fields are optional (version/platform may
+ * appear only after the verify phase enriches the record).
+ *
+ * Returns null if the file is missing, unreadable, or lacks `at`.
  * Never throws; never logs file contents.
  */
 export function readDeploymentJson(stateDir: string | undefined): DeploymentJson | null {
@@ -65,31 +147,16 @@ export function readDeploymentJson(stateDir: string | undefined): DeploymentJson
   try {
     const raw = readFileSync(join(stateDir, "deployment.json"), "utf-8");
     const parsed: unknown = JSON.parse(raw);
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      !("version" in parsed) ||
-      !("platform" in parsed) ||
-      !("at" in parsed)
-    ) {
-      return null;
-    }
+    if (typeof parsed !== "object" || parsed === null || !("at" in parsed)) return null;
     const obj = parsed as Record<string, unknown>;
-    if (
-      typeof obj.version !== "string" ||
-      typeof obj.platform !== "string" ||
-      typeof obj.at !== "string"
-    ) {
-      return null;
-    }
-    const result: DeploymentJson = {
-      version: obj.version,
-      platform: obj.platform,
-      at: obj.at,
-    };
-    if (typeof obj.digest === "string") {
-      result.digest = obj.digest;
-    }
+    if (typeof obj.at !== "string") return null;
+
+    const result: DeploymentJson = { at: obj.at };
+    if (typeof obj.version === "string") result.version = obj.version;
+    if (typeof obj.platform === "string") result.platform = obj.platform;
+    if (typeof obj.imageRef === "string") result.imageRef = obj.imageRef;
+    if (typeof obj.digest === "string") result.digest = obj.digest;
+    if (typeof obj.externalId === "string") result.externalId = obj.externalId;
     return result;
   } catch {
     return null;
