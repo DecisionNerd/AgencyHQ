@@ -222,6 +222,7 @@ services:
     networks:
       - agencyhq   # bootstrap → app (coordinator)
       - webapp      # bootstrap → Trigger webapp (form submission, API calls)
+      - supervisor  # the webapp may advertise an address on any of its networks
       - docker-proxy-build  # bootstrap → docker-proxy-build (deployer phase only)
     volumes:
       - secrets:/run/agencyhq/secrets:ro

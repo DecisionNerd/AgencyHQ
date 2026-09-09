@@ -162,6 +162,11 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
     "--external-id",
     externalId,
     "--skip-update-check",
+    // Observed 2026-09-09 on Docker Desktop: a `--network host` image build reaches
+    // the webapp's container IP (advertised as API_ORIGIN) while a default-network
+    // build reaches neither the service name nor the IP.
+    "--network",
+    "host",
   ];
 
   /**
