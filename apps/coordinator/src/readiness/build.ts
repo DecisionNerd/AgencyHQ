@@ -20,7 +20,7 @@ import type {
  * 1. Database down → instruct operator to check agencyhq-postgres.
  * 2. Bootstrap absent → instruct operator to run `docker compose up -d`.
  * 3. Bootstrap running → report current phase.
- * 4. Bootstrap failed → surface phase and error category.
+ * 4. Bootstrap failed → backoff time when it will retry, else phase and error category.
  * 5. Bootstrap done but trigger unconfigured → bootstrap may still be deploying the key.
  * 6. Bootstrap done but image absent → deploy still in progress.
  * 7. All ready → instruct operator to log in with OpenCode.
@@ -42,7 +42,9 @@ function deriveNextAction(inputs: ReadinessInputs): string {
 
   if (bootstrapJson.status === "failed") {
     const category = bootstrapJson.error ?? "unknown";
-    if (category === "login_rate_limited" && bootstrapJson.nextRetryAt) {
+    // Any transient failure the bootstrap retries carries nextRetryAt (rate
+    // limits, an interrupted build the webapp still marks in progress, ...).
+    if (bootstrapJson.nextRetryAt) {
       return `Bootstrap is backing off until ${bootstrapJson.nextRetryAt} (${category}); check \`docker compose logs bootstrap\``;
     }
     return `Bootstrap failed at ${bootstrapJson.phase}: ${category}; run \`docker compose logs bootstrap\``;

@@ -57,11 +57,12 @@ bootstrap dashboard-link   # Request a fresh magic link and print it to stdout o
 | `credentials` | `project_page_not_found` | API keys page returned 404 after env/prod provisioning attempt. Check that the org and project slugs are correct. |
 | `credentials` | `pat_create_failed` | Token creation endpoint returned an unexpected response. |
 | `deploy` | `deploy_failed` | `trigger deploy` exited non-zero; see output for details. Re-run to retry. |
+| `deploy` | `deploy_in_progress` | The webapp still marks an interrupted build of this toolchain as in progress (the bootstrap was killed mid-build). The bootstrap retries once with `--force` (cancels the stale build); if that also fails, the webapp times the stale build out after `DEPLOY_TIMEOUT_MS` (default 8 min) and the backoff retry succeeds. |
 | `verify_deployment` | `verify_failed` | `GET /api/v1/deployments/current` returned non-200. |
 
 ## Backoff behaviour
 
-On any **transient** failure (categories: `login_rate_limited`, `magic_link_timeout`, `services_unavailable`, `deploy_failed`) the bootstrap process sleeps before exiting non-zero. This prevents `restart: on-failure` from hot-looping.
+On any **transient** failure (categories: `login_rate_limited`, `magic_link_timeout`, `services_unavailable`, `deploy_failed`, `deploy_in_progress`) the bootstrap process sleeps before exiting non-zero. This prevents `restart: on-failure` from hot-looping.
 
 ### Sleep duration
 

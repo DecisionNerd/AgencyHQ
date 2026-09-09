@@ -9,7 +9,7 @@
  * No third-party deps — uses node:crypto, node:fs, node:child_process.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -132,6 +132,49 @@ function resolveTriggerBin(workspaceRoot: string): string {
   if (existsSync(triggerPkg)) return triggerPkg;
   if (existsSync(hoisted)) return hoisted;
   return "trigger"; // fallback to PATH
+}
+
+/** Failure categories the deploy phase can surface (readiness shows them verbatim). */
+export type DeployFailureCategory = "deploy_failed" | "deploy_in_progress";
+
+/**
+ * Classify a failed `trigger deploy` from the tail of its output. The webapp
+ * rejects a deploy whose external id is already BUILDING with "A deployment for
+ * external id … is already in progress" (trigger.dev v4.5.16, read 2026-09-09).
+ */
+export function classifyDeployFailure(outputTail: string): DeployFailureCategory {
+  return /is already in progress/.test(outputTail) ? "deploy_in_progress" : "deploy_failed";
+}
+
+/** Bytes of CLI output kept for failure classification (never persisted). */
+const OUTPUT_TAIL_BYTES = 16 * 1024;
+
+/**
+ * Run the Trigger CLI, streaming its output to this process (so `docker logs`
+ * shows progress) while keeping the last OUTPUT_TAIL_BYTES for classification.
+ * Resolves with the exit status; a spawn error surfaces as status null.
+ */
+export function runTriggerCli(
+  bin: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ status: number | null; tail: string }> {
+  return new Promise((resolve) => {
+    let tail = "";
+    const keep = (chunk: Buffer, sink: NodeJS.WriteStream): void => {
+      sink.write(chunk);
+      tail = (tail + chunk.toString("utf-8")).slice(-OUTPUT_TAIL_BYTES);
+    };
+    const child = spawn(bin, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout.on("data", (c: Buffer) => keep(c, process.stdout));
+    child.stderr.on("data", (c: Buffer) => keep(c, process.stderr));
+    child.on("error", (err) => {
+      tail = `${tail}\ntrigger deploy process error: ${err.message}`;
+      resolve({ status: null, tail });
+    });
+    child.on("close", (status) => resolve({ status, tail }));
+  });
 }
 
 /** Name of the buildx builder the Trigger CLI uses by default (`--builder`). */
@@ -286,27 +329,32 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
   // Ensure the token is never visible in process listing.
   log(`spawning: ${triggerBin} ${args.filter((a) => a !== accessToken).join(" ")}`);
 
-  const result = spawnSync(triggerBin, args, {
-    cwd: triggerDir,
-    env,
-    stdio: "inherit",
-    encoding: "utf-8",
-  });
+  let result = await runTriggerCli(triggerBin, args, triggerDir, env);
 
-  if (result.error) {
-    throw Object.assign(new Error(`trigger deploy process error: ${result.error.message}`), {
-      errorCategory: "deploy_failed",
-    });
+  if (result.status !== 0 && classifyDeployFailure(result.tail) === "deploy_in_progress") {
+    // An earlier build of this exact toolchain was interrupted (container killed
+    // or restarted mid-build); the webapp keeps that deployment BUILDING until
+    // its DEPLOY_TIMEOUT_MS (default 8 min) and rejects a new one for the same
+    // external id. The bootstrap is the only deployer of this project, so the
+    // stale build is ours: cancel it and build again (observed 2026-09-09).
+    log(
+      "the webapp still marks an interrupted build of this toolchain in progress; retrying with --force",
+    );
+    result = await runTriggerCli(triggerBin, [...args, "--force"], triggerDir, env);
   }
 
   if (result.status !== 0) {
+    const category = classifyDeployFailure(result.tail);
+    const hint =
+      category === "deploy_in_progress"
+        ? "The webapp still reports a build of this toolchain in progress; it times out after DEPLOY_TIMEOUT_MS (default 8 min), after which the bootstrap retry succeeds. "
+        : "Check the output above for the exact failure. ";
     throw Object.assign(
       new Error(
-        `trigger deploy exited with code ${result.status}. ` +
-          "Check the output above for the exact failure. " +
+        `trigger deploy exited with code ${result.status}. ${hint}` +
           "Re-run bootstrap to retry only the deploy phase.",
       ),
-      { errorCategory: "deploy_failed" },
+      { errorCategory: category },
     );
   }
 

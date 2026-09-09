@@ -44,6 +44,7 @@ const TRANSIENT_CATEGORIES = new Set([
   "smtp_aborted",
   "services_unavailable",
   "deploy_failed",
+  "deploy_in_progress",
 ]);
 
 /**
@@ -338,7 +339,8 @@ async function runAll(sm: StateManager): Promise<void> {
       });
       sm.setDone(state, "deploy", record.skipped ? { deploymentVersion: "skipped" } : {});
     } catch (err) {
-      sm.setFailed(state, "deploy", "deploy_failed", String(err));
+      const category = (err as { errorCategory?: string }).errorCategory ?? "deploy_failed";
+      sm.setFailed(state, "deploy", category, String(err));
       throw err;
     }
   } else {

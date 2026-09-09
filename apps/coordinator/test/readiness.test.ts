@@ -402,6 +402,25 @@ describe("buildReadiness — login_rate_limited nextAction", () => {
     );
   });
 
+  it("deploy_in_progress with nextRetryAt → nextAction reports the backoff (interrupted build)", () => {
+    const r = buildReadiness(
+      inputs({
+        bootstrapJson: {
+          phase: "deploy",
+          status: "failed",
+          error: "deploy_in_progress",
+          at: RATE_LIMITED_AT,
+          nextRetryAt: NEXT_RETRY_AT,
+        },
+      }),
+    );
+    assert.ok(r.nextAction.includes(NEXT_RETRY_AT), `expected backoff time, got: ${r.nextAction}`);
+    assert.ok(
+      r.nextAction.includes("deploy_in_progress"),
+      `expected category, got: ${r.nextAction}`,
+    );
+  });
+
   it("login_rate_limited without nextRetryAt → falls back to generic failed message", () => {
     const r = buildReadiness(
       inputs({
