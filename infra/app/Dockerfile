@@ -68,10 +68,21 @@ FROM base AS app
 WORKDIR /app
 
 # Create a non-root user for the coordinator process.
-RUN groupadd -r agencyhq --gid 1000 && useradd -r -g agencyhq --uid 1000 -d /app agencyhq
+# node:24 ships user/group `node` as uid/gid 1000; rename it rather than
+# creating a second identity with the same ids (groupadd exits 4).
+RUN groupmod -n agencyhq node && usermod -l agencyhq -d /app node
 
 # Copy node_modules from the deps stage (includes workspace symlinks).
 COPY --from=deps /app/node_modules ./node_modules
+# pnpm keeps each workspace package's dependency links in its own node_modules
+# (the @agencyhq/* symlinks live there); copy them from the deps stage too.
+COPY --from=deps /app/apps/coordinator/node_modules apps/coordinator/node_modules
+COPY --from=deps /app/apps/bootstrap/node_modules   apps/bootstrap/node_modules
+COPY --from=deps /app/packages/contracts/node_modules packages/contracts/node_modules
+COPY --from=deps /app/packages/db/node_modules        packages/db/node_modules
+COPY --from=deps /app/packages/domain/node_modules    packages/domain/node_modules
+COPY --from=deps /app/packages/verification/node_modules packages/verification/node_modules
+COPY --from=deps /app/trigger/node_modules            trigger/node_modules
 
 # Copy workspace source (coordinator and its dependencies).
 COPY --chown=agencyhq:agencyhq package.json pnpm-workspace.yaml tsconfig.base.json ./
@@ -92,6 +103,9 @@ RUN chmod +x /usr/local/bin/entrypoint-app.sh
 
 # State and git volumes.
 RUN mkdir -p /var/agencyhq/state /var/agencyhq/git && chown -R agencyhq:agencyhq /var/agencyhq
+# The secrets volume takes this directory's ownership on first mount, so the
+# secrets-init job (uid 1000) can write into it.
+RUN mkdir -p /run/agencyhq/secrets && chown agencyhq:agencyhq /run/agencyhq/secrets && chmod 0755 /run/agencyhq/secrets
 
 # The web dist is pre-built and copied above; the coordinator serves it.
 ENV WEB_DIST=/app/apps/web/dist
@@ -118,10 +132,18 @@ USER root
 # Docker CLI and buildx plugin (matching Docker Desktop 28.x feature set).
 # Using the docker.io package from Debian stable (bookworm) keeps the install
 # simple; for exact version pinning in CI replace with the upstream apt repo.
+# Docker CLI + buildx plugin from Docker's own apt repository (Debian bookworm
+# main has no docker-buildx package). Versions pinned to the 28.x CLI line
+# used on the qualifying host; read 2026-09-09 from https://download.docker.com/linux/debian/dists/bookworm/stable/.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      docker.io \
-      docker-buildx \
+ && apt-get install -y --no-install-recommends curl gnupg \
+ && install -m 0755 -d /etc/apt/keyrings \
+ && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+ && chmod a+r /etc/apt/keyrings/docker.asc \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin \
+ && apt-get purge -y gnupg && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
 
 # Copy entrypoint wrappers used by other container roles.

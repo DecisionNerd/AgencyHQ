@@ -25,13 +25,17 @@ include:
   # edits documented in infra/trigger/UPSTREAM.md.
   # Container-profile settings (secrets wrappers, SMTP, platform, telemetry)
   # are applied directly in this file — see UPSTREAM.md § edits 8–9.
-  - path: infra/trigger/docker-compose.yml
+  - path:
+      - infra/trigger/docker-compose.yml
+      - infra/agencyhq/trigger-overrides.yaml
 
   # Trigger.dev worker stack: supervisor (Trigger worker stack container)
   # and docker-proxy. Vendored from v4.5.16 with agencyhq edits.
   # Container-profile settings (DOCKER_RUNNER_NETWORKS, DOCKER_PLATFORM,
   # secrets wrapper) are applied directly in this file — see UPSTREAM.md § edit 9.
-  - path: infra/trigger/docker-compose.worker.yml
+  - path:
+      - infra/trigger/docker-compose.worker.yml
+      - infra/agencyhq/trigger-worker-overrides.yaml
 
   # AgencyHQ application services: secrets-init, app, agencyhq-postgres,
   # opencode, bootstrap, docker-proxy-build.

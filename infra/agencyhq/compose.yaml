@@ -67,7 +67,9 @@ services:
     volumes:
       - secrets:/run/agencyhq/secrets
     networks: []
-    command: ["node", "/usr/local/bin/secrets-init.mjs"]
+    # Bypass the app entrypoint wrapper: it requires the secrets this job creates.
+    entrypoint: ["node", "/usr/local/bin/secrets-init.mjs"]
+    command: []
 
   # ── app ─────────────────────────────────────────────────────────────────────
   # AgencyHQ coordinator + web dist. Runs migrations on start; serves the
@@ -206,13 +208,10 @@ services:
   #
   # Implementation: apps/bootstrap (P15.2 packet; TypeScript, runs in Node 24).
   bootstrap:
-    build:
-      context: ../..
-      dockerfile: infra/app/Dockerfile
-      target: tools
-      platforms:
-        - ${AGENCYHQ_PLATFORM:-linux/arm64}
+    # The tools image is built once by secrets-init; two services building the
+    # same tag makes buildx bake fail with "image already exists".
     image: agencyhq/app:tools
+    pull_policy: never
     restart: on-failure
     logging: *logging-config
     depends_on:

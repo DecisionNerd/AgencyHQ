@@ -44,7 +44,7 @@ function readExistingValue(filePath, key) {
     if (!trimmed || trimmed.startsWith("#")) continue;
     const eqIdx = trimmed.indexOf("=");
     if (eqIdx < 0) continue;
-    if (trimmed.slice(0, eqIdx) === key) return trimmed.slice(eqIdx + 1);
+    if (trimmed.slice(0, eqIdx) === key) return unquote(trimmed.slice(eqIdx + 1));
   }
   return undefined;
 }
@@ -58,9 +58,28 @@ function readExistingRaw(filePath) {
   return v.length > 0 ? v : undefined;
 }
 
+/** Quote every KEY=value line of a sourced env file (values may contain &, ?, $). */
+function quoteEnv(content) {
+  return content
+    .split("\n")
+    .map((line) => {
+      const m = /^([A-Z0-9_]+)=(.*)$/.exec(line);
+      if (!m) return line;
+      const v = m[2];
+      if (v.startsWith("'") && v.endsWith("'")) return line;
+      return `${m[1]}='${v.replace(/'/g, "'\\''")}'`;
+    })
+    .join("\n");
+}
+
+function unquote(v) {
+  return v.startsWith("'") && v.endsWith("'") ? v.slice(1, -1).replace(/'\\''/g, "'") : v;
+}
+
 async function writeSecret(filePath, content) {
-  writeFileSync(filePath, content, { mode: 0o600 });
-  await chmod(filePath, 0o600);
+  if (filePath.endsWith(".env")) content = quoteEnv(content);
+  writeFileSync(filePath, content, { mode: 0o644 });
+  await chmod(filePath, 0o644);
 }
 
 /**
@@ -108,7 +127,9 @@ const sessionSecret = ensureValue(readExistingValue(webappFile, "SESSION_SECRET"
 const magicLinkSecret = ensureValue(readExistingValue(webappFile, "MAGIC_LINK_SECRET"), () =>
   hex(32),
 );
-const encryptionKey = ensureValue(readExistingValue(webappFile, "ENCRYPTION_KEY"), () => hex(32));
+// The webapp requires ENCRYPTION_KEY to be exactly 32 characters (env.server.ts
+// "must be exactly 32 bytes"; upstream generates `openssl rand -hex 16`).
+const encryptionKey = ensureValue(readExistingValue(webappFile, "ENCRYPTION_KEY"), () => hex(16));
 const providerSecret = ensureValue(readExistingValue(webappFile, "PROVIDER_SECRET"), () => hex(32));
 const coordinatorSecret = ensureValue(readExistingValue(webappFile, "COORDINATOR_SECRET"), () =>
   hex(32),

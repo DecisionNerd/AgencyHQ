@@ -1,0 +1,34 @@
+# Container-profile overrides merged (Compose `include` with a path list)
+# on top of the vendored Trigger.dev files. Every service that reads a secret
+# from the `secrets` volume waits for secrets-init; electric gets the database
+# password through a wrapper because its image reads only DATABASE_URL.
+# Kept outside the vendored files so the host profile (`-f infra/trigger/...`)
+# stays valid without the secrets-init service.
+services:
+  postgres:
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+  clickhouse:
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+  minio:
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+  webapp:
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+  electric:
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+    volumes:
+      - secrets:/run/agencyhq/secrets:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        export DATABASE_URL="postgresql://postgres:$(cat /run/agencyhq/secrets/trigger-db-password)@postgres:5432/main?schema=public&sslmode=disable";
+        exec /app/bin/entrypoint start
