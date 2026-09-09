@@ -115,7 +115,7 @@ Every task exports three schema variants and a type guard:
 
 **AnySchema** is `z.union([v1, v2])`. Use it wherever both payload formats must be accepted. `isV2Payload(p)` narrows to the v2 type.
 
-Later packets (P18.2, P18.3) switch coordinator and trigger importers to the `Any`/`V2` forms. Until then, all existing code continues to use the v1 primary schemas.
+P18.2 (`apps/coordinator/src/internal/artifacts-router.ts`) and P18.3 (`trigger/src/lib/source.ts`, `trigger/src/lib/artifact-upload.ts`, `trigger/src/lib/runtime.ts`) are implemented. Coordinator internal routes and trigger adapter modules use `SourceRef`, `ArtifactUploadMeta`, `StopEvidenceUpload`, `LeaseRequest`, `LeaseGrant`, and `LeaseRefusal` from this package. These paths are declared from code; not yet exercised live (L2 trial pending). Existing v1 payload schemas remain the primary schemas for dispatch.
 
 ### JSON Schema export
 

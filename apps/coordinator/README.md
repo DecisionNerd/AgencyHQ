@@ -227,11 +227,13 @@ Environment variables (container profile):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AGENCYHQ_OPENCODE_DATA_DIR` | — | OpenCode data dir (required in container) |
-| `AGENCYHQ_SECRETS_KEY` | — | AES-256-GCM key for decrypting project credentials |
-| `AGENCYHQ_LEASE_TTL_MS` | 1 800 000 (30 min) | Provider/git-read lease TTL |
-| `AGENCYHQ_INTEGRATE_LEASE_TTL_MS` | 300 000 (5 min) | Integrate lease TTL |
-| `AGENCYHQ_RUNTIME_PROFILE` | `host` | Set to `container` to enable internal routes |
+| `AGENCYHQ_OPENCODE_DATA_DIR` | — | OpenCode data dir (required in container profile; coordinator reads `auth.json` from here) |
+| `AGENCYHQ_SECRETS_KEY` | — | 64-hex AES-256-GCM key for encrypting/decrypting project credentials in `project_credentials` |
+| `AGENCYHQ_LEASE_TTL_MS` | 900 000 (15 min) | Default lease TTL for `provider`, `git-read`, and `upload` purposes |
+| `AGENCYHQ_INTEGRATE_LEASE_TTL_MS` | 300 000 (5 min) | Lease TTL for `integrate` purpose (operation-scoped; shorter than default) |
+| `AGENCYHQ_GIT_ROOT` | `<worktreeBase>/git` (host) / `/var/agencyhq/git` (container) | Root directory for git bare mirrors (`<gitRoot>/<projectId>.git`) |
+| `AGENCYHQ_MAX_BUNDLE_BYTES` | 209 715 200 (200 MiB) | Maximum bundle bytes for source download and artifact upload |
+| `AGENCYHQ_RUNTIME_PROFILE` | `host` | Set to `container` to enable internal routes and per-run isolated HOME |
 
 ## Readiness API
 

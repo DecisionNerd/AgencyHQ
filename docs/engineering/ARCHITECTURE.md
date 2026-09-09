@@ -201,6 +201,60 @@ execution state in the UI; delivery of every status change was confirmed against
 the self-hosted webapp on 2026-09-08 (`@trigger.dev/sdk` 4.5.16). Realtime
 remains UI-only; the coordinator's observation path is polling.
 
+## Internal API surface (container profile)
+
+Routes under `/internal/*` are consumed exclusively by worker containers running
+in the portable execution model (`source_mode = 'mirror'`). They are **not**
+protected by the operator bearer token (`AGENCYHQ_API_TOKEN`). Instead, each
+request is authenticated via the dispatch nonce (lease requests) or an upload
+lease bearer token (artifact and source routes).
+
+**Network reachability.** Internal routes are reachable only to runner containers
+on the `agencyhq` Docker network. External operators and the web control plane
+use `/api/*` routes with the operator bearer token; they never call `/internal/*`.
+
+| Route | Auth mechanism | Purpose |
+| --- | --- | --- |
+| `POST /internal/leases` | Dispatch nonce in request body | Request a credential lease (provider, git-read, integrate, upload). |
+| `GET /internal/source/:projectId?rev=<sha>` | Upload or git-read lease bearer token | Download a source git bundle from the coordinator mirror. |
+| `POST /internal/attempts/:id/artifacts` | Upload lease bearer token (SHA-256 lookup) | Upload an attempt artifact bundle. |
+| `POST /internal/attempts/:id/checkpoints` | Upload lease bearer token | Upload a checkpoint artifact bundle. |
+| `POST /internal/attempts/:id/stop-evidence` | Upload lease bearer token | Upload structured stop-sequence evidence. |
+
+**Implementation:** `apps/coordinator/src/internal/router.ts` (lease routes),
+`apps/coordinator/src/internal/artifacts-router.ts` (artifact and source routes).
+
+**Lease state machine.**
+
+```
+  [issued] → [used] (used_at set when worker materializes the credential)
+      ↓
+  [revoked] (revoked_at set by coordinator on generation advance or stop)
+      or
+  [expired] (expires_at < now; coordinator sweeps via revokeExpiredLeases)
+```
+
+All state transitions are via column updates (no row deletion). Idempotent
+re-request for the same `(attempt_id, generation, purpose, nonce_hash)` returns
+the same lease grant if not revoked/expired.
+
+**Revocation policy.** When a new generation starts,
+`revokeLeasesBelowGeneration(attemptId, newGeneration)` revokes all leases for
+the attempt whose `generation < newGeneration`. Logout blocks new provider leases
+(the provider state check returns `login_required`); in-flight leases with
+`revoked_at IS NULL` and `expires_at > now` continue to be honored until
+expiry, but `requestLease` will not issue new ones.
+
+**Credential exposure disclosure.** On the container profile, the coding agent
+(OpenCode) process runs with `HOME` pointing to the per-run isolated directory
+containing `auth.json` (mode `0600`). The coding agent can read this file within
+its process lifetime. This is declared behavior: the auth.json is written
+specifically to give the provider credentials to OpenCode for model API calls.
+The file is deleted by the cleanup step after the task completes or errors.
+No agent-accessible hard limit prevents the process from reading the file; the
+`0600` mode and per-run isolation reduce the attack surface compared to a shared
+home directory but are not a hard sandbox.
+
 ## Enforcement boundaries
 
 The table records observed host behavior and the earlier container spike, not
@@ -217,14 +271,16 @@ host profile and does not cause R-016 rejection; only contracts that enable
 
 | Boundary | Host profile | Kind | Container profile |
 | --- | --- | --- | --- |
-| Worktree per attempt | Separate `git worktree` folder; never shared with a replacement. | Before action | Fresh clone per container. not observed (no clone-from-remote step exists). |
+| Worktree per attempt | Separate `git worktree` folder; never shared with a replacement. | Before action | Fresh clone per container (declared from code — `materializeSource` in `trigger/src/lib/source.ts`; L2 evidence pending). |
 | Filesystem isolation from the host | None; the worker can read host files. | Advisory | Container filesystem. spike-observed (2026-09-08): cwd /app, no host paths visible. |
 | CPU, memory | None. | Advisory | Machine preset. not observed. |
 | Duration | Trigger `maxDuration` from the contract. | Before action | Same. not observed. |
 | Tool and command capability | OpenCode permission rules generated from the contract; `deny` survives `--auto`. | Before action | Same. not observed. |
 | Output paths | Adapter diff check against `paths.allow/deny`; violations quarantine the attempt. | On output | Same. not observed. |
-| Git pushes from the worker | Scrubbed child environment (no SSH agent, no tokens, empty credential helper) plus `deny` on `git push`/`git remote`. | Before action | No credential exists. spike-observed (2026-09-08): env = TRIGGER_*/OTEL_*/NODE_* only; SSH_AUTH_SOCK and GIT_* credential helper variables not present in the environment. |
-| Merge, deploy, publish | Only `integrate.merge`, after acceptance, serialized, compare-and-set. | Before action | Same, with operation-scoped token. not observed. |
+| Git pushes from the worker | Scrubbed child environment (no SSH agent, no tokens, empty credential helper) plus `deny` on `git push`/`git remote`. | Before action | No credential exists in container env (declared from code; L2 evidence pending). spike-observed (2026-09-08): env = TRIGGER_*/OTEL_*/NODE_* only; SSH_AUTH_SOCK and GIT_* credential helper variables not present in the environment. |
+| Merge, deploy, publish | Only `integrate.merge`, after acceptance, serialized, compare-and-set. | Before action | Same, with operation-scoped token from `integrate` lease (declared from code — `apps/coordinator/src/internal/leases.ts`; L2 evidence pending). |
+| Provider credential isolation | Shared host OpenCode HOME (declared, host profile). | Declared | Per-run isolated HOME (`0700`) with `auth.json` (`0600`) in `<runRoot>/runs/<runId>/home`; deleted on cleanup (declared from code — `trigger/src/lib/runtime.ts` + `runtime-home.ts`; L2 evidence pending). |
+| Artifact durability | Host `agencyhq/attempts/<id>` git ref; host stop.ndjson. | On output | Coordinator mirror + `attempt_artifacts` + `attempt_stop_evidence` tables (declared from code; L2 evidence pending). |
 | Termination | Generation revoked → `runs.cancel` → `onCancel` checkpoint commit and process-group kill → adapter confirms no survivors → Trigger final status. | Trusted observation | Target: trusted runtime confirmation of termination/isolation plus durable stop evidence before replacement. Not observed; the Trigger supervisor left the spike container after exit (`DOCKER_AUTOREMOVE_EXITED_CONTAINERS=0`). |
 | Egress and provider spend | None; spend is an estimate. | Advisory | Gateway with per-attempt keys (deferred; evidence requirement: ADR plus measured spend baseline). not observed. |
 | Nested agents | OpenCode `task` tool denied for worker agents. | Before action | Same. not observed. |
