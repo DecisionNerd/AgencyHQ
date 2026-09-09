@@ -85,7 +85,7 @@ COPY --from=deps /app/packages/verification/node_modules packages/verification/n
 COPY --from=deps /app/trigger/node_modules            trigger/node_modules
 
 # Copy workspace source (coordinator and its dependencies).
-COPY --chown=agencyhq:agencyhq package.json pnpm-workspace.yaml tsconfig.base.json ./
+COPY --chown=agencyhq:agencyhq package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json ./
 COPY --chown=agencyhq:agencyhq apps/coordinator/ apps/coordinator/
 COPY --chown=agencyhq:agencyhq packages/contracts/ packages/contracts/
 COPY --chown=agencyhq:agencyhq packages/db/ packages/db/
