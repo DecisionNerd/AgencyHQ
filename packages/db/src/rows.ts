@@ -434,6 +434,11 @@ export const LeaseRowSchema = z.object({
   run_id: z.string(),
   purpose: z.enum(["provider", "git-read", "integrate", "upload"]),
   nonce_hash: z.string(),
+  /**
+   * sha256(upload_token) for upload-purpose leases (migration 0011).
+   * null for non-upload leases or pre-migration rows.
+   */
+  token_hash: z.string().nullable(),
   issued_at: z.date(),
   expires_at: z.date(),
   used_at: z.date().nullable(),

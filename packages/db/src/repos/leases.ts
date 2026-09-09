@@ -17,6 +17,11 @@ export interface LeaseInsert {
   purpose: "provider" | "git-read" | "integrate" | "upload";
   /** SHA-256 hex hash of the raw nonce — the nonce value itself is not stored. */
   nonce_hash: string;
+  /**
+   * sha256(upload_token) for upload-purpose leases (migration 0011).
+   * Must be set when purpose === "upload"; null otherwise.
+   */
+  token_hash?: string | null;
   expires_at: Date;
 }
 
@@ -24,8 +29,8 @@ export interface LeaseInsert {
 export async function issueLease(client: pg.PoolClient, row: LeaseInsert): Promise<LeaseRow> {
   const { rows } = await client.query<LeaseRow>(
     `INSERT INTO leases
-       (id, attempt_id, generation, run_id, purpose, nonce_hash, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+       (id, attempt_id, generation, run_id, purpose, nonce_hash, token_hash, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING *`,
     [
       row.id,
@@ -34,11 +39,36 @@ export async function issueLease(client: pg.PoolClient, row: LeaseInsert): Promi
       row.run_id,
       row.purpose,
       row.nonce_hash,
+      row.token_hash ?? null,
       row.expires_at,
     ],
   );
   const first = rows[0];
   if (!first) throw new Error("issueLease: no row returned");
+  return LeaseRowSchema.parse(first);
+}
+
+/**
+ * Find an upload lease for an attempt by bearer token hash.
+ * Uses token_hash (sha256 of the upload token), not nonce_hash.
+ * Returns null if not found, revoked, or expired.
+ */
+export async function findUploadLeaseByTokenHash(
+  client: pg.PoolClient,
+  attemptId: string,
+  tokenHash: string,
+): Promise<LeaseRow | null> {
+  const { rows } = await client.query<LeaseRow>(
+    `SELECT * FROM leases
+     WHERE attempt_id = $1
+       AND purpose = 'upload'
+       AND token_hash = $2
+     ORDER BY issued_at DESC
+     LIMIT 1`,
+    [attemptId, tokenHash],
+  );
+  const first = rows[0];
+  if (!first) return null;
   return LeaseRowSchema.parse(first);
 }
 

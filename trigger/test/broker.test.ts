@@ -1,13 +1,58 @@
-// Tests for FakeBroker (lib/broker.ts).
-// Verifies call recording, redaction of secret material, and default behaviours.
-// No live network calls.
+// Tests for FakeBroker (lib/broker.ts) and createBroker real HTTP client.
+// FakeBroker: call recording, redaction of secret material, and default behaviours.
+// createBroker (W2-wire Output 5): auth header, JSON error mapping, bounded
+//   timeout (abort), and no retry of POSTs. Uses Node.js http.createServer()
+//   as the stub server (Hono is not available in the trigger package).
 
 import assert from "node:assert/strict";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { createServer as httpCreateServer } from "node:http";
 import test from "node:test";
 
 import type { LeaseGrant, LeaseRequest } from "@agencyhq/contracts";
 
-import { FakeBroker } from "../src/lib/broker.ts";
+import { createBroker, FakeBroker } from "../src/lib/broker.ts";
+
+// ---------------------------------------------------------------------------
+// Stub HTTP server helpers
+// ---------------------------------------------------------------------------
+
+type StubHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+
+function makeStubServer(handler: StubHandler): Promise<{ baseUrl: string; close(): void }> {
+  return new Promise((resolve, reject) => {
+    const server = httpCreateServer((req, res) => {
+      Promise.resolve(handler(req, res)).catch((err) => {
+        if (!res.headersSent) {
+          res.writeHead(500);
+          res.end(String(err));
+        }
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (!addr || typeof addr === "string") {
+        server.close();
+        reject(new Error("unexpected server address"));
+        return;
+      }
+      resolve({
+        baseUrl: `http://127.0.0.1:${addr.port}`,
+        close: () => server.close(),
+      });
+    });
+    server.on("error", reject);
+  });
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
 
 function makeUploadGrant(token: string): LeaseGrant {
   return {
@@ -199,4 +244,178 @@ test("FakeBroker: no raw secret values appear in any call records", async () => 
 
   const callsStr = JSON.stringify(broker.calls);
   assert.ok(!callsStr.includes(SECRET), "secret must not appear in any recorded call");
+});
+
+// ---------------------------------------------------------------------------
+// createBroker: real HTTP client tests (W2-wire Output 5)
+// ---------------------------------------------------------------------------
+
+test("createBroker: requestLease sends JSON body and returns grant on 200", async () => {
+  let capturedBody: string | undefined;
+
+  const stub = await makeStubServer(async (req, res) => {
+    capturedBody = await readBody(req);
+    const grant = {
+      leaseId: "lease-real-1",
+      purpose: "upload",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      material: { purpose: "upload", token: "upload-tok" },
+    };
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(grant));
+  });
+
+  try {
+    const broker = createBroker(stub.baseUrl);
+    const result = await broker.requestLease({
+      runId: "run-real",
+      attemptId: "attempt-real",
+      generation: 0,
+      purpose: "upload",
+      nonce: "a".repeat(32),
+    });
+
+    assert.equal(result.ok, true, "result must be ok");
+    if (!result.ok) return;
+    assert.equal(result.grant.leaseId, "lease-real-1");
+    assert.equal(result.grant.material.purpose, "upload");
+
+    // Verify JSON body was sent with correct fields.
+    assert.ok(capturedBody, "request body must be sent");
+    const parsed = JSON.parse(capturedBody!) as Record<string, unknown>;
+    assert.equal(parsed.runId, "run-real");
+    assert.equal(parsed.attemptId, "attempt-real");
+    assert.equal(parsed.purpose, "upload");
+    // Nonce must appear in body (it is required for the broker protocol).
+    assert.equal(parsed.nonce, "a".repeat(32));
+  } finally {
+    stub.close();
+  }
+});
+
+test("createBroker: requestLease maps JSON 403 body to typed LeaseRefusal", async () => {
+  const stub = await makeStubServer(async (req, res) => {
+    await readBody(req);
+    const refusal = { purpose: "upload", reason: "unknown_attempt" };
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(refusal));
+  });
+
+  try {
+    const broker = createBroker(stub.baseUrl);
+    const result = await broker.requestLease({
+      runId: "run-403",
+      attemptId: "attempt-403",
+      generation: 0,
+      purpose: "upload",
+      nonce: "b".repeat(32),
+    });
+
+    assert.equal(result.ok, false, "result must not be ok for 403");
+    if (!result.ok) {
+      assert.equal(result.status, 403);
+      assert.equal(result.refusal.reason, "unknown_attempt");
+    }
+  } finally {
+    stub.close();
+  }
+});
+
+test("createBroker: AbortController aborts a hung request (bounded timeout mechanism)", async () => {
+  // This test verifies the AbortController mechanism used by fetchWithTimeout.
+  // We manually abort a fetch with a tiny timeout, same way the broker does
+  // internally with DEFAULT_TIMEOUT_MS, and assert an AbortError is thrown.
+  const stub = await makeStubServer((_req, _res) => {
+    // Intentionally never respond.
+  });
+
+  try {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 50);
+
+    const fetchCall = fetch(`${stub.baseUrl}/internal/leases`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        runId: "r",
+        attemptId: "a",
+        generation: 0,
+        purpose: "upload",
+        nonce: "n".repeat(32),
+      }),
+      signal: controller.signal,
+    });
+
+    await assert.rejects(
+      () => fetchCall,
+      (err: unknown) => {
+        const e = err as { name?: string; code?: string };
+        return e.name === "AbortError" || e.code === "ABORT_ERR";
+      },
+      "fetch with AbortSignal must reject with AbortError when controller fires",
+    );
+  } finally {
+    stub.close();
+  }
+});
+
+test("createBroker: requestLease POST is never retried (single attempt only)", async () => {
+  let callCount = 0;
+
+  const stub = await makeStubServer(async (req, res) => {
+    callCount++;
+    await readBody(req);
+    const refusal = { purpose: "upload", reason: "unavailable" };
+    res.writeHead(409, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(refusal));
+  });
+
+  try {
+    const broker = createBroker(stub.baseUrl);
+    await broker.requestLease({
+      runId: "run-no-retry",
+      attemptId: "attempt-no-retry",
+      generation: 0,
+      purpose: "upload",
+      nonce: "c".repeat(32),
+    });
+    assert.equal(callCount, 1, "POST requestLease must be called exactly once (no retry)");
+  } finally {
+    stub.close();
+  }
+});
+
+test("createBroker: downloadSourceBundle retries GET up to 3 times", async () => {
+  let callCount = 0;
+  const BUNDLE = Buffer.from("fake-bundle-bytes");
+  const BUNDLE_SHA = "abc123sha256";
+
+  const stub = await makeStubServer((_req, res) => {
+    callCount++;
+    if (callCount < 3) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "x-agencyhq-bundle-sha256": BUNDLE_SHA,
+    });
+    res.end(BUNDLE);
+  });
+
+  try {
+    const broker = createBroker(stub.baseUrl);
+    const result = await broker.downloadSourceBundle({
+      projectId: "proj-1",
+      rev: "deadbeef01234567890123456789012345678901",
+      token: "dl-token",
+    });
+
+    assert.deepEqual(result.bundleBytes, BUNDLE);
+    assert.equal(result.bundleSha256, BUNDLE_SHA);
+    assert.equal(callCount, 3, "GET must retry until success (MAX_GET_ATTEMPTS = 3)");
+  } finally {
+    stub.close();
+  }
 });

@@ -131,9 +131,30 @@ async function runReviewV2(
     (() => {
       throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
     })();
-  // Upload token used for source bundle download (read-only access).
-  const uploadToken = process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
+  // D1 / W-6: get the nonce from the payload to request an upload lease for source download.
+  // Fall back to env var for compatibility during transition.
+  const nonce = payload.leaseNonce ?? process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
 
+  // If nonce is available, request an upload lease; otherwise fall back to empty token.
+  let uploadToken = "";
+  if (nonce && payload.leaseNonce) {
+    const runId =
+      process.env.TRIGGER_RUN_ID ?? process.env.AGENCYHQ_RUN_ID ?? `review-${payload.attemptId}`;
+    const leaseResult = await createBroker(coordinatorUrl).requestLease({
+      runId,
+      attemptId: payload.attemptId,
+      generation: payload.generation,
+      purpose: "upload",
+      nonce: payload.leaseNonce,
+    });
+    if (leaseResult.ok && leaseResult.grant.material.purpose === "upload") {
+      uploadToken = leaseResult.grant.material.token;
+    }
+  } else {
+    uploadToken = process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
+  }
+
+  // Reuse the broker created above (or create a new one if nonce path was not taken).
   const broker = createBroker(coordinatorUrl);
   // Temp parent: holds the cloned src subdir and the review runDir subdir.
   const tempParent = join(runRoot, "runs", `review-${payload.attemptId}-${payload.generation}`);

@@ -20,22 +20,44 @@ import type { StopEvidenceUpload } from "@agencyhq/contracts";
 import type { Broker } from "./broker.ts";
 
 // ---------------------------------------------------------------------------
-// Known stop step names (from StopEvidenceUploadSchema)
+// Known stop step names (D6 / W-8: extended to include all worker-written names)
 // ---------------------------------------------------------------------------
 
 const KNOWN_STEPS = new Set([
+  // canonical upload names
   "signal_sent",
   "process_exited",
   "survivor_scan",
   "checkpoint_committed",
   "upload_done",
   "aborted",
+  // additional worker-written names (worker-attempt-core.ts / worker-attempt.ts)
+  "abort_signal",
+  "soft_deadline",
+  "on_cancel_entered",
+  "stop_start",
+  "killed",
+  "checkpoint",
+  "checkpoint_failed",
+  "stop_done",
 ]);
+
+/**
+ * Translate worker-side step names to canonical upload names (D6).
+ *
+ * Some worker-written step names differ from the canonical names accepted by
+ * the evidence upload schema. This map translates them; unmapped names pass
+ * through unchanged.
+ */
+const STEP_TRANSLATIONS: Record<string, string> = {
+  checkpoint: "checkpoint_committed",
+};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+// All step names from StopEvidenceUploadSchema (extended per D6 / W-8).
 type StopStep = {
   at: string;
   step:
@@ -44,7 +66,15 @@ type StopStep = {
     | "survivor_scan"
     | "checkpoint_committed"
     | "upload_done"
-    | "aborted";
+    | "aborted"
+    | "abort_signal"
+    | "soft_deadline"
+    | "on_cancel_entered"
+    | "stop_start"
+    | "killed"
+    | "checkpoint"
+    | "checkpoint_failed"
+    | "stop_done";
   detail?: string;
 };
 
@@ -95,7 +125,9 @@ export async function collectStopEvidence(runDir: string): Promise<CollectStopEv
       continue;
     }
 
-    const step = stepName as StopStep["step"];
+    // Apply translation (D6): e.g. "checkpoint" → "checkpoint_committed"
+    const translatedStep = STEP_TRANSLATIONS[stepName] ?? stepName;
+    const step = translatedStep as StopStep["step"];
     const rawDetail = typeof obj.detail === "string" ? obj.detail : undefined;
     // detail must be ≤ 2000 chars and contain no newlines.
     const detail =

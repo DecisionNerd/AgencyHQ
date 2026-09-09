@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import type { ArtifactRef, ArtifactUploadMeta } from "@agencyhq/contracts";
+import { bundleRefFor } from "@agencyhq/contracts";
 
 import type { Broker } from "./broker.ts";
 
@@ -112,16 +113,16 @@ export async function exportAttemptBundle(args: {
     `agencyhq-artifact-${Date.now()}-${Math.random().toString(36).slice(2)}.bundle`,
   );
 
-  // Create a temporary ref pointing at commitId so git-bundle accepts the SHA
-  // as a positive inclusion. Bare SHAs cause "Refusing to create empty bundle"
-  // (known git limitation; parallel fix in coordinator's exportBundle).
-  const tempRef = `refs/agencyhq/tmp/artifact-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  // Use the canonical bundle ref name (D5 / W-7). Both the worker and coordinator
+  // must agree on this ref name so that `git fetch <bundle> <ref>:target` resolves.
+  // bundleRefFor(sha) → refs/agencyhq/export/<sha>
+  const exportRef = bundleRefFor(args.commitId);
 
   try {
-    await git(["update-ref", tempRef, args.commitId], args.repoPath);
+    await git(["update-ref", exportRef, args.commitId], args.repoPath);
 
     // Thin bundle: exclude objects reachable from baseRevision.
-    await git(["bundle", "create", bundlePath, `^${args.baseRevision}`, tempRef], args.repoPath);
+    await git(["bundle", "create", bundlePath, `^${args.baseRevision}`, exportRef], args.repoPath);
 
     const s = await stat(bundlePath);
     const bundleBytes = s.size;
@@ -133,7 +134,7 @@ export async function exportAttemptBundle(args: {
     throw err;
   } finally {
     // Always delete the temporary ref, even on error.
-    await git(["update-ref", "-d", tempRef], args.repoPath).catch(() => undefined);
+    await git(["update-ref", "-d", exportRef], args.repoPath).catch(() => undefined);
   }
 }
 

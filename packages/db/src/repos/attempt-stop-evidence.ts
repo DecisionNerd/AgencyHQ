@@ -11,13 +11,22 @@ import { AttemptStopEvidenceRowSchema } from "../rows.ts";
 
 export interface StopEvidenceStep {
   at: string;
+  // D6 / W-8: extended vocabulary matching all worker-written step names.
   step:
     | "signal_sent"
     | "process_exited"
     | "survivor_scan"
     | "checkpoint_committed"
     | "upload_done"
-    | "aborted";
+    | "aborted"
+    | "abort_signal"
+    | "soft_deadline"
+    | "on_cancel_entered"
+    | "stop_start"
+    | "killed"
+    | "checkpoint"
+    | "checkpoint_failed"
+    | "stop_done";
   detail?: string;
 }
 

@@ -155,6 +155,8 @@ export async function prepareRuntime(args: PrepareRuntimeArgs): Promise<PrepareR
     } else {
       failureKind = "provider_unavailable";
     }
+    // W-13: clean up the home dir that resolveRunHome already created.
+    await rm(home, { recursive: true, force: true }).catch(() => undefined);
     return {
       ok: false,
       failureKind,

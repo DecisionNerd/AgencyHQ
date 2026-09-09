@@ -20,6 +20,8 @@
  * Both operations are idempotent (commandId-deduplicated via claimCommand).
  */
 
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
 import {
   claimCommand,
   completeCommand,
@@ -28,8 +30,10 @@ import {
   getProjectCredential,
   setProjectSourceMode,
 } from "@agencyhq/db";
-import { ensureMirror } from "../git/mirror.ts";
+import { ensureMirror, mirrorPath as getMirrorPath } from "../git/mirror.ts";
 import type { CommandDeps } from "./stop.ts";
+
+const execFileAsync = promisify(execFileCb);
 
 // ---------------------------------------------------------------------------
 // ImportDeps — extends CommandDeps with git mirror configuration
@@ -135,8 +139,32 @@ export async function importHostProject(
       return result;
     }
 
-    // Silence unused variable warning - mirrorRef is used for side effect (mirror created)
     void mirrorRef;
+
+    // 3. Re-read allowed_refs from the mirror (W-15).
+    // List all refs/heads/* in the bare mirror; store short names (e.g. "main").
+    const mp = getMirrorPath(deps.gitRoot, projectId);
+    let allowedRefs: string[] | null = null;
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["for-each-ref", "refs/heads/", "--format=%(refname:short)"],
+        { cwd: mp },
+      );
+      const refs = stdout
+        .split("\n")
+        .map((r) => r.trim())
+        .filter(Boolean);
+      if (refs.length > 0) allowedRefs = refs;
+    } catch {
+      // Best-effort: proceed without updating allowed_refs if git fails.
+    }
+    if (allowedRefs) {
+      await client.query(
+        "UPDATE projects SET allowed_refs = $1::jsonb, updated_at = now() WHERE id = $2",
+        [JSON.stringify(allowedRefs), projectId],
+      );
+    }
 
     // 5. Set source_mode = 'mirror'
     await setProjectSourceMode(client, projectId, "mirror");

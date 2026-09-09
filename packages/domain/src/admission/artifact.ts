@@ -119,7 +119,10 @@ export function validateArtifactAdmission(
   if (claimed.bundleBytes > limits.maxBundleBytes) return err("BUNDLE_TOO_LARGE");
 
   // 10. Changed paths must be safe
-  const pathResult = validateChangedPaths(claimed.changedPaths);
+  // Checkpoints may have zero changed paths (D3: a zero-change checkpoint is valid).
+  const pathResult = validateChangedPaths(claimed.changedPaths, {
+    allowEmpty: claimed.kind === "checkpoint",
+  });
   if (!pathResult.ok) return err("PATH_UNSAFE");
 
   // 11. Commit must be present in the mirror

@@ -30,10 +30,16 @@ export type PathUnsafeCode = "PATH_UNSAFE";
  * - ends with / (looks like a directory)
  * - has .git/ as a prefix (guard the git directory itself)
  *
- * The entire list is also rejected if it is empty (no changed paths).
+ * The entire list is rejected if it is empty — UNLESS `allowEmpty` is true.
+ * Pass `allowEmpty: true` for checkpoint artifacts (D3: a zero-change checkpoint
+ * is valid; the empty-diff digest is the sha256 of the empty string).
  */
-export function validateChangedPaths(paths: readonly string[]): Result<true, PathUnsafeCode> {
+export function validateChangedPaths(
+  paths: readonly string[],
+  opts?: { allowEmpty?: boolean },
+): Result<true, PathUnsafeCode> {
   if (paths.length === 0) {
+    if (opts?.allowEmpty) return ok(true as const);
     return err("PATH_UNSAFE");
   }
 

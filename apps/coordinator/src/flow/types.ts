@@ -5,6 +5,7 @@
 import type { RuntimeProfile } from "@agencyhq/contracts";
 import type { createPool } from "@agencyhq/db";
 import type { Clock, ExecutionRuntime, IdGen } from "@agencyhq/domain";
+import type { ProviderStatus } from "../provider/state.ts";
 
 // ---------------------------------------------------------------------------
 // ProfileResolver
@@ -104,4 +105,10 @@ export interface FlowDeps {
    * Defaults to the real git fetch + merge-base --is-ancestor implementation.
    */
   isAncestor?: IsAncestorFn | undefined;
+  /**
+   * D9 / W-11: reads the current provider auth status for the dispatch gate.
+   * Called on each schedule pass for the container runtime profile.
+   * Absent (or returning undefined) disables the provider gate.
+   */
+  providerState?: (() => ProviderStatus | undefined) | undefined;
 }

@@ -103,6 +103,8 @@ const flowDeps: FlowDeps = {
     ...(config.integrateRetries !== undefined ? { integrateRetries: config.integrateRetries } : {}),
   },
   profileResolver,
+  // D9 / W-11: provider state for dispatch gate — only for container runtime profile.
+  ...(config.runtimeProfile === "container" ? { providerState: readCurrentProviderState } : {}),
 };
 
 // Construct flow and reconciler

@@ -5,10 +5,11 @@
  * worker containers running in the portable execution model (source_mode = 'mirror').
  *
  * Routes:
- *   GET  /internal/source/:projectId?rev=<sha>     — bundle download
- *   POST /internal/attempts/:id/artifacts           — artifact upload (kind: attempt)
- *   POST /internal/attempts/:id/checkpoints         — artifact upload (kind: checkpoint)
- *   POST /internal/attempts/:id/stop-evidence       — stop-sequence evidence
+ *   GET  /internal/source/:projectId?rev=<sha>                    — bundle download
+ *   GET  /internal/attempts/:id/artifacts/:generation/bundle      — artifact bundle (D7)
+ *   POST /internal/attempts/:id/artifacts                         — artifact upload (kind: attempt)
+ *   POST /internal/attempts/:id/checkpoints                       — artifact upload (kind: checkpoint)
+ *   POST /internal/attempts/:id/stop-evidence                     — stop-sequence evidence
  *
  * SECURITY INVARIANTS:
  *  - Secret values (bearer tokens) never appear in logs or error bodies.
@@ -20,12 +21,13 @@
  *  - All rejections: no DB state change.
  */
 
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { stat, unlink } from "node:fs/promises";
-
+import { readFile, unlink } from "node:fs/promises";
+import { promisify } from "node:util";
 import { ArtifactUploadMetaSchema, StopEvidenceUploadSchema } from "@agencyhq/contracts";
 import {
+  findUploadLeaseByTokenHash,
   getAttempt,
   getProject,
   getStepContract,
@@ -34,9 +36,10 @@ import {
 } from "@agencyhq/db";
 import { validateArtifactAdmission, validateStopEvidenceAdmission } from "@agencyhq/domain";
 import type { Context, Hono } from "hono";
-
 import { exportBundle, importBundle } from "../git/bundle.ts";
-import { diffDigest, hasCommit, mirrorPath } from "../git/mirror.ts";
+import { diffDigest, mirrorPath } from "../git/mirror.ts";
+
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,11 +69,22 @@ export interface ArtifactRouteDeps {
 // ---------------------------------------------------------------------------
 
 /**
- * Compute SHA-256 hex of a string (for bearer token → nonce_hash lookup).
+ * Compute SHA-256 hex of a string (for bearer token → token_hash lookup).
  * SECURITY: Only used for lookup; the value itself is never logged.
  */
 function sha256Hex(s: string): string {
   return createHash("sha256").update(s, "utf-8").digest("hex");
+}
+
+/**
+ * Delete a git ref from the mirror (best-effort). Used to clean up fetched
+ * refs on post-import validation failure (D3: no state advance on failure).
+ */
+async function deleteRef(mirrorPath: string, ref: string): Promise<void> {
+  await execFileAsync("git", ["update-ref", "-d", ref], {
+    cwd: mirrorPath,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  });
 }
 
 interface LeaseRow {
@@ -83,31 +97,26 @@ interface LeaseRow {
 }
 
 /**
- * Find an upload lease for the given attempt whose nonce_hash matches the
- * sha256 of the bearer token. Returns the first matching row or null.
+ * Find an upload lease for the given attempt whose token_hash matches the
+ * sha256 of the bearer token (W-3: upload leases use token_hash, not nonce_hash).
+ * Returns the first matching row or null.
  */
 async function findUploadLease(
   client: PgPoolClient,
   attemptId: string,
   bearerToken: string,
 ): Promise<LeaseRow | null> {
-  const nonceHash = sha256Hex(bearerToken);
-  const result = await client.query(
-    `SELECT id, attempt_id, generation, purpose, expires_at, revoked_at
-       FROM leases
-      WHERE attempt_id = $1
-        AND purpose = 'upload'
-        AND nonce_hash = $2
-      ORDER BY issued_at DESC
-      LIMIT 1`,
-    [attemptId, nonceHash],
+  const tokenHash = sha256Hex(bearerToken);
+  return findUploadLeaseByTokenHash(
+    client as unknown as import("pg").PoolClient,
+    attemptId,
+    tokenHash,
   );
-  const first = (result.rows as LeaseRow[])[0];
-  return first ?? null;
 }
 
 /**
- * Find a git-read or upload lease for a given project (via attempt).
+ * Find a valid upload lease for a given project (via attempt) by token_hash.
+ * Upload leases use token_hash; the bearer token is sha256'd to look up the lease.
  * Used for source download authorization.
  */
 async function findSourceLease(
@@ -115,19 +124,19 @@ async function findSourceLease(
   projectId: string,
   bearerToken: string,
 ): Promise<boolean> {
-  const nonceHash = sha256Hex(bearerToken);
+  const tokenHash = sha256Hex(bearerToken);
   const result = await client.query(
     `SELECT l.id
        FROM leases l
        JOIN attempts a ON a.id = l.attempt_id
        JOIN step_contracts sc ON sc.id = a.contract_id
-      WHERE l.nonce_hash = $1
-        AND l.purpose IN ('git-read', 'upload')
+      WHERE l.token_hash = $1
+        AND l.purpose = 'upload'
         AND l.revoked_at IS NULL
         AND l.expires_at > now()
         AND sc.project_id = $2
       LIMIT 1`,
-    [nonceHash, projectId],
+    [tokenHash, projectId],
   );
   return result.rows.length > 0;
 }
@@ -200,23 +209,19 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
     try {
       const result = await exportBundle(mirror, rev, undefined, maxBundleBytes);
       bundlePath = result.bundlePath;
-      const s = await stat(bundlePath);
-      const rs = createReadStream(bundlePath);
+      // Read into memory so we can delete the temp file before the response is returned.
+      // The caller cannot stream the file safely: the finally block runs when the Response
+      // is constructed (not when the body is consumed), so the file would be unlinked while
+      // still being read. Bundles are already size-limited by maxBundleBytes.
+      const fileBuffer = await readFile(bundlePath);
+      await unlink(bundlePath).catch(() => undefined);
+      bundlePath = undefined; // prevent double-delete in finally
 
-      const stream = new ReadableStream({
-        start(controller) {
-          rs.on("data", (chunk: unknown) => {
-            if (Buffer.isBuffer(chunk)) controller.enqueue(chunk);
-          });
-          rs.on("end", () => controller.close());
-          rs.on("error", (err: Error) => controller.error(err));
-        },
-      });
-      return new Response(stream, {
+      return new Response(fileBuffer, {
         status: 200,
         headers: {
           "Content-Type": "application/x-git-bundle",
-          "Content-Length": String(s.size),
+          "Content-Length": String(fileBuffer.length),
           "X-AgencyHQ-Bundle-Sha256": result.bundleSha256,
         },
       });
@@ -228,6 +233,100 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
       console.error("source bundle export failed:", (err as Error).message);
       return c.json({ error: "Failed to export source bundle" }, 500);
     } finally {
+      if (bundlePath) {
+        await unlink(bundlePath).catch(() => undefined);
+      }
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // GET /internal/attempts/:id/artifacts/:generation/bundle — D7
+  // Serves the verified artifact bundle for (attemptId, generation).
+  // Authenticated with an upload-purpose lease (same as upload routes).
+  // --------------------------------------------------------------------------
+
+  app.get("/internal/attempts/:id/artifacts/:generation/bundle", async (c: Context) => {
+    const attemptId = c.req.param("id");
+    const generationStr = c.req.param("generation");
+
+    if (!attemptId || !generationStr) {
+      return c.json({ error: "attemptId and generation required" }, 400);
+    }
+
+    const generation = parseInt(generationStr, 10);
+    if (!Number.isInteger(generation) || generation < 1) {
+      return c.json({ error: "generation must be a positive integer" }, 400);
+    }
+
+    const authHeader = c.req.header("authorization");
+    const token = parseBearerToken(authHeader);
+    if (!token) {
+      return c.json({ error: "Authorization: Bearer <token> required" }, 401);
+    }
+
+    const client = await pool.connect();
+    let bundlePath: string | undefined;
+    try {
+      // Authenticate: upload-purpose lease for this attempt.
+      const leaseRow = await findUploadLease(client, attemptId, token);
+      if (!leaseRow) {
+        return c.json({ error: "Forbidden: no valid upload lease for this attempt" }, 403);
+      }
+
+      // Look up the verified artifact for this (attemptId, generation).
+      const { rows: artRows } = await client.query(
+        `SELECT aa.commit_id, c.project_id
+           FROM attempt_artifacts aa
+           JOIN attempts a ON a.id = aa.attempt_id
+           JOIN step_contracts c ON c.id = a.contract_id
+          WHERE aa.attempt_id = $1
+            AND aa.generation = $2
+            AND aa.verified = true
+            AND aa.kind = 'attempt'
+          ORDER BY aa.received_at DESC
+          LIMIT 1`,
+        [attemptId, generation],
+      );
+      const artRow = artRows[0] as { commit_id?: string; project_id?: string | null } | undefined;
+      if (!artRow) {
+        return c.json({ error: "No verified artifact for this attempt/generation" }, 404);
+      }
+
+      const commitId = typeof artRow.commit_id === "string" ? artRow.commit_id : undefined;
+      const projectId = typeof artRow.project_id === "string" ? artRow.project_id : undefined;
+      if (!projectId || !commitId) {
+        return c.json({ error: "Artifact missing project or commit" }, 500);
+      }
+
+      const mp = mirrorPath(gitRoot, projectId);
+      const mirror = { mirrorPath: mp, remote: "" };
+
+      const result = await exportBundle(mirror, commitId, undefined, maxBundleBytes);
+      bundlePath = result.bundlePath;
+      // Read into memory before returning: the finally block runs when the Response
+      // is constructed, which would unlink the temp file before the body is consumed.
+      const fileBuffer = await readFile(bundlePath);
+      await unlink(bundlePath).catch(() => undefined);
+      bundlePath = undefined; // prevent double-delete in finally
+
+      return new Response(fileBuffer, {
+        status: 200,
+        headers: {
+          "content-type": "application/x-git-bundle",
+          "content-length": String(fileBuffer.length),
+          "cache-control": "no-store",
+          "x-commit-id": commitId,
+        },
+      });
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "BUNDLE_TOO_LARGE") {
+        return c.json({ error: "artifact bundle exceeds size limit" }, 413);
+      }
+      console.error("artifact bundle export failed:", (err as Error).message);
+      return c.json({ error: "Failed to export artifact bundle" }, 500);
+    } finally {
+      client.release();
       if (bundlePath) {
         await unlink(bundlePath).catch(() => undefined);
       }
@@ -297,16 +396,16 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
 
     const client = await pool.connect();
     try {
-      // Look up the upload lease (by nonce_hash match on the claimed attemptId)
+      // 1. Look up the upload lease by token_hash (W-3)
       const leaseRow = await findUploadLease(client, claimed.attemptId, token);
 
-      // Look up the attempt
+      // 2. Look up the attempt
       const attemptRow = await getAttempt(client as unknown as import("pg").PoolClient, attemptId);
       if (!attemptRow) {
         return c.json({ error: "attempt not found" }, 404);
       }
 
-      // Look up step_contract to find project_id
+      // 3. Look up step_contract to find project_id
       const contract = await getStepContract(
         client as unknown as import("pg").PoolClient,
         attemptRow.contract_id,
@@ -316,31 +415,19 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
       }
       const projectId = contract.project_id;
 
-      // Look up project
+      // 4. Look up project
       const project = await getProject(client as unknown as import("pg").PoolClient, projectId);
       if (!project) {
         return c.json({ error: "project not found" }, 500);
       }
 
       const now = clock();
-
-      // Set up mirror ref
       const mp = mirrorPath(gitRoot, projectId);
       const mirrorRef = { mirrorPath: mp, remote: project.remote ?? "" };
 
-      // Check if commit is in mirror
-      const commitInMirror = await hasCommit(mirrorRef, claimed.commitId);
-      let recomputedDiffDigest: string | null = null;
-      if (commitInMirror) {
-        recomputedDiffDigest = await diffDigest(
-          mirrorRef,
-          contract.base_revision,
-          claimed.commitId,
-        );
-      }
-
-      // Validate via domain admission
-      const admissionResult = validateArtifactAdmission({
+      // 5. Pre-import admission validation (D3 order: lease → generation → project → bundle size → paths).
+      // hasCommit is false at this stage; the commit enters the mirror via importBundle below.
+      const preAdmission = validateArtifactAdmission({
         claimed,
         lease: leaseRow
           ? {
@@ -359,48 +446,39 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
         },
         now,
         mirror: {
-          hasCommit: () => commitInMirror,
-          recomputedDiffDigest,
+          // Before import, treat commit as absent; the mirror check is deferred to post-import.
+          hasCommit: () => false,
+          recomputedDiffDigest: null,
         },
         limits: { maxBundleBytes },
       });
 
-      if (!admissionResult.ok) {
-        const code = admissionResult.error;
-        if (code === "STALE_GENERATION") {
-          return c.json({ error: code }, 409);
+      if (!preAdmission.ok) {
+        const code = preAdmission.error;
+        // COMMIT_NOT_IN_MIRROR and DIGEST_MISMATCH are expected pre-import and handled below.
+        if (code !== "COMMIT_NOT_IN_MIRROR" && code !== "DIGEST_MISMATCH") {
+          if (code === "STALE_GENERATION") return c.json({ error: code }, 409);
+          if (
+            code === "LEASE_MISSING" ||
+            code === "LEASE_REVOKED" ||
+            code === "LEASE_EXPIRED" ||
+            code === "LEASE_PURPOSE_MISMATCH"
+          )
+            return c.json({ error: code }, 401);
+          if (code === "ATTEMPT_MISMATCH") return c.json({ error: code }, 403);
+          if (code === "BUNDLE_TOO_LARGE") return c.json({ error: code }, 413);
+          if (code === "PATH_UNSAFE") return c.json({ error: code }, 422);
+          return c.json({ error: code }, 400);
         }
-        if (
-          code === "LEASE_MISSING" ||
-          code === "LEASE_REVOKED" ||
-          code === "LEASE_EXPIRED" ||
-          code === "LEASE_PURPOSE_MISMATCH"
-        ) {
-          return c.json({ error: code }, 401);
-        }
-        if (code === "ATTEMPT_MISMATCH") {
-          return c.json({ error: code }, 403);
-        }
-        if (code === "BUNDLE_TOO_LARGE") {
-          return c.json({ error: code }, 413);
-        }
-        if (code === "PATH_UNSAFE") {
-          return c.json({ error: code }, 422);
-        }
-        if (code === "COMMIT_NOT_IN_MIRROR" || code === "DIGEST_MISMATCH") {
-          return c.json({ error: code }, 422);
-        }
-        return c.json({ error: code }, 400);
       }
 
-      // Read body as buffer for bundle import
+      // 6. Read body as buffer
       const bodyBuffer = Buffer.from(await c.req.arrayBuffer());
-
       if (bodyBuffer.length > maxBundleBytes) {
         return c.json({ error: "BUNDLE_TOO_LARGE" }, 413);
       }
 
-      // Import bundle into the mirror
+      // 7. Import bundle into the mirror (D3 order: git bundle verify → fetch → rev-parse).
       let importResult: Awaited<ReturnType<typeof importBundle>>;
       try {
         importResult = await importBundle(mirrorRef, bodyBuffer, {
@@ -411,28 +489,45 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
         });
       } catch (err) {
         const code = (err as { code?: string }).code;
-        if (code === "BUNDLE_TOO_LARGE") {
-          return c.json({ error: "BUNDLE_TOO_LARGE" }, 413);
-        }
+        if (code === "BUNDLE_TOO_LARGE") return c.json({ error: "BUNDLE_TOO_LARGE" }, 413);
         if (code === "BUNDLE_PREREQ_MISSING" || code === "BUNDLE_SHA_MISMATCH") {
           return c.json({ error: "BUNDLE_TAMPERED" }, 422);
         }
-        if (code === "BUNDLE_FETCH_FAILED") {
-          return c.json({ error: "BUNDLE_FETCH_FAILED" }, 422);
-        }
+        if (code === "BUNDLE_FETCH_FAILED") return c.json({ error: "BUNDLE_FETCH_FAILED" }, 422);
         console.error("bundle import failed:", (err as Error).message);
         return c.json({ error: "bundle import failed" }, 500);
       }
 
-      // Recompute diff digest post-import (now the commit is in the mirror)
+      // Idempotency check: if we get a duplicate row, return 200
+      // (duplicate detection is based on unique constraint, checked before any DB write)
+      const { rows: existingRows } = await (client as unknown as import("pg").PoolClient).query<{
+        id: string;
+      }>(
+        `SELECT id FROM attempt_artifacts WHERE attempt_id = $1 AND generation = $2 AND kind = $3 AND commit_id = $4`,
+        [claimed.attemptId, claimed.generation, kind, claimed.commitId],
+      );
+      if (existingRows[0]) {
+        return c.json({ status: "duplicate" }, 200);
+      }
+
+      // 8. Post-import: recompute diff digest (commit is now in the mirror).
       const finalDiffDigest = await diffDigest(mirrorRef, contract.base_revision, claimed.commitId);
 
-      // verified = bundle sha matches AND diff digest matches
-      const verified =
-        importResult.bundleSha256 === claimed.bundleSha256 &&
-        finalDiffDigest === claimed.diffDigest;
+      // 9. Post-import admission: verify digest matches and bundle sha matches.
+      if (importResult.bundleSha256 !== claimed.bundleSha256) {
+        // Delete the fetched ref on failure (D3: no state advance on failure)
+        const targetRef = `refs/agencyhq/attempts/${claimed.attemptId}/g${claimed.generation}`;
+        await deleteRef(mirrorRef.mirrorPath, targetRef).catch(() => undefined);
+        return c.json({ error: "BUNDLE_TAMPERED" }, 422);
+      }
 
-      // Insert artifact row (idempotent: ON CONFLICT DO NOTHING)
+      if (finalDiffDigest !== claimed.diffDigest) {
+        const targetRef = `refs/agencyhq/attempts/${claimed.attemptId}/g${claimed.generation}`;
+        await deleteRef(mirrorRef.mirrorPath, targetRef).catch(() => undefined);
+        return c.json({ error: "DIGEST_MISMATCH" }, 422);
+      }
+
+      // 10. Insert artifact row as verified=true (D3: only fully verified rows).
       const insertResult = await insertAttemptArtifact(
         client as unknown as import("pg").PoolClient,
         {
@@ -446,6 +541,7 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
           quarantine_patch: claimed.quarantinePatch ?? null,
           bundle_sha256: importResult.bundleSha256,
           bundle_bytes: importResult.bundleBytes,
+          verified: true,
         },
       );
 
@@ -453,18 +549,11 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
         return c.json({ status: "duplicate" }, 200);
       }
 
-      // Mark as verified if all checks passed
-      if (verified) {
-        await client.query(`UPDATE attempt_artifacts SET verified = true WHERE id = $1`, [
-          insertResult.row.id,
-        ]);
-      }
-
       return c.json(
         {
           status: "accepted",
           artifactId: insertResult.row.id,
-          verified,
+          verified: true,
           diffDigest: finalDiffDigest,
         },
         201,

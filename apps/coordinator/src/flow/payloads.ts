@@ -166,10 +166,9 @@ export function workerAttemptPayload(
       bundlePath,
     };
     const bounds = contract.bounds;
-    // v2 workers do not use a worktree path for permission rules; use a placeholder
-    const permissionRules = permissionRulesFor(bounds, {
-      worktreePath: `/tmp/worker/${attempt.id}`,
-    });
+    // W-14: v2 workers materialise source from a bundle; no host worktree path.
+    // Pass empty string so permissionRulesFor emits only relative glob rules.
+    const permissionRules = permissionRulesFor(bounds, { worktreePath: "" });
     const payload = {
       payloadVersion: 2 as const,
       attemptId: attempt.id,
@@ -264,9 +263,9 @@ export function workerAttemptPayloadV2(
     model: opts.workerModel,
   });
   if (opts.leaseNonce !== undefined) {
-    return { ...base, leaseNonce: opts.leaseNonce };
+    return { ...base, leaseNonce: opts.leaseNonce } as WorkerAttemptPayloadV2WithNonce;
   }
-  return base;
+  return base as WorkerAttemptPayloadV2WithNonce;
 }
 
 // ---------------------------------------------------------------------------

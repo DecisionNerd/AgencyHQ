@@ -113,8 +113,21 @@ export const verifyRun = task({
       const broker = createBroker(coordinatorUrl);
       const cloneDir = join(runRoot, "runs", `verify-${payload.attemptId}`, "src");
 
-      // Use the upload token from the env (coordinator supplies it for verify tasks).
-      const uploadToken = process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
+      // D1 / W-6: get upload token from payload nonce (request a lease) or fall back to env.
+      let uploadToken = process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
+      if (payload.leaseNonce) {
+        const runId = process.env.TRIGGER_RUN_ID ?? `verify-${payload.attemptId}`;
+        const leaseResult = await broker.requestLease({
+          runId,
+          attemptId: payload.attemptId,
+          generation: payload.generation,
+          purpose: "upload",
+          nonce: payload.leaseNonce,
+        });
+        if (leaseResult.ok && leaseResult.grant.material.purpose === "upload") {
+          uploadToken = leaseResult.grant.material.token;
+        }
+      }
 
       const sourceResult = await materializeSource({
         source: { ...payload.source, revision: payload.attemptRevision },

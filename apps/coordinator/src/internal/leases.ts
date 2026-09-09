@@ -151,20 +151,22 @@ export async function issueLeaseBroker(
       return { ok: false, status: 403, refusal };
     }
 
-    // Check generation not stale
-    if (generation < attempt.generation) {
+    // Check generation equality (W-12 / D2): equal only; past and future both stale.
+    if (generation !== attempt.generation) {
       const refusal: LeaseRefusal = { purpose, reason: "stale_generation" };
       return { ok: false, status: 409, refusal };
     }
 
-    // 2. Verify nonce: sha256(nonce) must match stored dispatch_nonce_hash
-    if (intent.dispatch_nonce_hash !== null) {
-      if (!verifyNonce(nonce, intent.dispatch_nonce_hash)) {
-        const refusal: LeaseRefusal = { purpose, reason: "unknown_run" };
-        return { ok: false, status: 403, refusal };
-      }
+    // 2. Verify nonce: sha256(nonce) must match stored dispatch_nonce_hash.
+    // A null hash is refused as unknown_run (W-1: no null bypass).
+    if (intent.dispatch_nonce_hash === null) {
+      const refusal: LeaseRefusal = { purpose, reason: "unknown_run" };
+      return { ok: false, status: 403, refusal };
     }
-    // If dispatch_nonce_hash is null (pre-migration intents), allow for compatibility
+    if (!verifyNonce(nonce, intent.dispatch_nonce_hash)) {
+      const refusal: LeaseRefusal = { purpose, reason: "unknown_run" };
+      return { ok: false, status: 403, refusal };
+    }
 
     // Check idempotency: return existing lease for same (attempt, generation, purpose, nonce_hash)
     const existingLeases = await findLeasesByAttemptGeneration(client, attemptId, generation);
@@ -181,6 +183,16 @@ export async function issueLeaseBroker(
         const refusal: LeaseRefusal = { purpose, reason: "expired" };
         return { ok: false, status: 409, refusal };
       }
+      // For upload leases, mint a new token and update token_hash (W-3: idempotent re-issue).
+      let reissueUploadToken: string | undefined;
+      if (purpose === "upload") {
+        reissueUploadToken = randomHex(32);
+        const reissueTokenHash = sha256hex(reissueUploadToken);
+        await client.query(`UPDATE leases SET token_hash = $1 WHERE id = $2`, [
+          reissueTokenHash,
+          existingLease.id,
+        ]);
+      }
       // Re-issue same grant (idempotent)
       const grant = await buildGrant(
         existingLease.id,
@@ -189,6 +201,7 @@ export async function issueLeaseBroker(
         { attemptId, runId, generation },
         deps,
         client,
+        reissueUploadToken,
       );
       if (!grant) {
         const refusal: LeaseRefusal = { purpose, reason: "unavailable" };
@@ -218,7 +231,7 @@ export async function issueLeaseBroker(
     // 4. Project credential check for git-read/integrate
     if (purpose === "git-read" || purpose === "integrate") {
       const { rows: credRows } = await client.query<{ project_id: string }>(
-        `SELECT project_id FROM project_credentials
+        `SELECT project_credentials.project_id FROM project_credentials
          JOIN step_contracts sc ON sc.project_id = project_credentials.project_id
          JOIN attempts a ON a.contract_id = sc.id
          WHERE a.id = $1 AND project_credentials.purpose = $2
@@ -236,6 +249,10 @@ export async function issueLeaseBroker(
     const expiresAt = new Date(Date.now() + ttl);
     const leaseId = `lease_${randomHex(16)}`;
 
+    // For upload leases, pre-generate the token so we can store token_hash atomically (W-3).
+    const uploadToken = purpose === "upload" ? randomHex(32) : undefined;
+    const tokenHash = uploadToken !== undefined ? sha256hex(uploadToken) : undefined;
+
     await issueLease(client, {
       id: leaseId,
       attempt_id: attemptId,
@@ -243,6 +260,7 @@ export async function issueLeaseBroker(
       run_id: runId,
       purpose,
       nonce_hash: nonceHash,
+      token_hash: tokenHash ?? null,
       expires_at: expiresAt,
     });
 
@@ -253,6 +271,7 @@ export async function issueLeaseBroker(
       { attemptId, runId, generation },
       deps,
       client,
+      uploadToken,
     );
     if (!grant) {
       const refusal: LeaseRefusal = { purpose, reason: "unavailable" };
@@ -277,6 +296,8 @@ async function buildGrant(
   context: { attemptId: string; runId: string; generation: number },
   deps: LeaseBrokerDeps,
   client: pg.PoolClient,
+  /** Pre-generated upload token (only for purpose === "upload"). */
+  preGeneratedUploadToken?: string,
 ): Promise<LeaseGrant | null> {
   const { dataDirFn, secretsKey } = deps;
 
@@ -355,14 +376,8 @@ async function buildGrant(
   }
 
   if (purpose === "upload") {
-    const uploadToken = randomHex(32);
-    // Store sha256 of upload token on the lease row for later verification
-    const uploadTokenHash = sha256hex(uploadToken);
-    await client.query(`UPDATE leases SET nonce_hash = nonce_hash WHERE id = $1`, [leaseId]);
-    // Store upload token hash as metadata (future: dedicated column; for now embed in nonce_hash field)
-    // We store it alongside the existing nonce_hash via a separate update to a dedicated spot
-    // The upload token hash is returned for caller storage if needed
-    void uploadTokenHash; // used only for future storage; the token itself is in material
+    // Use the pre-generated token (token_hash was stored atomically in issueLease).
+    const uploadToken = preGeneratedUploadToken ?? randomHex(32);
 
     return LeaseGrantSchema.parse({
       leaseId,

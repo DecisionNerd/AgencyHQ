@@ -95,7 +95,9 @@ async function writeAskpassScript(token: string): Promise<string> {
   );
   // The script echoes the token; git calls it when credentials are needed.
   const content = `#!/bin/sh\necho '${token.replace(/'/g, "'\\''")}'`;
-  await writeFile(scriptPath, content, { encoding: "utf-8" });
+  // W-13: write with mode 0700 atomically to avoid a readable window.
+  await writeFile(scriptPath, content, { encoding: "utf-8", mode: 0o700 });
+  // Ensure 0700 even if the umask restricted writeFile.
   await chmod(scriptPath, 0o700);
   return scriptPath;
 }

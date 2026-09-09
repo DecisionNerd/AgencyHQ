@@ -21,6 +21,12 @@ export interface AttemptArtifactInsert {
   quarantine_patch?: string | null;
   bundle_sha256: string;
   bundle_bytes: number;
+  /**
+   * Whether this artifact has been fully verified (D3).
+   * Only verified=true rows represent admitted artifacts.
+   * Defaults to false; callers should pass true when all checks have passed.
+   */
+  verified?: boolean;
 }
 
 export type InsertArtifactResult =
@@ -38,8 +44,8 @@ export async function insertAttemptArtifact(
   const { rows } = await client.query<AttemptArtifactRow>(
     `INSERT INTO attempt_artifacts
        (id, attempt_id, generation, kind, commit_id, diff_digest,
-        changed_paths, quarantine_patch, bundle_sha256, bundle_bytes)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
+        changed_paths, quarantine_patch, bundle_sha256, bundle_bytes, verified)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
      ON CONFLICT (attempt_id, generation, kind, commit_id) DO NOTHING
      RETURNING *`,
     [
@@ -53,6 +59,7 @@ export async function insertAttemptArtifact(
       row.quarantine_patch ?? null,
       row.bundle_sha256,
       row.bundle_bytes,
+      row.verified ?? false,
     ],
   );
   const first = rows[0];

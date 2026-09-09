@@ -5,6 +5,7 @@ export type { ArtifactRef, ArtifactUploadMeta, StopEvidenceUpload } from "./arti
 export {
   ArtifactRefSchema,
   ArtifactUploadMetaSchema,
+  bundleRefFor,
   StopEvidenceUploadSchema,
 } from "./artifact.ts";
 // Authority, runtime profile, and StepContract schemas (wave 2.B).

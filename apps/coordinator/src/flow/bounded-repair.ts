@@ -12,7 +12,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type {
   Authority,
@@ -30,16 +30,22 @@ import {
   criteriaDigestInput,
   digestOf,
   IntegrateMergePayloadSchema,
+  IntegrateMergePayloadV2Schema,
   LeadAcceptPayloadSchema,
+  LeadAcceptPayloadV2Schema,
   LeadPlanPayloadSchema,
+  LeadPlanPayloadV2Schema,
   LeadReviewPayloadSchema,
+  LeadReviewPayloadV2Schema,
   permissionRulesFor,
   ReviewOutputSchema,
   TASK_IDS,
   VerifyRunOutputSchema,
   VerifyRunPayloadSchema,
+  VerifyRunPayloadV2Schema,
   WorkerAttemptOutputSchema,
   WorkerAttemptPayloadSchema,
+  WorkerAttemptPayloadV2Schema,
 } from "@agencyhq/contracts";
 import {
   applyObservation,
@@ -87,6 +93,20 @@ import { scheduleQueuedIntents } from "./schedule.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
+// Nonce helpers (D1 / W-1)
+// ---------------------------------------------------------------------------
+
+/** Generate a 32-byte random nonce (64-char hex). SECURITY: never log the raw value. */
+function generateDispatchNonce(): string {
+  return randomBytes(32).toString("hex");
+}
+
+/** sha256 hex of a nonce value. Only the hash is stored in the DB. */
+function hashNonce(nonce: string): string {
+  return createHash("sha256").update(nonce, "utf8").digest("hex");
+}
+
+// ---------------------------------------------------------------------------
 // Row types (raw DB rows, accessed via pool.query)
 // ---------------------------------------------------------------------------
 
@@ -99,6 +119,8 @@ interface ProjectRow {
   authority_version: string;
   profile_catalog?: unknown;
   allowed_refs: unknown;
+  /** Source mode: 'mirror' uses v2 payloads; 'host_clone' uses v1 (D8). */
+  source_mode?: "mirror" | "host_clone" | null;
 }
 
 interface WorkItemRow {
@@ -523,19 +545,46 @@ export async function finalizeAcceptedAttempt(
     const mergeIntentId = randomUUID() as unknown as DispatchIntentId;
     const mergeIdempotencyKey = `${String(mergeIntentId)}:g${String(attemptRow.generation)}`;
 
-    const mergePayload = IntegrateMergePayloadSchema.parse({
-      attemptId: ctx.attemptId,
-      generation: attemptRow.generation,
-      contractId: ctx.contractId,
-      contractVersion: ctx.contractVersion,
-      projectId: contractRow.project_id,
-      repoPath: projectRow.clone_path ?? worktreeBase,
-      remote: projectRow.remote ?? "origin",
-      targetRef,
-      expectedBaseRevision,
-      attemptRevision: ctx.artifactRevision,
-      strategy: "merge_commit",
-    });
+    // D8 / W-5: v2 payload for mirror projects; v1 for host_clone.
+    const mergeIsMirror = projectRow.source_mode === "mirror";
+    const mergeNonce = mergeIsMirror ? generateDispatchNonce() : undefined;
+    let mergePayload: unknown;
+    if (mergeIsMirror) {
+      mergePayload = IntegrateMergePayloadV2Schema.parse({
+        payloadVersion: 2,
+        attemptId: ctx.attemptId,
+        generation: attemptRow.generation,
+        contractId: ctx.contractId,
+        contractVersion: ctx.contractVersion,
+        projectId: contractRow.project_id,
+        remote: projectRow.remote ?? "origin",
+        targetRef,
+        expectedBaseRevision,
+        attemptRevision: ctx.artifactRevision,
+        strategy: "merge_commit",
+        source: {
+          projectId: contractRow.project_id,
+          revision: ctx.artifactRevision,
+          bundlePath: `/internal/source/${contractRow.project_id}?rev=${ctx.artifactRevision}`,
+        },
+        integrateLease: { purpose: "integrate" },
+        leaseNonce: mergeNonce,
+      });
+    } else {
+      mergePayload = IntegrateMergePayloadSchema.parse({
+        attemptId: ctx.attemptId,
+        generation: attemptRow.generation,
+        contractId: ctx.contractId,
+        contractVersion: ctx.contractVersion,
+        projectId: contractRow.project_id,
+        repoPath: projectRow.clone_path ?? worktreeBase,
+        remote: projectRow.remote ?? "origin",
+        targetRef,
+        expectedBaseRevision,
+        attemptRevision: ctx.artifactRevision,
+        strategy: "merge_commit",
+      });
+    }
 
     await client.query("BEGIN");
     try {
@@ -625,10 +674,17 @@ export async function finalizeAcceptedAttempt(
       },
     });
 
-    await pool.query(
-      "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-      [String(mergeIntentId), mergeRunId],
-    );
+    if (mergeNonce) {
+      await pool.query(
+        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
+        [String(mergeIntentId), mergeRunId, hashNonce(mergeNonce)],
+      );
+    } else {
+      await pool.query(
+        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+        [String(mergeIntentId), mergeRunId],
+      );
+    }
 
     return { boundary: "merge", mergeIntentId: String(mergeIntentId), mergeRunId };
   } else {
@@ -797,21 +853,48 @@ export class BoundedRepairFlow {
           : {}),
       });
 
-      const payload = LeadPlanPayloadSchema.parse({
-        workItemId: wiRow.id,
-        projectId: targetProjectRow.id,
-        repoPath: targetProjectRow.clone_path ?? config.worktreeBase,
-        baseRevision,
-        worktreeBase: config.worktreeBase,
-        authority: targetProjectRow.authority,
-        profileCatalog: Array.isArray(targetProjectRow.profile_catalog)
-          ? (targetProjectRow.profile_catalog as string[])
-          : [],
-        ...(wiRow.defect ? { defect: wiRow.defect } : {}),
-        operatorIntent,
-        model: config.leadModel,
-        ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
-      });
+      // D8 / W-5: v2 payload for mirror projects.
+      const planIsMirror = targetProjectRow.source_mode === "mirror";
+      const planNonce = planIsMirror ? generateDispatchNonce() : undefined;
+      let payload: unknown;
+      if (planIsMirror) {
+        payload = LeadPlanPayloadV2Schema.parse({
+          payloadVersion: 2,
+          workItemId: wiRow.id,
+          projectId: targetProjectRow.id,
+          source: {
+            projectId: targetProjectRow.id,
+            revision: baseRevision,
+            bundlePath: `/internal/source/${targetProjectRow.id}?rev=${baseRevision}`,
+          },
+          baseRevision,
+          authority: targetProjectRow.authority,
+          profileCatalog: Array.isArray(targetProjectRow.profile_catalog)
+            ? (targetProjectRow.profile_catalog as string[])
+            : [],
+          ...(wiRow.defect ? { defect: wiRow.defect } : {}),
+          operatorIntent,
+          model: config.leadModel,
+          ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
+          leaseNonce: planNonce,
+        });
+      } else {
+        payload = LeadPlanPayloadSchema.parse({
+          workItemId: wiRow.id,
+          projectId: targetProjectRow.id,
+          repoPath: targetProjectRow.clone_path ?? config.worktreeBase,
+          baseRevision,
+          worktreeBase: config.worktreeBase,
+          authority: targetProjectRow.authority,
+          profileCatalog: Array.isArray(targetProjectRow.profile_catalog)
+            ? (targetProjectRow.profile_catalog as string[])
+            : [],
+          ...(wiRow.defect ? { defect: wiRow.defect } : {}),
+          operatorIntent,
+          model: config.leadModel,
+          ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
+        });
+      }
 
       const intentId = ids.next("di") as DispatchIntentId;
       const idempotencyKey = `leadplan:${workItemId}:${String(intentId)}`;
@@ -836,10 +919,17 @@ export class BoundedRepairFlow {
         },
       });
 
-      await pool.query(
-        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-        [String(intentId), runId],
-      );
+      if (planNonce) {
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
+          [String(intentId), runId, hashNonce(planNonce)],
+        );
+      } else {
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+          [String(intentId), runId],
+        );
+      }
 
       const result = { intentId: String(intentId), runId };
       await completeCommand(client, commandId, result);
@@ -893,7 +983,6 @@ export class BoundedRepairFlow {
       let activeEntryTargetRef: string | null = null;
       let manifestDigestValue: string | null = null;
       let activeManifestEntry: ManifestEntry | null = null;
-      let allManifestEntries: ManifestEntry[] | null = null;
       if (wipRows.length > 0) {
         const manifestEntries: ManifestEntry[] = wipRows.map((row) => ({
           position: row.position,
@@ -902,7 +991,6 @@ export class BoundedRepairFlow {
           expectedBaseRevision: row.expected_base_revision,
           resultRevision: row.result_revision,
         }));
-        allManifestEntries = manifestEntries;
         const activeEntry = nextEntry(manifestEntries);
         activeManifestEntry = activeEntry ?? null;
         projectRow = await loadProject(pool, activeEntry?.projectId ?? wiRow.project_id);
@@ -1259,7 +1347,12 @@ export class BoundedRepairFlow {
       // it returns per-intent outcomes. We inspect the result for the newly
       // queued worker intent only. Failures of OTHER queued intents during this
       // pass are logged and left queued — the next poll retries them.
-      const scheduleResult = await scheduleQueuedIntents(this.deps, (id) => this.retryDispatch(id));
+      // D9 / W-11: pass provider status to gate at admission.
+      const scheduleResult = await scheduleQueuedIntents(
+        this.deps,
+        (id) => this.retryDispatch(id),
+        this.deps.providerState?.(),
+      );
 
       // Log failures for other intents (they stay queued; next poll retries).
       for (const f of scheduleResult.failed) {
@@ -1693,25 +1786,55 @@ export class BoundedRepairFlow {
           };
         }
 
-        const verifyPayload = VerifyRunPayloadSchema.parse({
-          attemptId: attemptRow.id,
-          generation: attemptRow.generation,
-          contractId: contractRow.id,
-          profileId: contractRow.profile_id,
-          profileDigest: resolvedProfile.digest,
-          criteriaDigest: contractRow.criteria_digest,
-          repoPath: projectRow.clone_path ?? config.worktreeBase,
-          worktreeBase: config.worktreeBase,
-          baseRevision: contractRow.base_revision,
-          attemptRevision: revision,
-          diffDigest,
-          checks: resolvedProfile.checks,
-          protectedPaths: resolvedProfile.protectedPaths, // F-6
-          ...(verifyManifestPayload ? { manifest: verifyManifestPayload } : {}),
-        });
+        // D8 / W-5: use v2 payload for mirror projects, v1 for host_clone.
+        // D1 / W-1: generate dispatch nonce for v2.
+        const verifyIsMirror = projectRow.source_mode === "mirror";
+        const verifyNonce = verifyIsMirror ? generateDispatchNonce() : undefined;
+        let verifyPayload: unknown;
+        if (verifyIsMirror) {
+          const bundlePath = `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`;
+          verifyPayload = VerifyRunPayloadV2Schema.parse({
+            payloadVersion: 2,
+            attemptId: attemptRow.id,
+            generation: attemptRow.generation,
+            contractId: contractRow.id,
+            profileId: contractRow.profile_id,
+            profileDigest: resolvedProfile.digest,
+            criteriaDigest: contractRow.criteria_digest,
+            source: {
+              projectId: projectRow.id,
+              revision: contractRow.base_revision,
+              bundlePath,
+            },
+            baseRevision: contractRow.base_revision,
+            attemptRevision: revision,
+            diffDigest,
+            checks: resolvedProfile.checks,
+            protectedPaths: resolvedProfile.protectedPaths,
+            ...(verifyManifestPayload ? { manifest: verifyManifestPayload } : {}),
+            leaseNonce: verifyNonce,
+          });
+        } else {
+          verifyPayload = VerifyRunPayloadSchema.parse({
+            attemptId: attemptRow.id,
+            generation: attemptRow.generation,
+            contractId: contractRow.id,
+            profileId: contractRow.profile_id,
+            profileDigest: resolvedProfile.digest,
+            criteriaDigest: contractRow.criteria_digest,
+            repoPath: projectRow.clone_path ?? config.worktreeBase,
+            worktreeBase: config.worktreeBase,
+            baseRevision: contractRow.base_revision,
+            attemptRevision: revision,
+            diffDigest,
+            checks: resolvedProfile.checks,
+            protectedPaths: resolvedProfile.protectedPaths, // F-6
+            ...(verifyManifestPayload ? { manifest: verifyManifestPayload } : {}),
+          });
+        }
 
         // Combine parsed payload with extension fields (manifest ext is not in the schema).
-        const verifyTriggerPayload = { ...verifyPayload, ...verifyManifestExt };
+        const verifyTriggerPayload = { ...(verifyPayload as object), ...verifyManifestExt };
 
         await client.query(
           `INSERT INTO dispatch_intents
@@ -1752,10 +1875,17 @@ export class BoundedRepairFlow {
           },
         });
 
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-          [String(verifyIntentId), verifyRunId],
-        );
+        if (verifyNonce) {
+          await pool.query(
+            "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
+            [String(verifyIntentId), verifyRunId, hashNonce(verifyNonce)],
+          );
+        } else {
+          await pool.query(
+            "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+            [String(verifyIntentId), verifyRunId],
+          );
+        }
 
         await completeCommand(client, commandId, {
           artifactId: String(artifactId),
@@ -2092,22 +2222,55 @@ export class BoundedRepairFlow {
         }
       }
       const reviewIntentId = ids.next("di") as DispatchIntentId;
-      const reviewPayload = LeadReviewPayloadSchema.parse({
-        attemptId: attemptRow.id,
-        generation: attemptRow.generation,
-        contractId: contractRow.id,
-        criteria: contractRow.criteria,
-        criteriaDigest: contractRow.criteria_digest,
-        profileDigest: resolvedProfile.digest,
-        attemptRevision: artifactRow.revision,
-        diffDigest: artifactRow.diff_digest,
-        patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
-        verificationResults: results,
-        model: config.reviewerModel,
-        repoPath: projectRow.clone_path ?? config.worktreeBase,
-        worktreeBase: config.worktreeBase,
-        baseRevision: contractRow.base_revision,
-      });
+      // D8 / W-5: use v2 payload for mirror projects.
+      const reviewIsMirror = projectRow.source_mode === "mirror";
+      const reviewNonce = reviewIsMirror ? generateDispatchNonce() : undefined;
+      let reviewPayload: unknown;
+      if (reviewIsMirror) {
+        // D7 / W-10: source = base bundle, patch = attempt artifact bundle.
+        reviewPayload = LeadReviewPayloadV2Schema.parse({
+          payloadVersion: 2,
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          contractId: contractRow.id,
+          criteria: contractRow.criteria,
+          criteriaDigest: contractRow.criteria_digest,
+          profileDigest: resolvedProfile.digest,
+          attemptRevision: artifactRow.revision,
+          diffDigest: artifactRow.diff_digest,
+          patch: {
+            attemptId: attemptRow.id,
+            generation: attemptRow.generation,
+            revision: artifactRow.revision,
+          },
+          verificationResults: results,
+          model: config.reviewerModel,
+          source: {
+            projectId: projectRow.id,
+            revision: contractRow.base_revision,
+            bundlePath: `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`,
+          },
+          baseRevision: contractRow.base_revision,
+          leaseNonce: reviewNonce,
+        });
+      } else {
+        reviewPayload = LeadReviewPayloadSchema.parse({
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          contractId: contractRow.id,
+          criteria: contractRow.criteria,
+          criteriaDigest: contractRow.criteria_digest,
+          profileDigest: resolvedProfile.digest,
+          attemptRevision: artifactRow.revision,
+          diffDigest: artifactRow.diff_digest,
+          patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
+          verificationResults: results,
+          model: config.reviewerModel,
+          repoPath: projectRow.clone_path ?? config.worktreeBase,
+          worktreeBase: config.worktreeBase,
+          baseRevision: contractRow.base_revision,
+        });
+      }
 
       // Insert review intent and close incoming verify intent in the same tx (F-5).
       await client.query(
@@ -2147,10 +2310,17 @@ export class BoundedRepairFlow {
         },
       });
 
-      await pool.query(
-        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-        [String(reviewIntentId), reviewRunId],
-      );
+      if (reviewNonce) {
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
+          [String(reviewIntentId), reviewRunId, hashNonce(reviewNonce)],
+        );
+      } else {
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+          [String(reviewIntentId), reviewRunId],
+        );
+      }
 
       await completeCommand(client, commandId, {
         reviewIntentId: String(reviewIntentId),
@@ -2224,22 +2394,55 @@ export class BoundedRepairFlow {
           // First failure: dispatch a bounded retry with idempotency key <intentId>:r1.
           const retryIntentId = ids.next("di") as DispatchIntentId;
           const retryKey = `${intentRow.id}:r1`;
-          const retryPayload = LeadReviewPayloadSchema.parse({
-            attemptId: attemptRow.id,
-            generation: attemptRow.generation,
-            contractId: contractRow.id,
-            criteria: contractRow.criteria,
-            criteriaDigest: contractRow.criteria_digest,
-            profileDigest: resolvedProfile.digest,
-            attemptRevision: artifactRow?.revision ?? "",
-            diffDigest: artifactRow?.diff_digest ?? "",
-            patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
-            verificationResults,
-            model: config.reviewerModel,
-            repoPath: projectRow.clone_path ?? config.worktreeBase,
-            worktreeBase: config.worktreeBase,
-            baseRevision: contractRow.base_revision,
-          });
+          // D8 / W-5: v2 payload for mirror projects on retry too.
+          const retryReviewIsMirror = projectRow.source_mode === "mirror";
+          const retryReviewNonce = retryReviewIsMirror ? generateDispatchNonce() : undefined;
+          let retryPayload: unknown;
+          if (retryReviewIsMirror) {
+            // D7 / W-10: source = base bundle, patch = attempt artifact bundle.
+            retryPayload = LeadReviewPayloadV2Schema.parse({
+              payloadVersion: 2,
+              attemptId: attemptRow.id,
+              generation: attemptRow.generation,
+              contractId: contractRow.id,
+              criteria: contractRow.criteria,
+              criteriaDigest: contractRow.criteria_digest,
+              profileDigest: resolvedProfile.digest,
+              attemptRevision: artifactRow?.revision ?? "",
+              diffDigest: artifactRow?.diff_digest ?? "",
+              patch: {
+                attemptId: attemptRow.id,
+                generation: attemptRow.generation,
+                revision: artifactRow?.revision ?? "",
+              },
+              verificationResults,
+              model: config.reviewerModel,
+              source: {
+                projectId: projectRow.id,
+                revision: contractRow.base_revision,
+                bundlePath: `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`,
+              },
+              baseRevision: contractRow.base_revision,
+              leaseNonce: retryReviewNonce,
+            });
+          } else {
+            retryPayload = LeadReviewPayloadSchema.parse({
+              attemptId: attemptRow.id,
+              generation: attemptRow.generation,
+              contractId: contractRow.id,
+              criteria: contractRow.criteria,
+              criteriaDigest: contractRow.criteria_digest,
+              profileDigest: resolvedProfile.digest,
+              attemptRevision: artifactRow?.revision ?? "",
+              diffDigest: artifactRow?.diff_digest ?? "",
+              patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
+              verificationResults,
+              model: config.reviewerModel,
+              repoPath: projectRow.clone_path ?? config.worktreeBase,
+              worktreeBase: config.worktreeBase,
+              baseRevision: contractRow.base_revision,
+            });
+          }
 
           // ON CONFLICT ensures idempotency across reconciler replays.
           await client.query(
@@ -2279,10 +2482,17 @@ export class BoundedRepairFlow {
               }),
             },
           });
-          await pool.query(
-            "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-            [String(retryIntentId), retryRunId],
-          );
+          if (retryReviewNonce) {
+            await pool.query(
+              "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
+              [String(retryIntentId), retryRunId, hashNonce(retryReviewNonce)],
+            );
+          } else {
+            await pool.query(
+              "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+              [String(retryIntentId), retryRunId],
+            );
+          }
         } else {
           // Retry also failed: record pending_human decision and stop.
           const decisionId = ids.next("dec") as DecisionId;
@@ -2313,19 +2523,41 @@ export class BoundedRepairFlow {
       const review = reviewOutput.data;
 
       const acceptIntentId = ids.next("di") as DispatchIntentId;
-      const acceptPayload = LeadAcceptPayloadSchema.parse({
-        attemptId: attemptRow.id,
-        generation: attemptRow.generation,
-        contractId: contractRow.id,
-        criteria: contractRow.criteria,
-        criteriaDigest: contractRow.criteria_digest,
-        profileDigest: resolvedProfile.digest,
-        attemptRevision: artifactRow?.revision ?? "",
-        diffDigest: artifactRow?.diff_digest ?? "",
-        verificationResults,
-        review,
-        model: config.leadModel,
-      });
+      // D8 / W-5: v2 payload for mirror projects.
+      const acceptIsMirror = projectRow.source_mode === "mirror";
+      const acceptNonce = acceptIsMirror ? generateDispatchNonce() : undefined;
+      let acceptPayload: unknown;
+      if (acceptIsMirror) {
+        acceptPayload = LeadAcceptPayloadV2Schema.parse({
+          payloadVersion: 2,
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          contractId: contractRow.id,
+          criteria: contractRow.criteria,
+          criteriaDigest: contractRow.criteria_digest,
+          profileDigest: resolvedProfile.digest,
+          attemptRevision: artifactRow?.revision ?? "",
+          diffDigest: artifactRow?.diff_digest ?? "",
+          verificationResults,
+          review,
+          model: config.leadModel,
+          leaseNonce: acceptNonce,
+        });
+      } else {
+        acceptPayload = LeadAcceptPayloadSchema.parse({
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          contractId: contractRow.id,
+          criteria: contractRow.criteria,
+          criteriaDigest: contractRow.criteria_digest,
+          profileDigest: resolvedProfile.digest,
+          attemptRevision: artifactRow?.revision ?? "",
+          diffDigest: artifactRow?.diff_digest ?? "",
+          verificationResults,
+          review,
+          model: config.leadModel,
+        });
+      }
 
       const reviewId = ids.next("rev") as ReviewId;
       await client.query("BEGIN");
@@ -2385,10 +2617,17 @@ export class BoundedRepairFlow {
         },
       });
 
-      await pool.query(
-        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-        [String(acceptIntentId), acceptRunId],
-      );
+      if (acceptNonce) {
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
+          [String(acceptIntentId), acceptRunId, hashNonce(acceptNonce)],
+        );
+      } else {
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+          [String(acceptIntentId), acceptRunId],
+        );
+      }
 
       await completeCommand(client, commandId, {
         reviewId: String(reviewId),
@@ -2488,21 +2727,45 @@ export class BoundedRepairFlow {
               }>,
             };
 
+            const failProjectRow = await loadProject(pool, failContractRow.project_id);
+
             const retryIntentId = ids.next("di") as DispatchIntentId;
             const retryKey = `${intentRow.id}:r1`;
-            const retryPayload = LeadAcceptPayloadSchema.parse({
-              attemptId: failAttemptRow.id,
-              generation: failAttemptRow.generation,
-              contractId: failContractRow.id,
-              criteria: failContractRow.criteria,
-              criteriaDigest: failContractRow.criteria_digest,
-              profileDigest: failResolvedProfile.digest,
-              attemptRevision: failArtifactRow?.revision ?? "",
-              diffDigest: failArtifactRow?.diff_digest ?? "",
-              verificationResults: failVerificationResults,
-              review: failReview,
-              model: config.leadModel,
-            });
+            // D8 / W-5: v2 payload for mirror projects on retry.
+            const retryAcceptIsMirror = failProjectRow?.source_mode === "mirror";
+            const retryAcceptNonce = retryAcceptIsMirror ? generateDispatchNonce() : undefined;
+            let retryPayload: unknown;
+            if (retryAcceptIsMirror && failProjectRow) {
+              retryPayload = LeadAcceptPayloadV2Schema.parse({
+                payloadVersion: 2,
+                attemptId: failAttemptRow.id,
+                generation: failAttemptRow.generation,
+                contractId: failContractRow.id,
+                criteria: failContractRow.criteria,
+                criteriaDigest: failContractRow.criteria_digest,
+                profileDigest: failResolvedProfile.digest,
+                attemptRevision: failArtifactRow?.revision ?? "",
+                diffDigest: failArtifactRow?.diff_digest ?? "",
+                verificationResults: failVerificationResults,
+                review: failReview,
+                model: config.leadModel,
+                leaseNonce: retryAcceptNonce,
+              });
+            } else {
+              retryPayload = LeadAcceptPayloadSchema.parse({
+                attemptId: failAttemptRow.id,
+                generation: failAttemptRow.generation,
+                contractId: failContractRow.id,
+                criteria: failContractRow.criteria,
+                criteriaDigest: failContractRow.criteria_digest,
+                profileDigest: failResolvedProfile.digest,
+                attemptRevision: failArtifactRow?.revision ?? "",
+                diffDigest: failArtifactRow?.diff_digest ?? "",
+                verificationResults: failVerificationResults,
+                review: failReview,
+                model: config.leadModel,
+              });
+            }
 
             await client.query(
               `INSERT INTO dispatch_intents
@@ -2540,10 +2803,17 @@ export class BoundedRepairFlow {
                 }),
               },
             });
-            await pool.query(
-              "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-              [String(retryIntentId), retryRunId],
-            );
+            if (retryAcceptNonce) {
+              await pool.query(
+                "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
+                [String(retryIntentId), retryRunId, hashNonce(retryAcceptNonce)],
+              );
+            } else {
+              await pool.query(
+                "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+                [String(retryIntentId), retryRunId],
+              );
+            }
           } else {
             // No review row → cannot rebuild payload; escalate to pending_human.
             const decisionId = ids.next("dec") as DecisionId;
@@ -2743,21 +3013,53 @@ export class BoundedRepairFlow {
     const contractRow = await loadContract(pool, attemptRow.contract_id);
     const projectRow = await loadProject(pool, contractRow.project_id);
 
-    const worktreePath = `${config.worktreeBase}/${attemptRow.id}`;
-    const payload = WorkerAttemptPayloadSchema.parse({
-      attemptId: attemptRow.id,
-      generation: attemptRow.generation,
-      contractId: contractRow.id,
-      contractVersion: String(contractRow.version),
-      repoPath: projectRow.clone_path ?? config.worktreeBase,
-      baseRev: contractRow.base_revision,
-      prompt: contractRow.inputs?.intent ?? "",
-      allowedPaths: contractRow.bounds.paths.allow,
-      bounds: contractRow.bounds,
-      permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath }),
-      model: config.workerModel,
-      worktreeBase: config.worktreeBase,
-    });
+    const isMirror = projectRow.source_mode === "mirror";
+
+    // Build payload (D8 / W-5): v2 for mirror-mode, v1 for host_clone.
+    // Generate a dispatch nonce for v2 and store sha256(nonce) in dispatch_intents (D1 / W-1).
+    let payload: unknown;
+    let dispatchNonce: string | undefined;
+    if (isMirror) {
+      dispatchNonce = generateDispatchNonce();
+      const bundlePath = `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`;
+      payload = WorkerAttemptPayloadV2Schema.parse({
+        payloadVersion: 2,
+        attemptId: attemptRow.id,
+        generation: attemptRow.generation,
+        contractId: contractRow.id,
+        contractVersion: String(contractRow.version),
+        source: {
+          projectId: projectRow.id,
+          revision: contractRow.base_revision,
+          bundlePath,
+        },
+        baseRev: contractRow.base_revision,
+        prompt: contractRow.inputs?.intent ?? "",
+        allowedPaths: contractRow.bounds.paths.allow,
+        bounds: contractRow.bounds,
+        permissionRules: permissionRulesFor(contractRow.bounds, {
+          worktreePath: `/tmp/worker/${attemptRow.id}`,
+        }),
+        model: config.workerModel,
+        leaseNonce: dispatchNonce,
+      });
+    } else {
+      const worktreePath = `${config.worktreeBase}/${attemptRow.id}`;
+      payload = WorkerAttemptPayloadSchema.parse({
+        attemptId: attemptRow.id,
+        generation: attemptRow.generation,
+        contractId: contractRow.id,
+        contractVersion: String(contractRow.version),
+        repoPath: projectRow.clone_path ?? config.worktreeBase,
+        baseRev: contractRow.base_revision,
+        prompt: contractRow.inputs?.intent ?? "",
+        allowedPaths: contractRow.bounds.paths.allow,
+        bounds: contractRow.bounds,
+        permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath }),
+        model: config.workerModel,
+        worktreeBase: config.worktreeBase,
+      });
+    }
 
     const { runId } = await runtime.trigger({
       intentId: intentId as DispatchIntentId,
@@ -2779,9 +3081,13 @@ export class BoundedRepairFlow {
       },
     });
 
+    // Store nonce hash atomically with triggered status (D1 / W-1).
     await pool.query(
-      "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, skip_reason = NULL, updated_at = now() WHERE id = $1",
-      [intentId, runId],
+      `UPDATE dispatch_intents
+         SET status = 'triggered', run_id = $2, skip_reason = NULL, updated_at = now()
+             ${dispatchNonce ? ", dispatch_nonce_hash = $3" : ""}
+       WHERE id = $1`,
+      dispatchNonce ? [intentId, runId, hashNonce(dispatchNonce)] : [intentId, runId],
     );
     await pool.query(
       "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",
