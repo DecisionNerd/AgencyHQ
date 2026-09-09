@@ -144,7 +144,22 @@ model (ADR-0007): no Trigger SDK usage, node built-ins only.
   (`HOME`, `PATH`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`,
   `TMPDIR`, plus `AGENCYHQ_ATTEMPT_ID` and the `GIT_*` overrides that empty
   the credential helper and disable prompting/SSH); `assertPushBlocked` is
-  the before-action control that proves a scrubbed env cannot push.
+  the before-action control that proves a scrubbed env cannot push. The
+  optional `home` argument overrides `HOME` in the returned env — use it to
+  supply the per-run isolated home on the container profile (see
+  `runtime-home.ts` below); when absent the behaviour is identical to before.
+- `runtime-home.ts`: `resolveRunHome({ profile, runRoot, runId, hostHome })`
+  resolves the per-run HOME directory. On the container profile it creates
+  `<runRoot>/runs/<runId>/home` (mode 0700) and
+  `<home>/.local/share/opencode` (mode 0700) so that a later coordinator
+  lease can deliver provider auth material there; on the host profile it
+  returns `hostHome` unchanged and creates nothing. `runId` is validated
+  against `/^[A-Za-z0-9_-]{1,128}$/` — anything outside that range is
+  rejected to prevent path traversal. `readRuntimeProfile(env)` returns
+  `"container"` only when `AGENCYHQ_RUNTIME_PROFILE` is exactly
+  `"container"`, and `"host"` otherwise. Provider material (API keys and
+  provider tokens) is delivered by the coordinator lease broker (packet
+  P18.3 / P17.1) and is not present yet.
 - `paths.ts`: a minimal glob matcher (`*`, `**`, `?`, exact) plus
   `classifyPaths` (allow/violation split against `paths.allow`, with an
   optional `denied` list — a path matching any denied glob is a violation

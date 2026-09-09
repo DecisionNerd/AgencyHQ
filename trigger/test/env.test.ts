@@ -71,6 +71,89 @@ test("REMOVED_BY_ALLOWLIST documents the named secrets", () => {
   }
 });
 
+test("scrubbedChildEnv home override: overrides HOME in the returned env", () => {
+  const originalHome = process.env.HOME;
+  try {
+    process.env.HOME = "/home/original";
+    const env = scrubbedChildEnv({
+      attemptId: "attempt-home",
+      home: "/tmp/agencyhq/runs/run-1/home",
+    });
+    assert.equal(env.HOME, "/tmp/agencyhq/runs/run-1/home");
+    assert.equal(env.AGENCYHQ_ATTEMPT_ID, "attempt-home");
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+  }
+});
+
+test("scrubbedChildEnv home absence: uses process.env HOME (identical to original behaviour)", () => {
+  const originalEnv = { ...process.env };
+  try {
+    process.env.HOME = "/home/testuser";
+    // Omitting home should pass process.env.HOME through unchanged
+    const env = scrubbedChildEnv({ attemptId: "attempt-absent" });
+    assert.equal(env.HOME, "/home/testuser");
+    assert.equal(env.AGENCYHQ_ATTEMPT_ID, "attempt-absent");
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
+  }
+});
+
+test("scrubbedChildEnv home override: forbidden names still absent after override", () => {
+  const originalEnv = { ...process.env };
+  try {
+    process.env.SSH_AUTH_SOCK = "/tmp/agent.sock";
+    process.env.GH_TOKEN = "gh-secret";
+    process.env.ANTHROPIC_API_KEY = "sk-test";
+    const env = scrubbedChildEnv({
+      attemptId: "attempt-sec",
+      home: "/tmp/agencyhq/runs/run-sec/home",
+    });
+    assert.equal(env.SSH_AUTH_SOCK, undefined);
+    assert.equal(env.GH_TOKEN, undefined);
+    assert.equal(env.ANTHROPIC_API_KEY, undefined);
+    assert.equal(env.HOME, "/tmp/agencyhq/runs/run-sec/home");
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
+  }
+});
+
+test("scrubbedChildEnv home override: LC_* still copied with override", () => {
+  const originalEnv = { ...process.env };
+  try {
+    process.env.LC_ALL = "en_US.UTF-8";
+    process.env.LC_CTYPE = "UTF-8";
+    const env = scrubbedChildEnv({
+      attemptId: "attempt-lc",
+      home: "/tmp/agencyhq/runs/run-lc/home",
+    });
+    assert.equal(env.LC_ALL, "en_US.UTF-8");
+    assert.equal(env.LC_CTYPE, "UTF-8");
+    assert.equal(env.HOME, "/tmp/agencyhq/runs/run-lc/home");
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
+  }
+});
+
 test("assertPushBlocked reports blocked when the scrubbed env cannot push", async () => {
   const repoPath = await mkdtemp(join(tmpdir(), "agencyhq-env-test-"));
   await git(["init", "--initial-branch=main"], repoPath);

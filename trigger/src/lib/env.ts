@@ -31,6 +31,12 @@ export const REMOVED_BY_ALLOWLIST = [
 export function scrubbedChildEnv(args: {
   attemptId: string;
   extra?: Record<string, string>;
+  /**
+   * When provided, overrides the HOME entry in the returned environment.
+   * Use this to supply the per-run isolated HOME on the container profile
+   * (see runtime-home.ts). The allowlist is otherwise unchanged.
+   */
+  home?: string;
 }): Record<string, string> {
   const env: Record<string, string> = {};
 
@@ -44,6 +50,11 @@ export function scrubbedChildEnv(args: {
     if (key.startsWith("LC_") && value !== undefined) {
       env[key] = value;
     }
+  }
+
+  // Override HOME with the per-run isolated directory when provided.
+  if (args.home !== undefined) {
+    env.HOME = args.home;
   }
 
   env.AGENCYHQ_ATTEMPT_ID = args.attemptId;
