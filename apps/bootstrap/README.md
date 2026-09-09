@@ -2,7 +2,7 @@
 
 Bootstraps a self-hosted Trigger.dev webapp into a usable AgencyHQ execution environment. Runs as a one-shot container in the Compose stack and drives the webapp's web interface to create an organisation, project, credentials, and a deployed task image.
 
-**Status:** Implemented; not yet run against a real Trigger.dev webapp (L1 is the live qualification step).
+**Status:** Implemented; exercised live in L1 (2026-09-09) against Trigger.dev v4.5.16 (see [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09)).
 
 ## What it does
 
@@ -10,7 +10,7 @@ Bootstraps a self-hosted Trigger.dev webapp into a usable AgencyHQ execution env
 2. **login** — Starts a minimal SMTP sink on port 2525, requests a magic link for the bootstrap email address, captures the link from the incoming email (MIME-decoded: quoted-printable soft breaks and `=XX` sequences are resolved; HTML entities such as `&amp;` and `&#x3D;` in HTML parts are unescaped; the first URL with a non-empty `token` query parameter wins), follows it to establish an authenticated session. The authenticated cookie jar is saved to `webapp-session.json` (0600) in `AGENCYHQ_STATE_DIR` so container restarts do not need to re-login. On rerun, the phase loads the session file; if the session is invalid (GET `/` redirects to `/login`), the file is deleted and a fresh magic link is requested. If the magic link is not received within `BOOTSTRAP_MAGIC_LINK_TIMEOUT_MS`, the run fails with category `login_required` and an actionable message rather than silently continuing. A 60-second throttle between requests prevents the webapp from rejecting rapid repeated requests.
 3. **org_project** — Finds or creates the organisation and project by slug prefix (`agencyhq`). Reuses existing resources if already present; never creates duplicates.
 4. **credentials** — Reads the prod environment secret key (`tr_prod_...`) from the webapp's API keys page. Mints a personal access token (`tr_pat_...`) only when none is already stored. Both are persisted as separate 0600 files in `AGENCYHQ_SECRETS_DIR`, never in the state JSON.
-5. **deploy** — Runs `trigger deploy --local-build --external-id <sha256>` from the workspace `trigger/` directory with `TRIGGER_ACCESS_TOKEN` (the PAT file) and `TRIGGER_API_URL` (webapp with DNS-resolved IP, to avoid the CLI's `localhost` → `host.docker.internal` rewrite). Skips the build when `deployment.json` already records the same external ID.
+5. **deploy** — Runs `trigger deploy --local-build --external-id <sha256>` from the workspace `trigger/` directory with `TRIGGER_ACCESS_TOKEN` (the PAT file) and `TRIGGER_API_URL` (webapp with DNS-resolved IP, to avoid the CLI's `localhost` → `host.docker.internal` rewrite). `DOCKER_CONFIG` is set to `<AGENCYHQ_STATE_DIR>/docker` so the Docker CLI writes buildx state under the state volume rather than the root-owned `/app`. `ensureBuilder` creates the `trigger` buildx `docker-container` builder on `AGENCYHQ_BUILD_NETWORK` (default `webapp`) with a buildkitd config that pins Docker's embedded DNS 127.0.0.11, and writes a `builder.marker` file to track the builder configuration; the builder is recreated when the marker differs. `deploymentIsCurrent` checks whether `deployment.json` already records the current toolchain hash: if so the deploy phase is skipped. If the webapp rejects the deploy with "already in progress" (`deploy_in_progress`), the bootstrap retries once with `--force` (cancels the stale build); if that also fails, the webapp times the stale build out after `DEPLOY_TIMEOUT_MS` (default 8 min) and the backoff retry succeeds.
 6. **verify_deployment** — `GET /api/v1/deployments/current` with the prod secret key; writes the result into the bootstrap state.
 7. **done** — Marks the bootstrap complete.
 
@@ -20,8 +20,10 @@ Each phase is idempotent and resumable: restarting the container picks up from t
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `AGENCYHQ_STATE_DIR` | `/var/run/agencyhq/state` | Directory for `bootstrap.json` and `deployment.json`. |
-| `AGENCYHQ_SECRETS_DIR` | `/var/run/agencyhq/secrets` | Directory for 0600 secret files (`trigger-prod-key`, `trigger-pat`). |
+| `AGENCYHQ_STATE_DIR` | `/var/agencyhq/state` | Directory for `bootstrap.json` and `deployment.json`. |
+| `AGENCYHQ_SECRETS_DIR` | `AGENCYHQ_STATE_DIR` | Directory for 0600 secret files (`trigger-prod-key`, `trigger-pat`). Defaults to the same path as `AGENCYHQ_STATE_DIR`. |
+| `DOCKER_CONFIG` | `<AGENCYHQ_STATE_DIR>/docker` | Docker CLI configuration directory; buildx state is written here. Set so the CLI does not write to the root-owned `/app`. |
+| `AGENCYHQ_BUILD_NETWORK` | `webapp` | Docker network on which the `trigger` buildx builder is created. The builder pins Docker's embedded DNS 127.0.0.11 so the indexer RUN step can reach the webapp by service name. |
 | `TRIGGER_WEBAPP_URL` | `http://webapp:3000` | Internal URL of the Trigger.dev webapp container. |
 | `BOOTSTRAP_EMAIL` | `agencyhq@example.com` | Email address for the magic-link login. Must match `WHITELISTED_EMAILS`/`ADMIN_EMAILS`. |
 | `BOOTSTRAP_SMTP_PORT` | `2525` | Port for the built-in SMTP sink (the webapp sends to this host). |
@@ -93,8 +95,18 @@ The reset time is parsed from `x-ratelimit-reset` (epoch-seconds or epoch-ms, au
 
 The SMTP sink timeout (default 90 s) applies **only after a successful magic-link request**. If the request is rate-limited or otherwise failed, the SMTP sink is cancelled immediately via `AbortController` and the bootstrap sleeps before exiting — it does not wait the full SMTP timeout.
 
-## Known open questions (L1 required to confirm)
+## Confirmed in L1 (2026-09-09)
 
-- `--push` flag: the Trigger.dev v4.5.16 docs (read 2026-09-09) do not list a `--push` flag on `trigger deploy`. The local build may push to the registry implicitly; this needs L1 verification.
-- `--network` flag: not listed in the v4.5.16 docs. If RUN steps during build need webapp access, use `TRIGGER_DEPLOY_ARGS=--network host` or the socat fallback documented in ADR-0008.
-- `/api/v1/deployments/current` route: copied from the plan and bootstrap.sh patterns; requires L1 verification against the real webapp.
+The following were open questions before L1 and are now confirmed against
+Trigger.dev v4.5.16 (commands/deploy.js, read 2026-09-09):
+
+- `--push`, `--network`, `--builder`, and `--force` exist as hidden flags in
+  the 4.5.16 CLI. The bootstrap uses `--local-build` (not `--push`);
+  localhost-tagged images are loaded into the daemon by the CLI, not pushed to
+  the registry (the registry catalog stayed empty in L1).
+- `/api/v1/deployments/current` works with the prod key and returns the current
+  deployment record.
+- `--external-id` returns an existing server deployment without triggering a new
+  build (`deploymentIsCurrent` uses this to skip redundant deploys) and rejects
+  one still in progress with "already in progress" (`deploy_in_progress` — the
+  `--force` retry handles this case).

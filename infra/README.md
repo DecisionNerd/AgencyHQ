@@ -10,7 +10,7 @@ container runtime profile (ADR-0008).
 | --- | --- |
 | `infra/agencyhq/compose.yaml` | AgencyHQ application services: `secrets-init`, `app`, `agencyhq-postgres`, `opencode`, `bootstrap`, `docker-proxy-build`. |
 | `infra/app/Dockerfile` | Multi-stage image build for AgencyHQ containers. Targets: `app` (coordinator + web), `tools` (adds Docker CLI for bootstrap/secrets-init), `opencode` (OpenCode AI service). |
-| `infra/secrets/` | Secret generation and entrypoint wrappers. See `infra/secrets/README.md`. |
+| `infra/secrets/` | Secret generation (`secrets-init.mjs`) and the coordinator entrypoint wrapper (`entrypoint-app.sh`). Trigger/ClickHouse/MinIO/Electric source their secrets through inline command wrappers in the Compose files. See `infra/secrets/README.md`. |
 | `infra/trigger/` | Vendored Trigger.dev v4.5.16 compose files. See `infra/trigger/README.md` and `infra/trigger/UPSTREAM.md`. |
 | `infra/db/compose.yaml` | Test database for local development (postgres:17.6 on port 5434). Not used by the container profile. |
 | `infra/clickhouse/` | Read-only Clickhouse configuration XML files (data-paths, override, users-override). |
@@ -28,8 +28,8 @@ networks.
 | `app` | `app` | `agencyhq-internal`, `agencyhq`, `webapp` | `secrets:ro`, `agencyhq-state`, `agencyhq-git`, `opencode-data:ro` | Coordinator + web (port 8787). Runs migrations on start. |
 | `agencyhq-postgres` | `postgres:17.6` | `agencyhq-internal` | `agencyhq-postgres` | AgencyHQ domain ledger. Separate from Trigger's postgres:14. |
 | `opencode` | `opencode` | `agencyhq` | `opencode-data`, `opencode-config` | `sleep infinity`; `docker compose exec opencode opencode auth login`. |
-| `bootstrap` | `tools` | `agencyhq`, `webapp`, `docker-proxy-build` | `secrets:ro`, `agencyhq-state` | One-shot (restart on-failure): bootstraps Trigger project; deploys task image. |
-| `docker-proxy-build` | `tecnativa/docker-socket-proxy:v0.5.0` | `docker-proxy-build` | `/var/run/docker.sock:ro` | Build-only socket proxy for bootstrap. |
+| `bootstrap` | `tools` | `agencyhq`, `webapp`, `supervisor`, `docker-proxy-build` | `secrets:ro`, `agencyhq-state` | One-shot (restart on-failure): bootstraps Trigger project; deploys task image. |
+| `docker-proxy-build` | `tecnativa/docker-socket-proxy:v0.5.0` | `docker-proxy-build` | `/var/run/docker.sock:ro` | Socket proxy for the bootstrap's image build: allows build, image, container, exec, volume and network endpoints so the Trigger CLI's buildx docker-container builder can run (the daemon's docker driver cannot be used behind the proxy; L1 2026-09-09). |
 | `webapp` | `ghcr.io/triggerdotdev/trigger.dev:v4.5.16` | `webapp`, `supervisor`, `agencyhq` | `shared`, `secrets:ro`, `agencyhq-state:ro` | Trigger.dev webapp (port 8030). |
 | `postgres` | `postgres:14` | `webapp` | `postgres` | Trigger's own database. |
 | `redis` | `redis:7` | `webapp` | `redis` | Trigger's job queue and cache. |
@@ -96,3 +96,19 @@ separate and are not affected by operating on the `agencyhq` project.
 
 The Trigger vendored files in `infra/trigger/` remain usable as a standalone
 host-profile stack. See `infra/trigger/README.md` for instructions.
+
+## Observed on Docker Desktop (L1, 2026-09-09)
+
+- The buildx builder container `buildx_buildkit_trigger0` and its `_state`
+  volume are created by the bootstrap outside the Compose project. They survive
+  `docker compose down -v` (which removes the 13 project volumes) and must be
+  removed by hand to force an uncached rebuild. The bootstrap recreates the
+  builder when its recorded configuration differs.
+- Compose prints "variable is not set" warnings for `POSTGRES_PASSWORD`,
+  `CLICKHOUSE_PASSWORD`, `MANAGED_WORKER_SECRET`, and `NODE_MAX_OLD_SPACE_SIZE`
+  on every command: the values come from the secrets volume at runtime, not
+  from the host environment. These warnings are cosmetic.
+- The registry stays empty on a single host: the Trigger CLI loads a
+  localhost-tagged image into the daemon and the supervisor runs it from there;
+  the registry catalog stayed empty throughout L1. The `registry` service
+  remains in the stack for the multi-host case (#19).

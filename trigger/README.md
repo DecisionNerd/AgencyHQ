@@ -2,9 +2,9 @@
 
 > Deployment direction: [ADR-0008](../docs/engineering/adrs/0008-compose-first-container-runtime.md) makes root Compose startup,
 > persistent OpenCode login, and disposable deployed task containers the default
-> target. Implementation is pending. The procedures and trial notes below
-> describe the current host fallback and partial container spike; they do not
-> qualify the new startup path.
+> target. Packaging, bootstrap and the task image are implemented on branch
+> `epic-14` (L1, 2026-09-09). The trial notes below describe the container
+> spike and L1 results; qualification (C1–C7) is pending.
 
 Task definitions run by `trigger dev` on the OpenCode host (host profile) and,
 by the deployed supervisor from a task image (container profile).
@@ -48,10 +48,11 @@ The image is built by `trigger deploy --local-build` using the `agencyhqToolchai
 extension from `trigger/build/toolchain.ts`. The extension runs during
 `trigger deploy` only and has no effect on `trigger dev`.
 
-**This image has not yet been built or run with this recipe.** The recipe was
-introduced in P16.1 (2026-09-09) to correct the toolchain gaps observed in the
-Slice 6 spike (see §Slice 6 history below). The first build and live trial is the
-L1 live step (Fable-main).
+**Built and run in L1 (2026-09-09).** The recipe was introduced in P16.1
+(2026-09-09) to correct the toolchain gaps observed in the Slice 6 spike (see
+§Slice 6 history below) and was first exercised in the L1 Compose trial. The
+observed toolchain layer: node v24.18.0, git 2.39.5, opencode-ai 1.18.29, pnpm
+11.25.0; uid 1000; platform linux/arm64.
 
 The image recipe (`trigger.config.ts` + `trigger/build/toolchain.ts`):
 
@@ -66,7 +67,10 @@ The image recipe (`trigger.config.ts` + `trigger/build/toolchain.ts`):
 - **Deploy-time env** (synced to the Trigger deployment, no secrets):
   `AGENCYHQ_RUNTIME_PROFILE=container`,
   `AGENCYHQ_COORDINATOR_INTERNAL_URL=http://app:8787`,
-  `AGENCYHQ_RUN_ROOT=/tmp/agencyhq`
+  `AGENCYHQ_RUN_ROOT=/tmp/agencyhq`,
+  `HOME=/home/node` — runner processes build the task environment from deploy
+  env vars, not image `ENV`; `HOME` must appear here or it is unset in the
+  runner (observed defect 23, fixed in L1).
 
 ### Machine presets
 
@@ -91,7 +95,7 @@ Machine presets are set per task and verified against `MachinePresetName` in
 | `AGENCYHQ_RUNTIME_PROFILE` | deploy.env (toolchain) | `"container"` in the deployed image |
 | `AGENCYHQ_COORDINATOR_INTERNAL_URL` | deploy.env (toolchain) | Internal coordinator URL for lease/bundle endpoints |
 | `AGENCYHQ_RUN_ROOT` | deploy.env (toolchain) / ENV | Shared run root (`/tmp/agencyhq`); created by the image recipe |
-| `HOME` | ENV (toolchain) | `/home/node`; created by the image recipe |
+| `HOME` | deploy.env (toolchain) and ENV | `/home/node`; runner processes build the task environment from deploy env vars, not image `ENV`, so `HOME` is set as a deploy env var (L1 defect 23) |
 | `AGENCYHQ_OPENCODE_BIN` | optional env var | Path to the `opencode` binary; defaults to `opencode` on PATH |
 | `AGENCYHQ_WORKTREE_BASE` | (required for coding tasks) | Base directory for worktrees and run dirs inside the container |
 | `TRIGGER_PROJECT_REF` | (required) | Trigger project reference |

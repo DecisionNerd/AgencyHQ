@@ -29,20 +29,34 @@ It prints the missing names (never the values) and exits 1.
 AGENCYHQ_PLATFORM  Expected task container platform, default "linux/arm64"
 ```
 
-### Example L1 command
+### L1 run command (2026-09-09)
+
+The script was run from the `tools` image on the stack network via:
 
 ```sh
-cd trigger
-node --import tsx/esm scripts/image-smoke.ts \
-  2>image-smoke-diag.txt | tee image-smoke-report.json
-echo "exit: $?"
+docker compose run --rm --no-deps \
+  -e TRIGGER_API_URL=http://webapp:3000 \
+  -e AGENCYHQ_FIXTURE_REMOTE=<public-fixture-https-url> \
+  -e AGENCYHQ_FIXTURE_REVISION=7a79b81 \
+  --entrypoint sh bootstrap -c \
+  'export TRIGGER_SECRET_KEY=$(cat /var/agencyhq/state/trigger-prod.key) && \
+   node --experimental-strip-types trigger/scripts/image-smoke.ts'
 ```
 
-Or with an `.env` file (Trigger SDK reads `TRIGGER_SECRET_KEY` from env):
+`TRIGGER_SECRET_KEY` is read from the state volume inside the container so no
+secret appears in the shell history. `tsx` is not installed in the task image;
+use `--experimental-strip-types` (Node.js built-in TypeScript stripping).
 
-```sh
-node --env-file .env --import tsx/esm scripts/image-smoke.ts
-```
+### Observed result (L1, 2026-09-09)
+
+Both runs COMPLETED:
+- `runtime.probe` run COMPLETED in 4,072 ms (git 2.39.5, opencode 1.18.29,
+  pnpm 11.25.0, node v24.18.0, uid 1000, platform linux/arm64).
+- `image.smoke` run COMPLETED in 6,081 ms (`fixture-node-v1` profile on
+  fixture at 7a79b81: pnpm-install@1, pnpm-typecheck@1, pnpm-test@1 all exit 0).
+
+See the [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09)
+for full evidence.
 
 ### What the script proves (for C1 / #16)
 

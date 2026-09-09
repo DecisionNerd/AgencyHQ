@@ -189,6 +189,7 @@ No secret values appear in the response.
 | bootstrap.json absent | `Bootstrap not started; run \`docker compose up -d\`` |
 | bootstrap running | `Bootstrap is running: phase deploy` |
 | bootstrap failed | `Bootstrap failed at credentials: pat_creation_failed; run \`docker compose logs bootstrap\`` |
+| bootstrap backing off | `Bootstrap is backing off until 2026-09-09T14:00:00Z (login_rate_limited)` — reported for any retried failure; `nextRetryAt` is read from `bootstrap.json` |
 | ready for login | `Ready for provider login: run \`docker compose exec opencode opencode auth login\`` |
 
 ## Running

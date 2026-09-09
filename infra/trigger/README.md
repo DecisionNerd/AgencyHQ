@@ -2,9 +2,9 @@
 
 > Deployment direction: [ADR-0008](../../docs/engineering/adrs/0008-compose-first-container-runtime.md) makes root Compose startup,
 > persistent OpenCode login, and disposable deployed task containers the default
-> target. Implementation is pending. The procedures and trial notes below
-> describe the current host fallback and partial container spike; they do not
-> qualify the new startup path.
+> target. Packaging and bootstrap are implemented on branch `epic-14` (L1,
+> 2026-09-09). The procedures below describe the host fallback; container-profile
+> startup uses the root `compose.yaml` instead.
 
 This folder holds the self-hosted Trigger.dev **webapp stack** for
 AgencyHQ's host runtime profile ([ADR-0005](../../docs/engineering/adrs/0005-trigger-as-execution-runtime.md),
@@ -251,22 +251,38 @@ Non-interactive authentication uses `TRIGGER_ACCESS_TOKEN` and `TRIGGER_API_URL`
 
 ## Pinned versions
 
-| Component | Version | Qualified by |
+| Component | Version | Status |
 | --- | --- | --- |
-| Trigger.dev webapp image | `v4.5.16` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| Trigger.dev SDK/CLI | `4.5.16` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| `postgres` | `14` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| `redis` | `7` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| `electricsql/electric` | `1.2.4` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| `clickhouse/clickhouse-server` | `26.2` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| `registry` | `2` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial); image pulled by the Docker daemon 2026-09-08 (Slice 6 spike) |
-| `bitnamilegacy/minio` | `2025.5.24-debian-12-r5` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| `busybox` (s2-init) | `1.37` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
-| `ghcr.io/s2-streamstore/s2` (s2-lite) | digest-pinned, see `.env.example` | pending: [Slice 1 execution trial](../../docs/engineering/TESTING.md#required-execution-trial) |
+| Trigger.dev webapp image | `v4.5.16` | exercised in the L1 Compose trial (2026-09-09, linux/arm64): [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09) |
+| Trigger.dev SDK/CLI | `4.5.16` | exercised in the L1 Compose trial (2026-09-09, linux/arm64): [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09) |
+| `postgres` | `14` | exercised in the L1 Compose trial (2026-09-09, linux/arm64): [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09) |
+| `redis` | `7` | exercised in the L1 Compose trial (2026-09-09, linux/arm64): [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09) |
+| `electricsql/electric` | `1.2.4` | exercised in the L1 Compose trial (2026-09-09, linux/arm64): [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09) |
+| `clickhouse/clickhouse-server` | `26.2` | exercised in the L1 Compose trial (2026-09-09, linux/arm64): [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09) |
+| `registry` | `2` | exercised in the L1 Compose trial (2026-09-09, linux/arm64): [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09) |
+| `bitnamilegacy/minio` | `2025.5.24-debian-12-r5` | exercised in the L1 Compose trial (2026-09-09, linux/arm64): [trial record](../../docs/engineering/trials/2026-09-compose.md#l1--packaging-bootstrap-and-task-image-2026-09-09) |
+| `busybox` (s2-init) | `1.37` | pending: not listed in the L1 trial digests |
+| `ghcr.io/s2-streamstore/s2` (s2-lite) | digest-pinned, see `.env.example` | pending: not listed in the L1 trial digests |
 
 ADR-0005 requires the Trigger image tag, SDK/CLI, and OpenCode versions to be
-pinned together and the execution trial rerun whenever any of them changes;
-none of the pins above have been qualified by that trial yet.
+pinned together and the execution trial rerun whenever any of them changes.
+The components listed as "exercised" above ran in the L1 Compose trial
+(2026-09-09, linux/arm64 Docker Desktop); qualification (C1–C7) remains pending.
+
+## Container-profile API_ORIGIN
+
+In the container profile, the Trigger webapp advertises `http://webapp:3000` as
+its `API_ORIGIN`. The Trigger CLI and runner processes take the API URL from the
+webapp's project-env response, so they dial `http://webapp:3000` inside the
+container network. On the host profile, `API_ORIGIN=http://localhost:8030` is
+set in the env file so the host-side `trigger dev` process dials the published
+port.
+
+The Trigger webapp, worker stack container (supervisor), ClickHouse, MinIO,
+Electric, and Trigger Postgres source their secrets through inline
+`command:`/`entrypoint:` wrappers in `docker-compose.yml`,
+`docker-compose.worker.yml`, and `infra/agencyhq/trigger-overrides.yaml` (each
+tolerant of a missing file so the host profile is unaffected).
 
 ## Sources
 

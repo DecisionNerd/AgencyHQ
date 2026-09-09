@@ -167,7 +167,9 @@ on it.
 
 ## Compose-first container runtime
 
-**Current priority; implementation pending.**
+**Current priority; in progress.** Packaging/bootstrap (#15) and the task image
+(#16) are implemented on branch `epic-14` with L1 live evidence (2026-09-09);
+#17–#20 are open.
 [ADR-0008](../engineering/adrs/0008-compose-first-container-runtime.md) records
 the accepted default: `docker compose up -d` plus first-use OpenCode login,
 with persistent state and disposable deployed task containers. Slices 1–6
@@ -185,8 +187,8 @@ Tracker: [#14 — Compose-first container runtime](https://github.com/DecisionNe
 
 | Issue | Work | Blocked by |
 | --- | --- | --- |
-| [#15](https://github.com/DecisionNerd/AgencyHQ/issues/15) | Package and bootstrap the full local stack with one Docker Compose command | None |
-| [#16](https://github.com/DecisionNerd/AgencyHQ/issues/16) | Build and register a runnable pinned task image for all AgencyHQ execution stages | None |
+| [#15](https://github.com/DecisionNerd/AgencyHQ/issues/15) | Package and bootstrap the full local stack with one Docker Compose command — implemented on epic-14; L1 evidence | None |
+| [#16](https://github.com/DecisionNerd/AgencyHQ/issues/16) | Build and register a runnable pinned task image for all AgencyHQ execution stages — implemented on epic-14; L1 evidence | None |
 | [#17](https://github.com/DecisionNerd/AgencyHQ/issues/17) | Persist OpenCode provider login and deliver it to disposable task containers | [#16](https://github.com/DecisionNerd/AgencyHQ/issues/16), [#15](https://github.com/DecisionNerd/AgencyHQ/issues/15) |
 | [#18](https://github.com/DecisionNerd/AgencyHQ/issues/18) | Refactor task inputs and recovery around portable Git artifacts and durable evidence | [#16](https://github.com/DecisionNerd/AgencyHQ/issues/16) |
 | [#19](https://github.com/DecisionNerd/AgencyHQ/issues/19) | Enable replicated deployed task execution with verified runtime capabilities | [#17](https://github.com/DecisionNerd/AgencyHQ/issues/17), [#18](https://github.com/DecisionNerd/AgencyHQ/issues/18) |

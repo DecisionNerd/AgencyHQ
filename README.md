@@ -27,22 +27,26 @@ docker compose up -d
 docker compose exec opencode opencode auth login
 ```
 
-**Implementation pending:** there is no root Compose file or `opencode`
-service yet. These commands define the target, not today's runnable setup.
-Only Git, Docker with Compose, and a browser are required on the host. Docker
-will build and start the full stack, run migrations, configure internal
-credentials, bootstrap Trigger, and register the worker image. OpenCode handles
-first-use provider login; authentication and project data survive restarts.
+**Implemented on branch `epic-14`; qualification pending.** The root
+`compose.yaml`, `opencode` service, `bootstrap` container, and task image build
+are implemented and were exercised in L1 (2026-09-09, linux/arm64 Docker
+Desktop, one host): fresh install, image build and registration, restart with
+volumes untouched, and interrupted bootstrap recovered without duplicate
+org/project/token. Provider login and real repair have not yet been exercised;
+qualification C1–C7 (multi-platform, provider lifecycle, real repair, artifact
+integrity, capacity, stop/loss) is pending. See [trial record](docs/engineering/trials/2026-09-compose.md).
 
-Open AgencyHQ, complete any remaining provider or repository setup, and start
-work. The UI will distinguish service health, provider login, and available
-workers. Trigger will launch disposable task containers from the same image as
-eligible concurrency grows, preserving evidence and checkpoints outside the
-containers. No separate host runner or per-task login is required by default.
+Only Git and Docker with Compose are required on the host. Docker builds and
+starts the full stack, runs migrations, configures internal credentials,
+bootstraps Trigger, and registers the worker image. OpenCode handles first-use
+provider login; authentication and project data survive restarts.
+
+`/api/readiness` returns `provider` and `worker` as `"unknown"` until issues
+#17 and #19 supply real data; a `nextAction` sentence describes what to do.
 
 See [ADR-0008](docs/engineering/adrs/0008-compose-first-container-runtime.md)
 for the specification and the [implementation roadmap](docs/strategy/roadmap.md#compose-first-container-runtime)
-for tracked work. The host setup below remains a fallback while this is built.
+for tracked work. The host setup below remains the runnable fallback.
 
 ## Current installation (host fallback)
 
