@@ -178,6 +178,12 @@ function watchForSessionId(
 
 export const workerAttempt = task({
   id: TASK_IDS.workerAttempt,
+  // medium-1x: coding attempts need 2 GB for git, opencode, and the model
+  // client. MachinePresetName verified from schemas/common.d.ts (read 2026-09-09):
+  //   node_modules/.pnpm/@trigger.dev+core@4.5.16_supports-color@10.2.2/
+  //   node_modules/@trigger.dev/core/dist/commonjs/v3/schemas/common.d.ts
+  // machine field on task verified from types/tasks.d.ts (read 2026-09-09).
+  machine: "medium-1x",
   maxDuration: 600,
   queue: { name: "worker", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },

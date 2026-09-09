@@ -397,14 +397,14 @@ test("createWorkItem (S-7): manifest entry resolves expectedBaseRevision from en
         [workItemId],
       );
       assert.equal(rows.length, 1, "one work_item_projects row");
-      assert.equal(rows[0]!.target_ref, "release/v2", "target_ref = release/v2");
+      assert.equal(rows[0]?.target_ref, "release/v2", "target_ref = release/v2");
       assert.equal(
-        rows[0]!.expected_base_revision,
+        rows[0]?.expected_base_revision,
         releaseSha,
         "expected_base_revision must come from allowed_refs['release/v2'], not allowed_refs['main']",
       );
       assert.notEqual(
-        rows[0]!.expected_base_revision,
+        rows[0]?.expected_base_revision,
         mainSha,
         "expected_base_revision must NOT be the main ref SHA",
       );

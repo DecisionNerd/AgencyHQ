@@ -131,6 +131,7 @@ test("PROFILE_CATALOG: all expected ids are present", () => {
     "multi-repo-v1",
     "node-pnpm-v2",
     "multi-repo-v2",
+    "fixture-node-v1",
   ];
   for (const id of expected) {
     assert.ok(PROFILE_CATALOG[id] !== undefined, `PROFILE_CATALOG missing "${id}"`);

@@ -1,0 +1,17 @@
+{
+  "name": "@agencyhq/bootstrap",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "bootstrap": "./src/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.ts'"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "^5.9"
+  }
+}

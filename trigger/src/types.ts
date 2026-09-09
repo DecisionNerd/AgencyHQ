@@ -1,11 +1,91 @@
-export type SpikeEchoPayload = {
-  message: string;
+/** Payload for the `runtime.probe` task (no required fields). */
+export type RuntimeProbePayload = Record<string, never>;
+
+/** Output of the `runtime.probe` task. */
+export type RuntimeProbeOutput = {
+  /** Tool version strings; "unavailable: <reason>" when the binary is not found. */
+  tools: {
+    git: string;
+    opencode: string;
+    pnpm: string;
+    node: string;
+  };
+  /** Current process uid (uid 1000 = node user in a container image). */
+  uid: string;
+  /** Value of process.env.HOME. */
+  home: string;
+  /** Whether HOME is writable (create-and-remove temp file test). */
+  homeWritable: boolean;
+  /** Whether AGENCYHQ_RUN_ROOT is writable (create-and-remove temp file test). */
+  runRootWritable: boolean;
+  /** "platform/arch" string, e.g. "linux/arm64". */
+  platform: string;
+  /** process.cwd() at task start. */
+  cwd: string;
+  /** Sorted env var names (keys only — no values are returned). */
+  envKeys: string[];
 };
 
 export const TASK_IDS = {
-  spikeEcho: "spike.echo",
+  runtimeProbe: "runtime.probe",
   workerAttempt: "worker.attempt",
+  imageSmoke: "image.smoke",
 } as const;
+
+// ---------------------------------------------------------------------------
+// image.smoke task types (P16.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Payload for the `image.smoke` task.
+ *
+ * The task clones the public fixture repository at the given revision inside
+ * the run root, then runs the named verification profile's checks through the
+ * @agencyhq/verification runCheck helper using the scrubbed child environment.
+ * It returns one ImageSmokeCheckResult per check.
+ *
+ * This task is only used by the image smoke script (trigger/scripts/image-smoke.ts)
+ * to prove the task image toolchain.  It is never dispatched as part of the
+ * production work flow.
+ */
+export type ImageSmokePayload = {
+  /** Public git remote URL for the fixture repository. */
+  fixtureRemote: string;
+  /** Git revision (branch name, tag, or commit SHA) to check out. */
+  fixtureRevision: string;
+  /**
+   * Verification profile id to run against the clone.
+   * Expected: "fixture-node-v1".
+   */
+  profileId: string;
+};
+
+/** Result of one check run inside the image.smoke task. */
+export type ImageSmokeCheckResult = {
+  /** Check catalog id, e.g. "pnpm-install@1". */
+  checkId: string;
+  /**
+   * Whether the check passed.
+   * Uses the check's passWhen predicate if defined; otherwise exit status 0.
+   */
+  passed: boolean;
+  /** Process exit code, or null when the process could not be spawned. */
+  exitStatus: number | null;
+  /** Last N bytes of stdout (ring-buffer bounded). */
+  stdoutTail: string;
+  /** Last N bytes of stderr (ring-buffer bounded). */
+  stderrTail: string;
+  /** True when the check was killed due to timeout. */
+  timedOut: boolean;
+};
+
+/** Output of the `image.smoke` task. */
+export type ImageSmokeOutput = {
+  /** Absolute path to the cloned fixture directory inside the run root. */
+  cloneDir: string;
+  /** One result per check in the profile, in profile order. */
+  results: ImageSmokeCheckResult[];
+};
 
 // Appended for the worker.attempt spike libraries (trigger/src/lib/**). See
 // trigger/src/lib/opencode.ts for the OpenCode facts these types encode.

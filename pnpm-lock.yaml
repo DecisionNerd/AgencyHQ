@@ -18,6 +18,15 @@ importers:
         specifier: ^5.9
         version: 5.9.3
 
+  apps/bootstrap:
+    devDependencies:
+      '@types/node':
+        specifier: ^24
+        version: 24.13.3
+      typescript:
+        specifier: ^5.9
+        version: 5.9.3
+
   apps/coordinator:
     dependencies:
       '@agencyhq/contracts':

@@ -37,9 +37,9 @@ describe("readStopEvidence (H-1)", () => {
       await writeFile(join(dir, "stop.ndjson"), REAL_CONTENT, "utf-8");
       const result = await readStopEvidence(dir);
       assert.ok(result !== null, "should return non-null");
-      assert.deepEqual(result!.survivors, [], "survivors should be empty");
+      assert.deepEqual(result?.survivors, [], "survivors should be empty");
       assert.equal(
-        result!.checkpointCommit,
+        result?.checkpointCommit,
         "9324b35f5a5edc791bc8d3a5b4a2b172ce93ea92",
         "checkpointCommit from step:checkpoint line",
       );
@@ -59,8 +59,8 @@ describe("readStopEvidence (H-1)", () => {
       await writeFile(join(dir, "stop.ndjson"), content, "utf-8");
       const result = await readStopEvidence(dir);
       assert.ok(result !== null, "should return non-null");
-      assert.deepEqual(result!.survivors, [123], "survivors should be [123]");
-      assert.equal(result!.checkpointCommit, undefined, "no checkpoint commit");
+      assert.deepEqual(result?.survivors, [123], "survivors should be [123]");
+      assert.equal(result?.checkpointCommit, undefined, "no checkpoint commit");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -77,8 +77,8 @@ describe("readStopEvidence (H-1)", () => {
       await writeFile(join(dir, "stop.ndjson"), legacy, "utf-8");
       const result = await readStopEvidence(dir);
       assert.ok(result !== null, "should return non-null for legacy format");
-      assert.deepEqual(result!.survivors, []);
-      assert.equal(result!.checkpointCommit, "legacycommitabc");
+      assert.deepEqual(result?.survivors, []);
+      assert.equal(result?.checkpointCommit, "legacycommitabc");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

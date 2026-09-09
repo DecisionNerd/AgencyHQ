@@ -72,6 +72,13 @@ async function buildFingerprint(): Promise<Record<string, string>> {
 
 export const verifyRun = task({
   id: "verify.run",
+  // medium-1x: verification materialises worktrees and runs check scripts;
+  // 2 GB guards against memory-hungry check toolchains. MachinePresetName
+  // verified from schemas/common.d.ts (read 2026-09-09):
+  //   node_modules/.pnpm/@trigger.dev+core@4.5.16_supports-color@10.2.2/
+  //   node_modules/@trigger.dev/core/dist/commonjs/v3/schemas/common.d.ts
+  // machine field on task verified from types/tasks.d.ts (read 2026-09-09).
+  machine: "medium-1x",
   maxDuration: 1200,
   queue: { name: "verify", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },

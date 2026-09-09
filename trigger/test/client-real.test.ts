@@ -413,13 +413,70 @@ test("subscribe() respects AbortSignal to stop iteration", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// E-4: lazy secret-key provider
+// ---------------------------------------------------------------------------
+
+test("key absent at construction → present later → first trigger call uses the key", async () => {
+  // Simulate a fresh-start coordinator: key is empty when the runtime is built.
+  let currentKey = "";
+  const sdk = makeFakeSdk();
+
+  const rt = new RealExecutionRuntime(
+    { apiUrl: "http://webapp:3030", secretKey: () => currentKey },
+    sdk,
+  );
+
+  // No configure call yet (key was empty).
+  const configureCallsBefore = sdk.calls.filter((c) => c.method === "configure").length;
+  assert.equal(configureCallsBefore, 0, "configure must not be called when key is empty");
+
+  // Bootstrap writes the key later.
+  currentKey = "tr_prod_live_key";
+
+  // First trigger call must pick up the new key.
+  await rt.trigger({
+    intentId: "e4-test",
+    task: "worker.attempt",
+    payload: {},
+    options: { idempotencyKey: "e4-idem" },
+  });
+
+  const configureCalls = sdk.calls.filter((c) => c.method === "configure");
+  assert.equal(configureCalls.length, 1, "configure must be called exactly once after key appears");
+  const opts = configureCalls[0]?.args[0] as { baseURL: string; secretKey: string };
+  assert.equal(opts.baseURL, "http://webapp:3030");
+  assert.equal(opts.secretKey, "tr_prod_live_key");
+});
+
+test("non-empty key at construction → configure called immediately, not again on trigger", async () => {
+  const sdk = makeFakeSdk();
+  const rt = new RealExecutionRuntime(
+    { apiUrl: "http://webapp:3030", secretKey: "tr_already_set" },
+    sdk,
+  );
+
+  const configureBefore = sdk.calls.filter((c) => c.method === "configure").length;
+  assert.equal(configureBefore, 1, "configure called once at construction");
+
+  await rt.trigger({
+    intentId: "e4b-test",
+    task: "worker.attempt",
+    payload: {},
+    options: { idempotencyKey: "e4b-idem" },
+  });
+
+  const configureAfter = sdk.calls.filter((c) => c.method === "configure").length;
+  assert.equal(configureAfter, 1, "configure not called again when key unchanged");
+});
+
+// ---------------------------------------------------------------------------
 // Live test (skipped unless TRIGGER_LIVE=1)
 // ---------------------------------------------------------------------------
 
 test("live trigger roundtrip", { skip: !process.env.TRIGGER_LIVE }, async () => {
   // This test requires TRIGGER_LIVE=1 plus TRIGGER_API_URL and
   // TRIGGER_SECRET_KEY set in the environment.  It triggers the
-  // `spike.echo` task (registered in trigger/src/tasks/) and waits for
+  // `runtime.probe` task (registered in trigger/src/tasks/) and waits for
   // a non-QUEUED status.  Do not run it in CI.
   const { RealExecutionRuntime: RT } = await import("../src/client/real.ts");
 
@@ -431,8 +488,8 @@ test("live trigger roundtrip", { skip: !process.env.TRIGGER_LIVE }, async () => 
 
   const { runId } = await rt.trigger({
     intentId: "live-test-intent",
-    task: "spike.echo",
-    payload: { msg: "hello" },
+    task: "runtime.probe",
+    payload: {},
     options: { idempotencyKey: `live-test-${Date.now()}` },
   });
   assert.ok(runId, "should have a runId");
@@ -455,7 +512,7 @@ test("live subscribe: receives at least one observation for a triggered run", {
   skip: !process.env.TRIGGER_LIVE,
 }, async () => {
   // Requires TRIGGER_LIVE=1, TRIGGER_API_URL and TRIGGER_SECRET_KEY.
-  // Triggers spike.echo with a unique tag, subscribes, and expects at least
+  // Triggers runtime.probe with a unique tag, subscribes, and expects at least
   // one observation before timing out.  This is a wake-up hint test only —
   // the caller is expected to fall back to polling if needed.
   const { RealExecutionRuntime: RT } = await import("../src/client/real.ts");
@@ -477,8 +534,8 @@ test("live subscribe: receives at least one observation for a triggered run", {
   // Trigger a run with the unique tag after starting the subscription
   const { runId } = await rt.trigger({
     intentId: "live-subscribe-intent",
-    task: "spike.echo",
-    payload: { msg: "hello-subscribe" },
+    task: "runtime.probe",
+    payload: {},
     options: {
       idempotencyKey: `live-subscribe-${Date.now()}`,
       tags: [uniqueTag],

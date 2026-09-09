@@ -1,0 +1,42 @@
+# Root Compose entry point for the AgencyHQ container runtime profile.
+#
+# Usage:
+#   docker compose up -d                  # start (or resume) the full stack
+#   docker compose exec opencode opencode auth login  # provider setup (first time)
+#   docker compose down                   # stop (data volumes preserved)
+#   docker compose down -v                # full reset (all data volumes removed)
+#
+# Host profile (trigger dev) fallback — separate project, separate volumes:
+#   docker compose \
+#     -f infra/trigger/docker-compose.yml \
+#     -f infra/trigger/docker-compose.worker.yml \
+#     --env-file infra/trigger/.env up -d
+#   The host profile uses project name "trigger"; the agencyhq project name
+#   here differs, so all volumes are independent and both can coexist.
+#
+# See infra/README.md for the service map.
+# See infra/secrets/README.md for how internal credentials are managed.
+
+name: agencyhq
+
+include:
+  # Trigger.dev webapp stack: webapp, postgres (trigger), redis, electric,
+  # clickhouse, registry, minio, s2-init, s2. Vendored from v4.5.16 with
+  # edits documented in infra/trigger/UPSTREAM.md.
+  # Container-profile settings (secrets wrappers, SMTP, platform, telemetry)
+  # are applied directly in this file — see UPSTREAM.md § edits 8–9.
+  - path:
+      - infra/trigger/docker-compose.yml
+      - infra/agencyhq/trigger-overrides.yaml
+
+  # Trigger.dev worker stack: supervisor (Trigger worker stack container)
+  # and docker-proxy. Vendored from v4.5.16 with agencyhq edits.
+  # Container-profile settings (DOCKER_RUNNER_NETWORKS, DOCKER_PLATFORM,
+  # secrets wrapper) are applied directly in this file — see UPSTREAM.md § edit 9.
+  - path:
+      - infra/trigger/docker-compose.worker.yml
+      - infra/agencyhq/trigger-worker-overrides.yaml
+
+  # AgencyHQ application services: secrets-init, app, agencyhq-postgres,
+  # opencode, bootstrap, docker-proxy-build.
+  - path: infra/agencyhq/compose.yaml

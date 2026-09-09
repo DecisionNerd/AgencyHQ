@@ -15,10 +15,11 @@ import { CHECK_CATALOG, profileDigest, resolveProfile } from "@agencyhq/verifica
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.ts";
 import { commandHandlers } from "./commands/index.ts";
-import { loadConfig } from "./config.ts";
+import { loadConfig, readTriggerKeyFromState } from "./config.ts";
 import { BoundedRepairFlow } from "./flow/bounded-repair.ts";
 import { Reconciler } from "./flow/observe.ts";
 import type { FlowDeps } from "./flow/types.ts";
+import { loadReadinessInputs } from "./readiness/loader.ts";
 
 // ---------------------------------------------------------------------------
 // Start
@@ -42,9 +43,19 @@ const pool = createPool(config.databaseUrl);
 let runtime: FakeExecutionRuntime | RealExecutionRuntime;
 
 if (config.runtime === "real") {
+  // Resolve the key lazily so the coordinator can start before bootstrap writes
+  // trigger-prod.key. The provider reads trigger-prod.key from disk lazily;
+  // once a non-empty value is found it is memoized so subsequent calls skip
+  // the filesystem read even before _ensureConfigured() memoizes the key for configure.
+  let _memoizedKey = "";
   runtime = new RealExecutionRuntime({
     apiUrl: config.triggerApiUrl,
-    secretKey: config.triggerSecretKey,
+    secretKey: () => {
+      if (!_memoizedKey) {
+        _memoizedKey = config.triggerSecretKey || readTriggerKeyFromState(config.stateDir) || "";
+      }
+      return _memoizedKey;
+    },
   });
 } else {
   runtime = new FakeExecutionRuntime();
@@ -113,6 +124,15 @@ const commands = commandHandlers({
   },
 });
 
+// Wire the readiness loader — re-reads state files on every poll (lazy, no restart needed).
+const readinessLoader = () =>
+  loadReadinessInputs({
+    pool,
+    triggerApiUrl: config.triggerApiUrl,
+    triggerSecretKey: config.triggerSecretKey,
+    stateDir: config.stateDir,
+  });
+
 // Build and serve the app
 const app = createApp({
   pool,
@@ -128,6 +148,7 @@ const app = createApp({
   runtime,
   config,
   commands,
+  loadReadiness: readinessLoader,
 });
 
 const server = serve({

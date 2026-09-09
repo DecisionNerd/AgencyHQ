@@ -2,17 +2,17 @@
 
 > Deployment direction: [ADR-0008](../docs/engineering/adrs/0008-compose-first-container-runtime.md) makes root Compose startup,
 > persistent OpenCode login, and disposable deployed task containers the default
-> target. Implementation is pending. The procedures and trial notes below
-> describe the current host fallback and partial container spike; they do not
-> qualify the new startup path.
+> target. Packaging, bootstrap and the task image are implemented on branch
+> `epic-14` (L1, 2026-09-09). The trial notes below describe the container
+> spike and L1 results; qualification (C1–C7) is pending.
 
 Task definitions run by `trigger dev` on the OpenCode host (host profile) and,
-later, by the deployed supervisor from a task image (container profile).
+by the deployed supervisor from a task image (container profile).
 Tasks: `lead.plan`, `worker.attempt`, `verify.run`, `lead.review`,
-`lead.accept`, `integrate.merge`. Each is a thin adapter with no policy: it
-does the work, reports progress through run metadata, returns structured
-output, and throws `AbortTaskRunError` on contract failures so Trigger does
-not retry them. `worker.attempt` performs the worktree-scrub-run-diff-commit
+`lead.accept`, `integrate.merge`, `runtime.probe`, `image.smoke`. Each is a thin adapter with
+no policy: it does the work, reports progress through run metadata, returns
+structured output, and throws `AbortTaskRunError` on contract failures so Trigger
+does not retry them. `worker.attempt` performs the worktree-scrub-run-diff-commit
 sequence and the `onCancel` checkpoint-and-kill sequence in ADR-0007. Pin the
 Trigger image, SDK/CLI, and OpenCode versions together.
 
@@ -20,17 +20,18 @@ Trigger image, SDK/CLI, and OpenCode versions together.
 
 The `@agencyhq/trigger` workspace package pins `@trigger.dev/sdk` and
 `trigger.dev` at `4.5.16`. `trigger.config.ts` declares the project ref (from
-`TRIGGER_PROJECT_REF`), task directory (`./src/tasks`), Node runtime,
+`TRIGGER_PROJECT_REF`), task directory (`./src/tasks`), `runtime: "node-24"`,
 `maxDuration: 900`, and single-attempt retries with `enabledInDev: false`.
 
-`src/tasks/spike-echo.ts` defines a single throwaway task, `spike.echo`,
-that echoes its payload message alongside the sorted environment variable
-key list and the running Node version — used to inspect what a task process
-can see under the host profile. `scripts/echo.ts` triggers that task against
-a running Trigger instance (`TRIGGER_API_URL`, `TRIGGER_SECRET_KEY`) and
-polls `runs.retrieve` for a final status. `test/smoke.test.ts` is a
-`node --test` smoke check that the package's types import cleanly under
-Node's built-in TypeScript type stripping.
+`src/tasks/runtime-probe.ts` defines `runtime.probe`, the diagnostic task that
+reports tool versions (`git`, `opencode`, `pnpm`, `node`), uid, HOME, writable
+status of HOME and `AGENCYHQ_RUN_ROOT`, platform, cwd, and sorted env variable
+names (keys only, never values). It is the first live signal that the task image
+is correctly configured. `scripts/echo.ts` triggers that task against a running
+Trigger instance (`TRIGGER_API_URL`, `TRIGGER_SECRET_KEY`) and polls
+`runs.retrieve` for a final status. `test/smoke.test.ts` is a `node --test`
+smoke check that the package's types import cleanly under Node's built-in
+TypeScript type stripping.
 
 See `.env.example` for the environment variables these scripts and
 `trigger dev` expect.
@@ -41,78 +42,92 @@ The container profile runs each task in its own Docker container managed by the
 trigger.dev worker stack (supervisor + docker-proxy). Task images are built with
 `trigger deploy` using the build extensions declared in `trigger.config.ts`.
 
-### Deploy build configuration
+### Task image recipe
 
-`trigger.config.ts` declares two build extensions that run only during
-`trigger deploy` — they have no effect on `trigger dev`:
+The image is built by `trigger deploy --local-build` using the `agencyhqToolchain()`
+extension from `trigger/build/toolchain.ts`. The extension runs during
+`trigger deploy` only and has no effect on `trigger dev`.
 
-- **`aptGet({ packages: ["git"] })`** — installs the `git` binary inside the
-  task image via apt-get. Required because `worker.attempt` calls `git
-  worktree add`, `git diff`, and `git commit` inside the container.
-- **`additionalPackages({ packages: ["opencode-ai@1.18.29"] })`** — installs
-  the `opencode` CLI from npm at the pinned version (1.18.29, matching the host
-  OpenCode version qualified by the Slice 1 trial). Required because
-  `worker.attempt` calls `spawnOpenCode` to run the agent.
+**Built and run in L1 (2026-09-09).** The recipe was introduced in P16.1
+(2026-09-09) to correct the toolchain gaps observed in the Slice 6 spike (see
+§Slice 6 history below) and was first exercised in the L1 Compose trial. The
+observed toolchain layer: node v24.18.0, git 2.39.5, opencode-ai 1.18.29, pnpm
+11.25.0; uid 1000; platform linux/arm64.
 
-Both extensions are `BuildExtension` types from `@trigger.dev/build/extensions/core`
-(verified from the installed .d.ts and https://trigger.dev/docs/config/extensions/aptGet,
-read 2026-09-08). The JSDoc for `additionalPackages` states "when deploying".
+The image recipe (`trigger.config.ts` + `trigger/build/toolchain.ts`):
+
+- **Runtime:** `node-24` (matches workspace `engines: ">=24"` and host Node 24.16.0).
+- **System packages** (apt-get): `git`, `ca-certificates`.
+- **Global npm installs** (run as root in the base stage):
+  `opencode-ai@1.18.29` and `pnpm@11.25.0` — both land in `/usr/local/bin`
+  which is on PATH for uid 1000 (node). Pinned versions exported as
+  `OPENCODE_VERSION` and `PNPM_VERSION` constants from `trigger/build/toolchain.ts`.
+- **Directory setup** (run as root): `mkdir -p /home/node /tmp/agencyhq && chown 1000:1000 ...`
+- **ENV:** `HOME=/home/node`, `AGENCYHQ_RUN_ROOT=/tmp/agencyhq`
+- **Deploy-time env** (synced to the Trigger deployment, no secrets):
+  `AGENCYHQ_RUNTIME_PROFILE=container`,
+  `AGENCYHQ_COORDINATOR_INTERNAL_URL=http://app:8787`,
+  `AGENCYHQ_RUN_ROOT=/tmp/agencyhq`,
+  `HOME=/home/node` — runner processes build the task environment from deploy
+  env vars, not image `ENV`; `HOME` must appear here or it is unset in the
+  runner (observed defect 23, fixed in L1).
+
+### Machine presets
+
+Machine presets are set per task and verified against `MachinePresetName` in
+`@trigger.dev/core@4.5.16` `schemas/common.d.ts` (read 2026-09-09):
+
+| Task | Preset | Rationale |
+| --- | --- | --- |
+| `worker.attempt` | `medium-1x` | Coding attempts need 2 GB for git, opencode, and model client |
+| `verify.run` | `medium-1x` | Verification materialises worktrees and runs check scripts |
+| `integrate.merge` | `medium-1x` | Integration clones and pushes repositories |
+| `lead.plan` | `small-2x` | Single OpenCode serve session; 2 vCPU / 1 GB sufficient |
+| `lead.review` | `small-2x` | Single OpenCode serve session with diff context |
+| `lead.accept` | `small-2x` | Single OpenCode serve session with criteria context |
+| `runtime.probe` | `small-1x` | Lightweight diagnostics; no model or git operations |
+| `image.smoke` | `small-2x` | Clone public fixture + run fixture-node-v1 checks; ships in the production deployment (8 tasks total); any prod-key holder can trigger it. |
 
 ### Environment the deployed tasks expect
 
-| Variable | Default | Purpose |
+| Variable | Source | Purpose |
 | --- | --- | --- |
-| `AGENCYHQ_OPENCODE_BIN` | `opencode` (on PATH) | Path to the `opencode` binary inside the container; defaults to the `opencode` installed by `additionalPackages`. |
-| `AGENCYHQ_WORKTREE_BASE` | (required) | Base directory for worktrees and run directories inside the container. |
-| `TRIGGER_PROJECT_REF` | (required) | Trigger project reference, set via Trigger environment variables in the dashboard. |
+| `AGENCYHQ_RUNTIME_PROFILE` | deploy.env (toolchain) | `"container"` in the deployed image |
+| `AGENCYHQ_COORDINATOR_INTERNAL_URL` | deploy.env (toolchain) | Internal coordinator URL for lease/bundle endpoints |
+| `AGENCYHQ_RUN_ROOT` | deploy.env (toolchain) / ENV | Shared run root (`/tmp/agencyhq`); created by the image recipe |
+| `HOME` | deploy.env (toolchain) and ENV | `/home/node`; runner processes build the task environment from deploy env vars, not image `ENV`, so `HOME` is set as a deploy env var (L1 defect 23) |
+| `AGENCYHQ_OPENCODE_BIN` | optional env var | Path to the `opencode` binary; defaults to `opencode` on PATH |
+| `AGENCYHQ_WORKTREE_BASE` | (required for coding tasks) | Base directory for worktrees and run dirs inside the container |
+| `TRIGGER_PROJECT_REF` | (required) | Trigger project reference |
 
-Provider credentials (API keys for model providers) must be supplied as Trigger
-environment variables in the dashboard — they are never baked into the image.
-The earlier spike supplied no host authentication to task containers. ADR-0008
-supersedes the API-key-only target: OpenCode-managed API-key and supported
-interactive login flows must persist through a setup service and be explicitly
-delivered to the actual task containers, with refresh/logout tests. This is
-pending implementation; do not assume supervisor mounts reach task containers.
+Provider credentials (API keys for model providers) will be delivered by a coordinator lease (issue #17, not implemented in this PR); today runner containers have no provider credentials. They are never baked into the image.
 
-### Slice 6 container spike (2026-09-08, partial)
+### Slice 6 container spike (2026-09-08, historical record)
+
+The Slice 6 spike ran the then-named `spike.echo` task (since replaced by
+`runtime.probe`) to probe the container environment.
 
 **Observed:**
 
 - Supervisor v4.5.16 + docker-proxy v0.5.0 started as a trigger worker stack
   overlay alongside the running webapp stack.
-- The trigger worker stack supervisor (v4.5.16) read the bootstrap worker token
-  from the shared volume at `/home/node/shared/worker_token` and connected to
-  the trigger.dev platform ("Connected to platform" — `s6/supervisor-boot.log`).
 - First `trigger deploy --local-build` failed at the indexer stage: "Failed to
-  fetch environment variables: Connection error." The CLI rewrites
-  localhost→host.docker.internal and adds
-  `--add-host host.docker.internal:192.168.1.173` (buildImage.js:744-768 of
-  trigger.dev 4.5.16, read 2026-09-08) while the webapp is published on
-  127.0.0.1 only (`WEBAPP_PUBLISH_IP`). With a user-approved temporary TCP
-  forwarder on the LAN IP the deploy succeeded: version 20260908.2, 7 tasks,
+  fetch environment variables: Connection error." With a user-approved temporary
+  TCP forwarder on the LAN IP the deploy succeeded: version 20260908.2, 7 tasks,
   image 238.78 MB (linux/amd64 on arm64 host) pushed to localhost:5001 and
-  promoted current for prod (`s6/deploy-2.log`).
-- `spike.echo` run run_cmtt9txxd00hl3qp3tygv0v2k: DEQUEUED 22:58:53Z, EXECUTING 22:58:59Z, COMPLETED 22:59:02Z. Container runner-cmtt9txxd… pulled the image from localhost:5001 and exited 0 (trigger worker stack `s6/supervisor-run.log`).
-- Inside the container (`s6/container-spike-echo.log`): git 2.39.5 present;
-  node v21.7.3 (image node, not host v24); cwd /app; uid 1000; HOME unset;
-  platform linux/x64 (amd64 image emulated on arm64 host); env =
-  TRIGGER_*/OTEL_*/NODE_* only (no host environment, no SSH agent, no git
-  credential helper, no OpenCode auth).
+  promoted current for prod.
+- `spike.echo` run run_cmtt9txxd00hl3qp3tygv0v2k completed in ~9 s.
+  Inside the container: git 2.39.5 present; node v21.7.3 (image node, not host
+  v24); cwd /app; uid 1000; HOME unset; platform linux/x64 (amd64 emulated on
+  arm64 host).
 
-**Not observed:**
+**Gaps identified (corrected by P16.1 / this toolchain recipe):**
 
-- `opencode` and `pnpm` on PATH inside the container (ENOENT). Build extension
-  `additionalPackages({opencode-ai})` installs the package into
-  /app/node_modules but does not add the binary to PATH — this is the
-  build-extension gap that must be closed before `worker.attempt` can run in a
-  container. Next step: configure the extension or entrypoint to put the binary
-  on PATH.
-- `worker.attempt` executing inside a container (OpenCode not runnable via PATH;
-  adapters also need a local repository path — no clone-from-remote step exists).
-- Push token handling (generation-bound token issuance for container profile
-  attempts).
-- PAT push from a container.
-- Provider credentials as Trigger env vars.
+- `opencode` and `pnpm` not on PATH (`additionalPackages` placed the binary in
+  `/app/node_modules` but not on PATH — corrected by `npm install -g`).
+- Node v21 in the image, not Node 24 — corrected by `runtime: "node-24"`.
+- HOME unset — corrected by `ENV HOME=/home/node`.
+- No writable home or run root — corrected by the `mkdir`/`chown` step.
 
 ## Libraries
 

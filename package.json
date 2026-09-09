@@ -7,7 +7,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "check": "node --test tests/architecture-baseline.test.mjs tests/dependency-rules.test.mjs",
+    "check": "node --test tests/architecture-baseline.test.mjs tests/dependency-rules.test.mjs tests/compose-config.test.mjs tests/no-session-paths.test.mjs infra/tests/secrets-init.test.mjs",
     "test": "pnpm check && pnpm lint && pnpm typecheck && pnpm test:unit",
     "test:all": "pnpm test && pnpm test:integration",
     "typecheck": "pnpm -r --if-present typecheck",

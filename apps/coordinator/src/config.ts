@@ -3,7 +3,22 @@
  *
  * Reads environment variables and returns a validated config object.
  * Never logs secret values; validation errors list missing variable names only.
+ *
+ * Secret resolution precedence (env wins):
+ *   1. Environment variable (always highest priority)
+ *   2. <AGENCYHQ_SECRETS_DIR>/<NAME>.env — single-line file in `NAME=value` format
+ *   3. <AGENCYHQ_SECRETS_DIR>/<NAME> — raw file (trimmed)
+ *   4. Existing default / required behaviour
+ *
+ * TRIGGER_SECRET_KEY and TRIGGER_API_URL additionally fall back to
+ * <AGENCYHQ_STATE_DIR>/trigger-prod.key (and trigger-api-url respectively)
+ * which are written by the bootstrap after it completes.  These are read at
+ * config-load time; the readiness loader re-reads them on every poll so the
+ * app can start before the bootstrap finishes without requiring a restart.
  */
+
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 export type CoordinatorConfig = {
   databaseUrl: string;
@@ -40,6 +55,18 @@ export type CoordinatorConfig = {
   bindHost: string;
   /** Bearer token for /api/* authentication. Absent when binding to loopback only. */
   apiToken?: string;
+  /**
+   * Directory for durable state files written by the bootstrap
+   * (bootstrap.json, deployment.json, trigger-prod.key).
+   * Corresponds to the agencyhq-state volume mount point.
+   */
+  stateDir?: string;
+  /**
+   * Directory for secrets files mounted from the secrets volume.
+   * Used to resolve DATABASE_URL, TRIGGER_SECRET_KEY, and AGENCYHQ_API_TOKEN
+   * when the corresponding environment variable is not set.
+   */
+  secretsDir?: string;
 };
 
 export class ConfigError extends Error {
@@ -57,18 +84,64 @@ export class ConfigError extends Error {
   }
 }
 
+/**
+ * Reads a secret value from the secrets directory.
+ * Tries <dir>/<name>.env (NAME=value format) then <dir>/<name> (raw).
+ * Returns undefined if the directory is not set or neither file exists.
+ * Never throws; read errors are silently ignored.
+ * Never logs the value.
+ */
+export function readSecretFile(name: string, dir: string | undefined): string | undefined {
+  if (!dir) return undefined;
+
+  // Try <name>.env — single line `NAME=value` format (as written by secrets-init)
+  try {
+    const envContent = readFileSync(join(dir, `${name}.env`), "utf-8");
+    for (const line of envContent.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#") || !trimmed.includes("=")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      const key = trimmed.slice(0, eqIdx);
+      if (key !== name) continue;
+      const raw = trimmed.slice(eqIdx + 1);
+      // Strip single quotes (secrets-init writes NAME='value'; unescape '\'' → ')
+      const val =
+        raw.startsWith("'") && raw.endsWith("'") ? raw.slice(1, -1).replace(/'\\''/g, "'") : raw;
+      if (val.length > 0) return val;
+    }
+  } catch {
+    // File missing or unreadable — try next source
+  }
+
+  // Try raw file <name>
+  try {
+    const raw = readFileSync(join(dir, name), "utf-8").trim();
+    if (raw.length > 0) return raw;
+  } catch {
+    // File missing or unreadable — fall through
+  }
+
+  return undefined;
+}
+
+/**
+ * Reads the Trigger production secret key from the bootstrap state directory.
+ * Returns undefined if the file does not yet exist (bootstrap still running).
+ * Never throws; never logs the value.
+ */
+export function readTriggerKeyFromState(stateDir: string | undefined): string | undefined {
+  if (!stateDir) return undefined;
+  try {
+    const raw = readFileSync(join(stateDir, "trigger-prod.key"), "utf-8").trim();
+    return raw.length > 0 ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorConfig {
   const missing: string[] = [];
   const invalid: string[] = [];
-
-  function required(name: string): string {
-    const val = env[name];
-    if (val === undefined || val === "") {
-      missing.push(name);
-      return "";
-    }
-    return val;
-  }
 
   function optional(name: string): string | undefined {
     const val = env[name];
@@ -97,7 +170,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     return n;
   }
 
-  const databaseUrl = required("DATABASE_URL");
+  // Resolve the two directory sources first — they are used for secret lookups below.
+  const stateDir = optional("AGENCYHQ_STATE_DIR");
+  const secretsDir = optional("AGENCYHQ_SECRETS_DIR");
+
+  /**
+   * Secret resolution: env → secrets dir → required/optional fallback.
+   * Never logs the value.
+   */
+  function secretRequired(name: string): string {
+    const fromEnv = env[name];
+    if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
+    const fromFile = readSecretFile(name, secretsDir);
+    if (fromFile !== undefined) return fromFile;
+    missing.push(name);
+    return "";
+  }
+
+  function secretOptional(name: string): string | undefined {
+    const fromEnv = env[name];
+    if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
+    return readSecretFile(name, secretsDir);
+  }
+
+  const databaseUrl = secretRequired("DATABASE_URL");
 
   // RUNTIME: "fake" | "real" (defaults to "real")
   const runtimeRaw = optional("RUNTIME") ?? optional("COORDINATOR_RUNTIME") ?? "real";
@@ -109,12 +205,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     runtime = "real";
   }
 
-  // Trigger credentials: required for real runtime, optional for fake
+  // Trigger credentials: env wins, then secrets dir, then state dir (lazy — bootstrap
+  // writes trigger-prod.key after startup; app starts with empty key and readiness
+  // reflects "unconfigured" until the key appears).
   let triggerApiUrl: string;
   let triggerSecretKey: string;
   if (runtime === "real") {
-    triggerApiUrl = required("TRIGGER_API_URL");
-    triggerSecretKey = required("TRIGGER_SECRET_KEY");
+    // Try env → secrets dir → state dir; do NOT require — bootstrap may not have run yet.
+    triggerApiUrl =
+      optional("TRIGGER_API_URL") ?? readSecretFile("TRIGGER_API_URL", secretsDir) ?? "";
+    triggerSecretKey =
+      optional("TRIGGER_SECRET_KEY") ??
+      readSecretFile("TRIGGER_SECRET_KEY", secretsDir) ??
+      readTriggerKeyFromState(stateDir) ??
+      "";
   } else {
     triggerApiUrl = optional("TRIGGER_API_URL") ?? "";
     triggerSecretKey = optional("TRIGGER_SECRET_KEY") ?? "";
@@ -147,8 +251,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
   const port = portNum("PORT", 8787);
   const bindHost = optional("AGENCYHQ_BIND_HOST") ?? "127.0.0.1";
 
-  // Bearer token: optional when binding to a loopback address; required otherwise.
-  const apiToken = optional("AGENCYHQ_API_TOKEN");
+  // Bearer token: env wins, then secrets dir; optional when binding to loopback; required otherwise.
+  const apiToken = secretOptional("AGENCYHQ_API_TOKEN");
   const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
   if (apiToken === undefined && !loopbackHosts.has(bindHost)) {
     missing.push("AGENCYHQ_API_TOKEN");
@@ -184,6 +288,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
   }
   if (apiToken !== undefined) {
     result = { ...result, apiToken };
+  }
+  if (stateDir !== undefined) {
+    result = { ...result, stateDir };
+  }
+  if (secretsDir !== undefined) {
+    result = { ...result, secretsDir };
   }
   return result;
 }

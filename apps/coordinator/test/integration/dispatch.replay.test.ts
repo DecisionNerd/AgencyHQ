@@ -56,7 +56,7 @@ test("dispatch.replay: lost trigger response → retry with same key → one run
   await withTestSchema(t, async ({ client, schema }) => {
     await client.query(`SET search_path TO "${schema}", public`);
 
-    const poolUrl = new URL(DATABASE_URL!);
+    const poolUrl = new URL(DATABASE_URL as string);
     poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
     const pool = createPool(poolUrl.toString());
 

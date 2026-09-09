@@ -1,0 +1,8 @@
+# Container-profile overrides merged on top of the vendored Trigger.dev worker
+# stack file (the supervisor of the trigger worker stack reads its secrets from
+# the `secrets` volume, so it waits for secrets-init).
+services:
+  supervisor:
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully

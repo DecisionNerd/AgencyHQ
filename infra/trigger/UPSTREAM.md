@@ -75,6 +75,59 @@ docker-socket-proxy).
    only affects `docker compose config`'s willingness to render the file,
    not which values end up in a real deployment.
 
+6. **Registry htpasswd removed** (container profile, P15.1, 2026-09-08).
+   Reason: the registry runs without htpasswd by design (user choice; loopback-only publishing,
+   currently unused on a single host where the Trigger CLI loads images directly into the daemon).
+   Peers on the `webapp` network could push to it. A multi-host setup (issue #19) must add
+   authentication or move the registry to a dedicated network.
+   The `docker-compose.yml` edit removes the `volumes: ../registry/auth.htpasswd` bind mount
+   and the three `REGISTRY_AUTH*` environment variables from the registry service.
+   The `.env.example` variables `DOCKER_REGISTRY_USERNAME` and
+   `DOCKER_REGISTRY_PASSWORD` are retained in the host-profile .env.example
+   for the worker stack's credential settings (they default to empty).
+
+7. **Webapp port default changed `0.0.0.0` → `127.0.0.1`** (container
+   profile, P15.1, 2026-09-08). Reason: the container profile requires all
+   published ports to bind loopback-only. The .env.example already
+   set `WEBAPP_PUBLISH_IP=127.0.0.1` explicitly; the compose default now
+   matches that recommendation. Port variable `WEBAPP_PORT` added so the
+   compose.yaml root can override port without re-binding the IP.
+
+8. **Container-profile settings applied directly** (P15.1, 2026-09-09).
+   All settings previously intended for a separate overlay file are now
+   in-lined with tolerant wrappers. Docker Compose v2.39.1 `include:` does
+   NOT merge service definitions across included files (same-service references
+   in multiple included files produce "conflicts with imported resource" and the
+   later definition is silently ignored). The root `compose.yaml` therefore
+   includes this file directly and the settings are here, using
+   `${VAR:-default}` so the host profile can override them.
+
+   Changes:
+   - `webapp`: volumes +`secrets:/run/agencyhq/secrets:ro`; command changed to
+     a tolerant sh wrapper (sources `webapp.env` if present, no-ops if absent);
+     networks +`agencyhq`; env vars added: `EMAIL_TRANSPORT=${EMAIL_TRANSPORT:-smtp}`,
+     `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `FROM_EMAIL`, `WHITELISTED_EMAILS`,
+     `ADMIN_EMAILS`, `NODE_ENV=${NODE_ENV:-production}`,
+     `DEPLOY_IMAGE_PLATFORM=${AGENCYHQ_PLATFORM:-linux/arm64}`,
+     `TRIGGER_TELEMETRY_DISABLED=${TRIGGER_TELEMETRY_DISABLED:-1}`; existing
+     secret-key vars changed from `${VAR}` to `${VAR:-}` (empty default so
+     `docker compose config` validates without a host `.env`).
+   - `postgres`: volumes +`secrets:/run/agencyhq/secrets:ro`; entrypoint
+     changed to `sh -c` wrapper that reads `trigger-db-password` from the
+     secrets volume if present and exports it as `POSTGRES_PASSWORD` before
+     exec-ing `docker-entrypoint.sh -c wal_level=logical`.
+   - `clickhouse`: volumes +`secrets:/run/agencyhq/secrets:ro`; entrypoint
+     changed to `/bin/bash -c` wrapper that sources `clickhouse.env` if
+     present; healthcheck changed from `clickhouse-client --password` (not
+     available at healthcheck time) to `wget --spider http://localhost:8123/ping`
+     (unauthenticated HTTP).
+   - `minio`: volumes +`secrets:/run/agencyhq/secrets:ro`; entrypoint changed
+     to `/bin/bash -c` wrapper that sources `minio.env` if present.
+   - `volumes`: `secrets:` declared (empty on host profile; populated by
+     `secrets-init` on container profile).
+   - `networks`: `agencyhq:` declared (`name: agencyhq`; shared with
+     `infra/agencyhq/compose.yaml` by Docker network name).
+
 Everything else — the full service list (`webapp`, `postgres`, `redis`,
 `electric`, `clickhouse`, `registry`, `minio`, `s2-init`, `s2`), all
 `depends_on` edges, all healthchecks, the `docker-proxy` and `supervisor`
@@ -83,6 +136,46 @@ this file stays a drop-in match for upstream's if that stack is added
 later), and all other image tag variables (`POSTGRES_IMAGE_TAG`,
 `REDIS_IMAGE_TAG`, `ELECTRIC_IMAGE_TAG`, `CLICKHOUSE_IMAGE_TAG`,
 `REGISTRY_IMAGE_TAG`, `BUSYBOX_IMAGE_TAG`) — is unchanged from upstream.
+
+## Container-profile env var confirmation (P15.1, env.server.ts read 2026-09-09)
+
+The following Trigger webapp env vars are set in the root `compose.yaml`
+container-profile overrides. Each was confirmed present in
+`apps/webapp/app/env.server.ts` at tag v4.5.16 on 2026-09-09:
+
+| Env var | env.server.ts line | Schema |
+| --- | --- | --- |
+| `EMAIL_TRANSPORT` | 379 | `z.enum(["resend","smtp","aws-ses"]).optional()` |
+| `FROM_EMAIL` | 380 | `z.string().optional()` |
+| `SMTP_HOST` | 383 | `z.string().optional()` |
+| `SMTP_PORT` | 384 | `z.coerce.number().optional()` |
+| `SMTP_SECURE` | 385 | `BoolEnv.optional()` |
+| `WHITELISTED_EMAILS` | 333 | `z.string().refine(isValidRegex).optional()` |
+| `ADMIN_EMAILS` | 337 | `z.string().refine(isValidRegex).optional()` |
+| `NODE_ENV` | 152 | `z.union(["development","production","test"])` |
+| `DEPLOY_IMAGE_PLATFORM` | 815 | `z.string().default("linux/amd64")` |
+| `TRIGGER_TELEMETRY_DISABLED` | 374 | `z.string().optional()` |
+| `MANAGED_WORKER_SECRET` | 878 | `z.string().min(1).refine(isNotInsecureSecret)` |
+
+Source URL: https://raw.githubusercontent.com/triggerdotdev/trigger.dev/v4.5.16/apps/webapp/app/env.server.ts
+Read: 2026-09-09
+
+Note: `DOCKER_PLATFORM` is a Trigger worker stack container env var, not a webapp env var;
+it was not found in env.server.ts. It is set in `docker-compose.worker.yml` directly (edit 6 above).
+
+## Coexistence of root project and host profile
+
+The root `compose.yaml` uses project name `agencyhq`; the Trigger vendored
+files alone (standalone host profile) use project name `trigger`. Because the
+project names differ, all Docker-managed volumes are also separate:
+
+- Host profile: `trigger_postgres`, `trigger_clickhouse`, `trigger_shared`, …
+- Container profile: `agencyhq_postgres`, `agencyhq_clickhouse`, `agencyhq_shared`, …
+
+Neither profile touches the other's volumes. A fresh install or `docker compose
+down -v` on one profile does not affect the other. The named networks
+(`webapp`, `supervisor`, `docker-proxy`) overlap by name — run only one profile
+at a time to avoid network conflicts.
 
 ## Worker stack (docker-compose.worker.yml) — every edit vs upstream
 
@@ -120,9 +213,26 @@ Edits vs upstream:
    "trigger.dev worker stack container", "trigger worker stack", or
    "worker stack internal routing domain" depending on context.
 
+6. **Container-profile settings applied directly** (P15.1, 2026-09-09).
+   Same rationale as docker-compose.yml edit 8: Docker Compose `include:`
+   does NOT merge same-service definitions.
+
+   Changes:
+   - `supervisor` (Trigger worker stack container): volumes
+     +`secrets:/run/agencyhq/secrets:ro`; command changed to tolerant sh
+     wrapper (sources `supervisor.env` if present, no-ops if absent);
+     networks +`agencyhq`; `DOCKER_RUNNER_NETWORKS` changed from
+     `webapp,supervisor` to `webapp,supervisor,agencyhq` (runner task
+     containers join the agencyhq network so they reach the coordinator at
+     `http://app:8787/internal/*`); `DOCKER_PLATFORM` added
+     (`${AGENCYHQ_PLATFORM:-linux/arm64}`); `DOCKER_AUTOREMOVE_EXITED_CONTAINERS`
+     changed from `0` to `"1"` (auto-remove runner containers on exit).
+   - `volumes`: `secrets:` declared.
+   - `networks`: `agencyhq:` declared (`name: agencyhq`).
+
 Everything else — service definitions, healthchecks, `depends_on` edges,
-`ENFORCE_MACHINE_PRESETS`, `DEBUG`, `DOCKER_RUNNER_NETWORKS`, the bootstrap
-token path (`file:///home/node/shared/worker_token`), `shared` volume,
+`ENFORCE_MACHINE_PRESETS`, `DEBUG`, the bootstrap token path
+(`file:///home/node/shared/worker_token`), `shared` volume,
 and trigger worker-stack named networks (`docker-proxy` and `supervisor`) and
 all other upstream environment variables — is unchanged from upstream.
 

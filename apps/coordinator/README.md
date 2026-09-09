@@ -98,6 +98,43 @@ All commands are idempotent by `commandId` (R-010). Repeated delivery with the s
 | `AGENCYHQ_WORKER_SLOTS` | 1 | Maximum concurrent worker attempts across the shared ledger. On admission the worker intent is recorded `queued` and `BoundedRepairFlow.onLeadPlanOutput` calls `scheduleQueuedIntents` (`apps/coordinator/src/flow/schedule.ts`) directly, applying every gate at admission time. If the admitted item's own worker dispatch fails, recovery fires: a failure row and `pending_human` decision are recorded and the worker intent is marked `failed` so a subsequent poll cannot re-dispatch it. Failures of other queued items during the pass are logged; those items stay `queued` and are retried on the next poll. The reconciler polling wrapper also runs `scheduleQueuedIntents` on every poll and wake-up. Active attempts counted by `listActiveAttemptsForScheduling`: attempts in `stopping` status or with an in-flight `worker.attempt` intent, whose work item is not halted/completed/done. The provider gate is skipped entirely when the `provider_capacity` table is empty. The overview uses `listActiveAttemptCountsPerProject` with the same rule. No live run was performed after 0c5809f (review rework); T2/T4 live passes predate the admission change and were reached with every admission queued (33 seed attempts held the slots). (See [docs/engineering/trials/2026-09-slice6.md](../../docs/engineering/trials/2026-09-slice6.md).) |
 | `AGENCYHQ_REALTIME_WAKEUP` | false | When `true`, subscribes to `runs.subscribeToRunsWithTag` for the tags of all non-terminal work items; refreshes and resubscribes after every poll when the tag set changes. On subscribe the SDK replays current run states (observed 2026-09-08, `@trigger.dev/sdk` 4.5.16); the pollOnce in-flight guard absorbs replays. Polling remains the authoritative observation path. |
 
+## Configuration sources
+
+### Environment variables (always highest priority)
+
+All configuration is read from environment variables. The table below lists
+the secret-bearing variables and their resolution order.
+
+| Variable | Resolution order |
+|----------|-----------------|
+| `DATABASE_URL` | env → `<AGENCYHQ_SECRETS_DIR>/DATABASE_URL.env` → `<AGENCYHQ_SECRETS_DIR>/DATABASE_URL` → required |
+| `TRIGGER_SECRET_KEY` | env → `<AGENCYHQ_SECRETS_DIR>/TRIGGER_SECRET_KEY.env` → `<AGENCYHQ_SECRETS_DIR>/TRIGGER_SECRET_KEY` → `<AGENCYHQ_STATE_DIR>/trigger-prod.key` → empty (bootstrap not yet complete) |
+| `AGENCYHQ_API_TOKEN` | env → `<AGENCYHQ_SECRETS_DIR>/AGENCYHQ_API_TOKEN.env` → `<AGENCYHQ_SECRETS_DIR>/AGENCYHQ_API_TOKEN` → required when non-loopback |
+
+### AGENCYHQ_SECRETS_DIR
+
+Set to the mount point of the secrets volume (e.g. `/run/agencyhq/secrets`).
+The coordinator reads each secret-bearing variable from a file in this
+directory when the corresponding environment variable is not set. Two file
+formats are supported:
+
+- `<NAME>.env` — single line in `NAME=value` format (values parsed; comments
+  skipped)
+- `<NAME>` — raw file; trimmed whitespace
+
+### AGENCYHQ_STATE_DIR
+
+Set to the mount point of the `agencyhq-state` volume (e.g. `/var/agencyhq/state`).
+The coordinator reads two files from this directory on every readiness poll:
+
+- `bootstrap.json` — written by the bootstrap container as it progresses
+  through phases; surfaced in `GET /api/readiness` as the `bootstrap` field.
+- `deployment.json` — written by the bootstrap after a successful
+  `trigger deploy`; surfaced as the `image` field.
+- `trigger-prod.key` — the Trigger production secret key written by bootstrap
+  after completing the credentials phase. Read lazily on every readiness poll
+  so the app starts before bootstrap completes without requiring a restart.
+
 ## Network isolation
 
 The coordinator binds to `AGENCYHQ_BIND_HOST` (default `127.0.0.1`). All
@@ -107,6 +144,52 @@ unset and the bind host is not loopback, the server fails closed at startup.
 Loopback without a token is allowed but logs a startup warning. All
 coordinator-to-Trigger communication uses the Trigger secret key held only
 by the coordinator process.
+
+## Readiness API
+
+`GET /api/readiness` returns the current readiness state of all subsystems.
+The route is bearer-authenticated (same rule as all other `/api/*` routes).
+`GET /api/health` remains unauthenticated infra-only.
+
+### Response shape
+
+```json
+{
+  "services": {
+    "database": "ok | down",
+    "trigger": "ok | down | unconfigured"
+  },
+  "bootstrap": {
+    "phase": "wait_services | login | org_project | credentials | deploy | verify_deployment | done",
+    "status": "running | done | failed",
+    "error": "error_category",
+    "at": "2026-09-08T12:00:00.000Z"
+  },
+  "image": {
+    "version": "1.2.3",
+    "platform": "linux/arm64",
+    "at": "2026-09-08T12:00:00.000Z"
+  },
+  "provider": "unknown",
+  "worker": "unknown",
+  "nextAction": "Human-readable sentence describing what to do next"
+}
+```
+
+`bootstrap` and `image` are `null` when the corresponding state file is
+absent (bootstrap not yet started; image not yet deployed). `provider` and
+`worker` are placeholder values until issues #17 and #19 supply real data.
+No secret values appear in the response.
+
+### nextAction examples
+
+| State | nextAction |
+|-------|-----------|
+| bootstrap.json absent | `Bootstrap not started; run \`docker compose up -d\`` |
+| bootstrap running | `Bootstrap is running: phase deploy` |
+| bootstrap failed | `Bootstrap failed at credentials: pat_create_failed; run \`docker compose logs bootstrap\`` |
+| bootstrap backing off | `Bootstrap is backing off until 2026-09-09T14:00:00Z (login_rate_limited)` — reported for any retried failure; `nextRetryAt` is read from `bootstrap.json` |
+| ready for login | `Ready for provider login: run \`docker compose exec opencode opencode auth login\`` |
 
 ## Running
 
