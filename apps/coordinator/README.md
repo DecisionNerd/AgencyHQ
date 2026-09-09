@@ -168,7 +168,6 @@ The route is bearer-authenticated (same rule as all other `/api/*` routes).
   "image": {
     "version": "1.2.3",
     "platform": "linux/arm64",
-    "digest": "sha256:...",
     "at": "2026-09-08T12:00:00.000Z"
   },
   "provider": "unknown",

@@ -91,7 +91,6 @@ export function buildReadiness(inputs: ReadinessInputs): ReadinessResponse {
         ...(deploymentJson.version !== undefined ? { version: deploymentJson.version } : {}),
         ...(deploymentJson.platform !== undefined ? { platform: deploymentJson.platform } : {}),
         ...(deploymentJson.imageRef !== undefined ? { imageRef: deploymentJson.imageRef } : {}),
-        ...(deploymentJson.digest !== undefined ? { digest: deploymentJson.digest } : {}),
         ...(deploymentJson.externalId !== undefined
           ? { externalId: deploymentJson.externalId }
           : {}),

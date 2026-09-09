@@ -56,6 +56,6 @@ volume explicitly, then bring the stack back up with `docker compose up -d`.
 
 ## File permissions
 
-Secret files are written with mode **0644** (not 0600). This is intentional: the secrets volume is mounted read-only into every consumer, and services run as different UIDs (Trigger Postgres: root, ClickHouse: uid 101, MinIO: uid 1001, webapp: uid 1000). Since no single UID can own all files and still allow reading by others, 0644 gives all services read access. See trial record defect 7 (`docs/engineering/trials/2026-09-compose.md §Deviations`).
+Secret files are written with mode **0644** (not 0600). This is intentional: the secrets volume is mounted read-only into every consumer, and services run as different UIDs (Trigger webapp: root, Trigger Postgres wrapper: root, ClickHouse: uid 101, MinIO: uid 1001, Electric: varies, AgencyHQ app: uid 1000). Since no single UID can own all files and still allow reading by others, 0644 gives all services read access. See trial record defect 7 (`docs/engineering/trials/2026-09-compose.md §Deviations`).
 
 `trigger-prod.key` and `trigger-pat.key` are written by the **bootstrap** container (not by `secrets-init`) with mode **0600**; they live in the `agencyhq-state` volume, not the secrets volume.

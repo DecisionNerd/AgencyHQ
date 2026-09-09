@@ -7,10 +7,10 @@
  * existing env files without overwriting present values.
  * No runtime dependencies beyond Node.js built-ins.
  *
- * File mode is 0644 (not 0600): the Trigger postgres wrapper runs as root,
- * ClickHouse as uid 101, MinIO as uid 1001, and the webapp as uid 1000; all
- * consumers mount the volume read-only. No single-user-only mode would satisfy
- * every reader (L1 trial record, defect 7). The bootstrap writes trigger-prod.key
+ * File mode is 0644 (not 0600): the Trigger webapp and its postgres wrapper run
+ * as root, ClickHouse as uid 101, MinIO as uid 1001, and the AgencyHQ app as
+ * uid 1000; all consumers mount the volume read-only. No single-user-only mode
+ * would satisfy every reader (L1 trial record, defect 7). The bootstrap writes trigger-prod.key
  * and trigger-pat.key as 0600 — those are not written here.
  *
  * Secret files written:

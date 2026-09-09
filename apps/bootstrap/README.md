@@ -87,7 +87,7 @@ Trigger.dev v4.5.16 rate-limits `POST /login/magic` per email address. The obser
 The bootstrap detects this in three ways (checked in order):
 1. `x-ratelimit-remaining: 0` header on the initial response hop.
 2. `retry-after` header (RFC 7231 seconds) on the initial response hop.
-3. A 302 redirect to `/login` on a sent request indicates the link was sent but login was rejected (defect 17: this is not a rate-limit signal; rate limiting uses a 429 or specific headers).
+3. After all redirects the final URL path is `/login` AND the page body matches `too many|rate.?limit|try again later` — the webapp served a rate-limit page. A `/login` final path without that text means the link was sent (the webapp redirects POST /login/magic → 302 /login normally; only the page text distinguishes a rate-limited response).
 
 The reset time is parsed from `x-ratelimit-reset` (epoch-seconds or epoch-ms, auto-detected by magnitude) or `retry-after` (seconds from now).
 

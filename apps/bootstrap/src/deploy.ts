@@ -91,7 +91,7 @@ export function computeExternalId(workspaceRoot: string): string {
   return hash.digest("hex");
 }
 
-function readDeploymentRecord(stateDir: string): DeploymentRecord | null {
+export function readDeploymentRecord(stateDir: string): DeploymentRecord | null {
   const p = join(stateDir, "deployment.json");
   if (!existsSync(p)) return null;
   try {

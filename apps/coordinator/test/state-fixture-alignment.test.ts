@@ -143,7 +143,7 @@ const BOOTSTRAP_CREDENTIALS_FAILED_JSON = JSON.stringify({
 
 /**
  * Shape written by runDeploy() immediately after `trigger deploy` succeeds.
- * version/imageRef/digest are absent at this point; added by enrichDeployment()
+ * version/imageRef are absent at this point; added by enrichDeployment()
  * after the verify phase.
  */
 const DEPLOYMENT_POST_DEPLOY_JSON = JSON.stringify({
@@ -255,7 +255,7 @@ describe("deployment.json fixture alignment — DeploymentRecord format", () => 
     assert.equal(result.platform, "linux/arm64");
     assert.equal(result.imageRef, "localhost:5001/trigger/agencyhq:20240901.1");
     assert.equal(result.at, "2026-09-08T10:20:00.000Z");
-    assert.equal("digest" in result, false, "digest absent when not enriched");
+    assert.equal("digest" in result, false, "digest field never written — absent by design");
   });
 
   it("returns null when at field is missing", () => {

@@ -41,7 +41,6 @@ export type DeploymentJson = {
   version?: string;
   platform?: string;
   imageRef?: string;
-  digest?: string;
   externalId?: string;
   at: string; // ISO-8601 timestamp of the deployment
 };
@@ -73,7 +72,6 @@ export type ImageReadiness = {
   version?: string;
   platform?: string;
   imageRef?: string;
-  digest?: string;
   externalId?: string;
   at: string;
 } | null;

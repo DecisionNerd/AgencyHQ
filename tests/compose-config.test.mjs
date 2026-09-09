@@ -529,7 +529,10 @@ test("webapp API_ORIGIN is http://webapp:3000 in the rendered container profile"
   const webappSection = configYaml.match(
     /\n  webapp:([\s\S]*?)(?=\n  [a-z]|\nnetworks:|\nvolumes:|$)/,
   );
-  if (!webappSection) return;
+  assert.ok(
+    webappSection !== null,
+    "webapp service section must be present in the rendered config (E-16)",
+  );
   assert.ok(
     webappSection[1].includes("API_ORIGIN: http://webapp:3000"),
     "webapp API_ORIGIN must be http://webapp:3000 in the rendered container profile (pinned in infra/agencyhq/trigger-overrides.yaml)",

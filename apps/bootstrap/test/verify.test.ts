@@ -122,3 +122,47 @@ describe("verifyDeployment — status assertion", () => {
     });
   });
 });
+
+describe("verifyDeployment — external-id equality (E-11)", () => {
+  function makeFetch(body: Record<string, unknown>, status = 200): typeof globalThis.fetch {
+    return async () =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+  }
+
+  it("succeeds when expectedExternalId matches the API response", async () => {
+    const body = { status: "DEPLOYED", version: "v1", externalId: "ext-match" };
+    await withFetch(makeFetch(body), async () => {
+      const info = await verifyDeployment("http://fake", "key", "ext-match");
+      assert.equal(info.externalId, "ext-match");
+    });
+  });
+
+  it("throws verify_failed when externalId mismatches", async () => {
+    const body = { status: "DEPLOYED", version: "v1", externalId: "ext-api" };
+    await withFetch(makeFetch(body), async () => {
+      await assert.rejects(
+        () => verifyDeployment("http://fake", "key", "ext-deployed"),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.match(err.message, /ext-deployed/);
+          assert.match(err.message, /ext-api/);
+          assert.equal((err as { errorCategory?: string }).errorCategory, "verify_failed");
+          return true;
+        },
+      );
+    });
+  });
+
+  it("succeeds when API response has no externalId (field absent)", async () => {
+    const body = { status: "DEPLOYED", version: "v1" };
+    await withFetch(makeFetch(body), async () => {
+      // When the API doesn't return an externalId, we cannot compare — should not throw.
+      const info = await verifyDeployment("http://fake", "key", "ext-deployed");
+      assert.equal(info.status, "DEPLOYED");
+      assert.equal(info.externalId, undefined);
+    });
+  });
+});

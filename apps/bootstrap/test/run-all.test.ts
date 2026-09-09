@@ -49,12 +49,17 @@ function makeDeps(stateDir: string, secretsDir: string, overrides: Partial<RunDe
     readProdSecretKey: async () => "tr_prod_fake",
     mintPAT: async () => "tr_pat_fake",
     resolveWebappIp: async () => "http://1.2.3.4:3000",
-    runDeploy: async () => ({
-      externalId: "abc",
-      webappIpUrl: "http://1.2.3.4:3000",
-      platform: "linux/arm64",
-      at: new Date().toISOString(),
-    }),
+    runDeploy: async () => {
+      const record = {
+        externalId: "abc",
+        webappIpUrl: "http://1.2.3.4:3000",
+        platform: "linux/arm64",
+        at: new Date().toISOString(),
+      };
+      // Write deployment.json so readDeploymentRecord in the verify phase can read it.
+      writeFileSync(join(stateDir, "deployment.json"), `${JSON.stringify(record)}\n`, "utf-8");
+      return record;
+    },
     verifyDeployment: async () => ({ raw: { status: "DEPLOYED" }, status: "DEPLOYED" }),
     deploymentIsCurrent: () => true,
     enrichDeployment: () => {},
@@ -241,26 +246,24 @@ describe("runAll — deploymentIsCurrent false", () => {
 });
 
 describe("runAll — corrupt state file", () => {
-  it("does not lose stored PAT when main state file is corrupted (bak fallback)", async () => {
+  it("recovers from corrupted bootstrap.json via bak and does not re-mint PAT", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "ra-corrupt-state-"));
     const secretsDir = mkdtempSync(join(tmpdir(), "ra-corrupt-secrets-"));
     try {
-      // First run: credentials phase completes, deploy fails so we stop there
-      const deps1 = makeDeps(stateDir, secretsDir, {
-        runDeploy: async () => {
-          throw Object.assign(new Error("deploy fail"), { errorCategory: "deploy_failed" });
-        },
-      });
-      await assert.rejects(() => runAll(deps1));
+      // First run: all phases succeed — credentials writes PAT, deploy writes deployment.json
+      const deps1 = makeDeps(stateDir, secretsDir);
+      await runAll(deps1);
 
-      // PAT must be stored
+      // PAT must be stored after the first run
       const sm = new StateManager(stateDir, secretsDir);
-      assert.ok(sm.hasSecret("trigger-pat.key"), "PAT stored after credentials phase");
+      assert.ok(sm.hasSecret("trigger-pat.key"), "PAT stored after first run");
 
-      // Corrupt the main state file (bak should still exist from the last save)
-      writeFileSync(join(stateDir, "bootstrap.json"), "CORRUPTED {{{{", "utf-8");
+      // Corrupt the main state file while the .bak copy (written by StateManager) survives.
+      // This simulates an interrupted write: bak holds the complete done state.
+      writeFileSync(join(stateDir, "bootstrap.json"), "TRUNCATED", "utf-8");
 
-      // Second run: load() falls back to bak; PAT already stored → no new mint
+      // Second run: load() detects invalid JSON, falls back to bak.
+      // All phases are already done in bak → runAll completes without re-minting.
       let _mintCalls = 0;
       const deps2 = makeDeps(stateDir, secretsDir, {
         mintPAT: async () => {
@@ -268,14 +271,106 @@ describe("runAll — corrupt state file", () => {
           return "tr_pat_new";
         },
       });
-      // May or may not complete (depends on bak state), but must not re-mint the PAT
-      try {
-        await runAll(deps2);
-      } catch {
-        // ok — bak may have credentials not yet done
-      }
-      // PAT file must still exist
-      assert.ok(sm.hasSecret("trigger-pat.key"), "PAT still present after corrupt state load");
+      await runAll(deps2);
+
+      // PAT must not be re-minted (credentials already done in bak state)
+      assert.equal(
+        _mintCalls,
+        0,
+        "mintPAT must not be called when PAT already stored (bak recovery)",
+      );
+      // Final state must be done
+      const finalState = sm.load();
+      assert.equal(finalState.phases.done?.status, "done", "all phases done after bak recovery");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+      rmSync(secretsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runAll — F2-6: pat_create_failed vs secret_key_missing error categories", () => {
+  it("credentials phase fails with pat_create_failed when mintPAT throws without category", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "ra-pat-fail-state-"));
+    const secretsDir = mkdtempSync(join(tmpdir(), "ra-pat-fail-secrets-"));
+    try {
+      const deps = makeDeps(stateDir, secretsDir, {
+        mintPAT: async () => {
+          throw new Error("could not find PAT in token creation response");
+        },
+      });
+      await assert.rejects(
+        () => runAll(deps),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.equal(
+            (err as { errorCategory?: string }).errorCategory,
+            "pat_create_failed",
+            "mintPAT failure must be tagged pat_create_failed",
+          );
+          return true;
+        },
+      );
+      const state = deps.sm.load();
+      assert.equal(state.phases.credentials?.status, "failed");
+      assert.equal(state.phases.credentials?.errorCategory, "pat_create_failed");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+      rmSync(secretsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("credentials phase fails with secret_key_missing when readProdSecretKey throws without category", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "ra-key-fail-state-"));
+    const secretsDir = mkdtempSync(join(tmpdir(), "ra-key-fail-secrets-"));
+    try {
+      const deps = makeDeps(stateDir, secretsDir, {
+        readProdSecretKey: async () => {
+          throw new Error("could not find prod secret key on apikeys page");
+        },
+      });
+      await assert.rejects(() => runAll(deps));
+      // The thrown error may not have errorCategory (it's set on phase state, not always re-tagged).
+      // Check the phase state for the recorded category.
+      const state = deps.sm.load();
+      assert.equal(state.phases.credentials?.status, "failed");
+      assert.equal(state.phases.credentials?.errorCategory, "secret_key_missing");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+      rmSync(secretsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runAll — E-11: externalId passed to verifyDeployment", () => {
+  it("passes the deployed externalId from deployment.json to verifyDeployment", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "ra-extid-state-"));
+    const secretsDir = mkdtempSync(join(tmpdir(), "ra-extid-secrets-"));
+    try {
+      let capturedExternalId: string | undefined;
+      const deps = makeDeps(stateDir, secretsDir, {
+        runDeploy: async () => {
+          const record = {
+            externalId: "ext-123abc",
+            webappIpUrl: "http://1.2.3.4:3000",
+            platform: "linux/arm64",
+            at: new Date().toISOString(),
+          };
+          // Write deployment.json to disk so readDeploymentRecord finds it.
+          writeFileSync(join(stateDir, "deployment.json"), `${JSON.stringify(record)}\n`, "utf-8");
+          return record;
+        },
+        verifyDeployment: async (_url, _key, expectedExternalId) => {
+          capturedExternalId = expectedExternalId;
+          return { raw: { status: "DEPLOYED" }, status: "DEPLOYED" };
+        },
+      });
+      await runAll(deps);
+      assert.equal(
+        capturedExternalId,
+        "ext-123abc",
+        "verifyDeployment must receive the externalId from deployment.json",
+      );
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
       rmSync(secretsDir, { recursive: true, force: true });

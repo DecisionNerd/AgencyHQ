@@ -161,7 +161,6 @@ export function readDeploymentJson(stateDir: string | undefined): DeploymentJson
     if (typeof obj.version === "string") result.version = obj.version;
     if (typeof obj.platform === "string") result.platform = obj.platform;
     if (typeof obj.imageRef === "string") result.imageRef = obj.imageRef;
-    if (typeof obj.digest === "string") result.digest = obj.digest;
     if (typeof obj.externalId === "string") result.externalId = obj.externalId;
     return result;
   } catch {

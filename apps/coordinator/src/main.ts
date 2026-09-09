@@ -44,11 +44,18 @@ let runtime: FakeExecutionRuntime | RealExecutionRuntime;
 
 if (config.runtime === "real") {
   // Resolve the key lazily so the coordinator can start before bootstrap writes
-  // trigger-prod.key. _ensureConfigured() re-reads on each operation until
-  // the key is non-empty, then memoizes it.
+  // trigger-prod.key. The provider reads trigger-prod.key from disk lazily;
+  // once a non-empty value is found it is memoized so subsequent calls skip
+  // the filesystem read even before _ensureConfigured() memoizes the key for configure.
+  let _memoizedKey = "";
   runtime = new RealExecutionRuntime({
     apiUrl: config.triggerApiUrl,
-    secretKey: () => config.triggerSecretKey || readTriggerKeyFromState(config.stateDir) || "",
+    secretKey: () => {
+      if (!_memoizedKey) {
+        _memoizedKey = config.triggerSecretKey || readTriggerKeyFromState(config.stateDir) || "";
+      }
+      return _memoizedKey;
+    },
   });
 } else {
   runtime = new FakeExecutionRuntime();

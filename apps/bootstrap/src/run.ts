@@ -5,6 +5,7 @@
  * unit tests without touching process.argv, process.env, or real external services.
  */
 
+import { readDeploymentRecord } from "./deploy.ts";
 import type { SmtpSinkResult } from "./smtp-sink.ts";
 import type { BootstrapState, PhaseState, StateManager } from "./state.ts";
 import type { MagicLinkResult } from "./trigger-web.ts";
@@ -103,7 +104,11 @@ export type RunDeps = {
   mintPAT: (url: string, name: string, jar: CookieJar) => Promise<string>;
   resolveWebappIp: (url: string) => Promise<string>;
   runDeploy: (opts: DeployOptions) => Promise<DeployRecord>;
-  verifyDeployment: (url: string, key: string) => Promise<DeploymentInfo>;
+  verifyDeployment: (
+    url: string,
+    key: string,
+    expectedExternalId?: string,
+  ) => Promise<DeploymentInfo>;
   deploymentIsCurrent: (workspaceRoot: string, stateDir: string) => boolean;
   enrichDeployment: (
     stateDir: string,
@@ -173,7 +178,15 @@ export async function runAll(deps: RunDeps): Promise<void> {
         signal: abort.signal,
       });
       await deps.sleep(200);
-      const mlResult = await deps.requestMagicLink(deps.webappUrl, deps.bootstrapEmail, jar);
+      let mlResult: MagicLinkResult;
+      try {
+        mlResult = await deps.requestMagicLink(deps.webappUrl, deps.bootstrapEmail, jar);
+      } catch (mlErr) {
+        // requestMagicLink threw (network error, etc.) — stop the sink so it doesn't linger.
+        sinkPromise.catch(() => {});
+        abort.abort();
+        throw mlErr;
+      }
       if (mlResult.kind === "rate_limited") {
         sinkPromise.catch(() => {});
         abort.abort();
@@ -212,7 +225,15 @@ export async function runAll(deps: RunDeps): Promise<void> {
           signal: abort.signal,
         });
         await deps.sleep(200);
-        const mlResult = await deps.requestMagicLink(deps.webappUrl, deps.bootstrapEmail, jar);
+        let mlResult: MagicLinkResult;
+        try {
+          mlResult = await deps.requestMagicLink(deps.webappUrl, deps.bootstrapEmail, jar);
+        } catch (mlErr) {
+          // requestMagicLink threw (network error, etc.) — stop the sink so it doesn't linger.
+          sinkPromise.catch(() => {});
+          abort.abort();
+          throw mlErr;
+        }
         if (mlResult.kind === "rate_limited") {
           sinkPromise.catch(() => {});
           abort.abort();
@@ -296,7 +317,17 @@ export async function runAll(deps: RunDeps): Promise<void> {
       }
 
       if (!sm.hasSecret(deps.secretPAT)) {
-        const pat = await deps.mintPAT(deps.webappUrl, deps.tokenName, jar);
+        let pat: string;
+        try {
+          pat = await deps.mintPAT(deps.webappUrl, deps.tokenName, jar);
+        } catch (mintErr) {
+          // mintPAT threw without an errorCategory — tag it so the outer catch
+          // records pat_create_failed rather than the generic secret_key_missing.
+          throw Object.assign(mintErr as Error, {
+            errorCategory:
+              (mintErr as { errorCategory?: string }).errorCategory ?? "pat_create_failed",
+          });
+        }
         sm.writeSecret(deps.secretPAT, pat);
         deps.log("PAT stored");
       } else {
@@ -350,7 +381,9 @@ export async function runAll(deps: RunDeps): Promise<void> {
     try {
       const prodKey = sm.readSecret(deps.secretProdKey);
       if (!prodKey) throw new Error("prod secret key not found in secrets");
-      const info = await deps.verifyDeployment(deps.webappUrl, prodKey);
+      const deployedRecord = readDeploymentRecord(deps.stateDir);
+      const expectedExternalId = deployedRecord?.externalId;
+      const info = await deps.verifyDeployment(deps.webappUrl, prodKey, expectedExternalId);
       const doneMeta: Record<string, string> = {};
       if (info.version !== undefined) doneMeta.deploymentVersion = info.version;
       sm.setDone(state, "verify_deployment", doneMeta as Partial<PhaseState>);

@@ -15,6 +15,8 @@
  */
 
 import { join } from "node:path";
+import type { DashboardLinkDeps } from "./dashboard-link.ts";
+import { runDashboardLink } from "./dashboard-link.ts";
 import { deploymentIsCurrent, enrichDeployment, runDeploy } from "./deploy.ts";
 import type { RunDeps } from "./run.ts";
 import { runAll } from "./run.ts";
@@ -37,6 +39,8 @@ import {
   waitForReadiness,
 } from "./trigger-web.ts";
 import { verifyDeployment } from "./verify.ts";
+
+export type { DashboardLinkDeps };
 
 // ── Transient failure categories that trigger backoff before exit ─────────────
 
@@ -189,34 +193,22 @@ function cmdStatus(): void {
 }
 
 async function cmdDashboardLink(): Promise<void> {
-  /**
-   * Start the SMTP sink, request a fresh magic link, capture it, stop the sink,
-   * print ONLY the URL to stdout. Never follows the link.
-   * On rate limit: print the reset time to stderr and exit 1.
-   */
   const sm = new StateManager(STATE_DIR, SECRETS_DIR);
   sm.load(); // Ensure state dir is accessible.
 
-  const jar = loadSession(SESSION_FILE);
-  const abort = new AbortController();
-  const sinkPromise = startSmtpSink({ port: SMTP_PORT, timeoutMs: 60_000, signal: abort.signal });
-  await sleep(200);
-  const mlResult = await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
-  if (mlResult.kind === "rate_limited") {
-    sinkPromise.catch(() => {});
-    abort.abort();
-    const resetMsg =
-      mlResult.resetAt !== null
-        ? `rate limit resets at ${new Date(mlResult.resetAt).toISOString()}`
-        : "rate limit reset time unknown";
-    process.stderr.write(`[bootstrap] dashboard-link: magic link rate limited; ${resetMsg}\n`);
-    process.exit(1);
-  }
-  const sinkResult = await sinkPromise;
-  sinkResult.stop();
-
-  // Print to stdout only — not to logs (link is a one-time URL).
-  process.stdout.write(`${sinkResult.magicLink}\n`);
+  await runDashboardLink({
+    webappUrl: WEBAPP_URL,
+    email: BOOTSTRAP_EMAIL,
+    smtpPort: SMTP_PORT,
+    sessionFile: SESSION_FILE,
+    loadSession,
+    startSmtpSink: startSmtpSink as DashboardLinkDeps["startSmtpSink"],
+    requestMagicLink,
+    sleep,
+    stdout: (msg) => process.stdout.write(msg),
+    stderr: (msg) => process.stderr.write(msg),
+    exit: (code) => process.exit(code),
+  });
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

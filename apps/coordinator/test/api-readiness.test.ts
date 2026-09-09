@@ -235,7 +235,7 @@ describe("GET /api/readiness — done + deployment.json", () => {
         deploymentJson: {
           version: "1.2.3",
           platform: "linux/arm64",
-          digest: "sha256:abc",
+          externalId: "ext-abc",
           at: NOW,
         },
       }),
@@ -246,28 +246,12 @@ describe("GET /api/readiness — done + deployment.json", () => {
     assert.ok(image !== null, "expected image to be present");
     assert.equal(image?.version, "1.2.3");
     assert.equal(image?.platform, "linux/arm64");
-    assert.equal(image?.digest, "sha256:abc");
+    assert.equal(image?.externalId, "ext-abc");
     const nextAction = body.nextAction as string;
     assert.ok(
       nextAction.includes("opencode auth login") || nextAction.includes("provider login"),
       `got: ${nextAction}`,
     );
-  });
-
-  it("image without digest — digest key absent", async () => {
-    const app = makeApp(
-      undefined,
-      makeLoader({
-        bootstrapJson: { phase: "done", status: "done", at: NOW },
-        trigger: "ok",
-        deploymentJson: { version: "1.0.0", platform: "linux/arm64", at: NOW },
-      }),
-    );
-    const res = await app.request("/api/readiness");
-    const body = (await res.json()) as Record<string, unknown>;
-    const image = body.image as Record<string, unknown> | null;
-    assert.ok(image !== null);
-    assert.equal("digest" in (image ?? {}), false);
   });
 });
 

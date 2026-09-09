@@ -25,10 +25,16 @@ function log(msg: string): void {
  * GET /api/v1/deployments/current with the prod secret key.
  * Returns the parsed deployment info on success, throws on failure.
  * Times out after BOOTSTRAP_VERIFY_TIMEOUT_MS (default 30 s).
+ *
+ * When `expectedExternalId` is provided and the API response carries its own
+ * `externalId`, the two values must match. A mismatch means the running
+ * deployment is not the one we just deployed (stale or wrong project) and
+ * fails with `verify_failed`.
  */
 export async function verifyDeployment(
   webappUrl: string,
   prodSecretKey: string,
+  expectedExternalId?: string,
 ): Promise<DeploymentInfo> {
   const url = `${webappUrl}/api/v1/deployments/current`;
   log(`GET ${url}`);
@@ -84,6 +90,18 @@ export async function verifyDeployment(
       new Error(`deployment status is ${b.status ?? "unknown"} (expected DEPLOYED)`),
       { errorCategory: "verify_failed" },
     );
+  }
+
+  // Assert external-id matches what we deployed (when both sides supply a value).
+  if (expectedExternalId !== undefined && info.externalId !== undefined) {
+    if (info.externalId !== expectedExternalId) {
+      throw Object.assign(
+        new Error(
+          `deployment external-id mismatch: deployed=${expectedExternalId} api=${info.externalId}`,
+        ),
+        { errorCategory: "verify_failed" },
+      );
+    }
   }
 
   return info;

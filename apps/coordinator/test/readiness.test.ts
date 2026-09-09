@@ -32,7 +32,6 @@ function inputs(overrides: Partial<ReadinessInputs> = {}): ReadinessInputs {
 const DEPLOYMENT = {
   version: "1.2.3",
   platform: "linux/arm64",
-  digest: "sha256:abc123",
   at: "2026-09-08T12:00:00.000Z",
 };
 
@@ -205,22 +204,12 @@ describe("buildReadiness — response shape", () => {
     assert.equal(r.image, null);
   });
 
-  it("image reflects version/platform/digest/at", () => {
+  it("image reflects version/platform/at", () => {
     const r = buildReadiness(inputs({ deploymentJson: DEPLOYMENT }));
     assert.ok(r.image !== null);
     assert.equal(r.image?.version, "1.2.3");
     assert.equal(r.image?.platform, "linux/arm64");
-    assert.equal(r.image?.digest, "sha256:abc123");
     assert.equal(r.image?.at, "2026-09-08T12:00:00.000Z");
-  });
-
-  it("image without digest — digest field absent", () => {
-    const r = buildReadiness(
-      inputs({
-        deploymentJson: { version: "1.0.0", platform: "linux/arm64", at: "2026-01-01T00:00:00Z" },
-      }),
-    );
-    assert.ok(r.image !== null);
     assert.equal("digest" in (r.image ?? {}), false);
   });
 
@@ -338,13 +327,13 @@ describe("readDeploymentJson", () => {
     assert.equal(readDeploymentJson(tmpDir), null);
   });
 
-  it("parses a valid deployment.json with digest", () => {
+  it("parses a valid deployment.json with version and externalId", () => {
     writeFileSync(
       join(tmpDir, "deployment.json"),
       JSON.stringify({
         version: "2.0.0",
         platform: "linux/arm64",
-        digest: "sha256:deadbeef",
+        externalId: "ext-deadbeef",
         at: "2026-09-08T12:00:00Z",
       }),
     );
@@ -352,10 +341,11 @@ describe("readDeploymentJson", () => {
     assert.ok(result !== null);
     assert.equal(result?.version, "2.0.0");
     assert.equal(result?.platform, "linux/arm64");
-    assert.equal(result?.digest, "sha256:deadbeef");
+    assert.equal(result?.externalId, "ext-deadbeef");
+    assert.equal("digest" in (result ?? {}), false);
   });
 
-  it("parses a valid deployment.json without digest", () => {
+  it("parses a valid deployment.json without optional fields", () => {
     writeFileSync(
       join(tmpDir, "deployment.json"),
       JSON.stringify({ version: "1.0.0", platform: "linux/amd64", at: "2026-09-08T12:00:00Z" }),
