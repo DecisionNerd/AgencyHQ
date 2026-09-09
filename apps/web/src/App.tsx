@@ -48,6 +48,7 @@ import {
   formatTimestamp,
   lifecycleIcon,
   parseRoute,
+  pickLatestAttempt,
   pickOpenDecision,
   type SinceWindow,
   sinceWindowToISO,
@@ -1341,8 +1342,9 @@ function WorkItemPage({
   const openDecision = pickOpenDecision(openPendingDecisions ?? null);
   const openDecisionsAbsent = item !== null && openPendingDecisions === undefined;
 
-  // Find the first attempt id for stop/invalidate (evidence-based, not decision-based)
-  const latestAttempt = evidence?.attempts[0];
+  // Pick the best attempt for stop/pause/invalidate actions: prefer an active
+  // (dispatched/running/stopping) attempt; otherwise the highest-version, most-recent one.
+  const latestAttempt = pickLatestAttempt(evidence?.attempts);
 
   return (
     <div className="layout">
@@ -1529,7 +1531,8 @@ function WorkItemPage({
                           openDecision?.contractVersion ??
                           evidence?.decisions.find(
                             (d) => d.attemptId === latestAttempt.id && d.contractVersion != null,
-                          )?.contractVersion,
+                          )?.contractVersion ??
+                          latestAttempt.contractVersion,
                         consequence: "stops the running attempt; the checkpoint is kept",
                       }),
                       () =>
@@ -1559,8 +1562,9 @@ function WorkItemPage({
                       action: "pause",
                       projectId: projectId ?? "unknown",
                       workItemId: item.workItemId,
-                      attemptId: openDecision?.attemptId,
-                      contractVersion: openDecision?.contractVersion,
+                      attemptId: openDecision?.attemptId ?? latestAttempt?.id,
+                      contractVersion:
+                        openDecision?.contractVersion ?? latestAttempt?.contractVersion,
                       consequence: "pauses dispatch for this work item; running attempts continue",
                     }),
                     () =>

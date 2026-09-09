@@ -14,6 +14,8 @@ import type { TestDbContext } from "@agencyhq/db";
 import { createPool } from "@agencyhq/db";
 import pg from "pg";
 import { FakeExecutionRuntime } from "../../../../trigger/src/client/fake.ts";
+import type { FlowLike, ReconcilerLike, RuntimeLike } from "../../src/app.ts";
+import { createApp } from "../../src/app.ts";
 import type { ApproveDeps } from "../../src/commands/approve.ts";
 import { approveWorkItem } from "../../src/commands/approve.ts";
 import {
@@ -24,12 +26,46 @@ import {
   setMainEffort,
   updateAuthority,
 } from "../../src/commands/index.ts";
+import type { CoordinatorConfig } from "../../src/config.ts";
 import { buildDecisionsView } from "../../src/views/decisions-view.ts";
 import { withControlPlaneSchema } from "../helpers/control-plane-schema.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers (duplicated locally to keep tests self-contained)
 // ---------------------------------------------------------------------------
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const NOW_ISO = new Date().toISOString();
+
+function makeFakeFlow(): FlowLike {
+  return { plan: async () => ({ ok: true }) };
+}
+
+function makeFakeReconciler(): ReconcilerLike {
+  return { freshness: () => ({ lastPollAt: NOW_ISO, stale: false }) };
+}
+
+function makeFakeRuntime(): RuntimeLike {
+  return { createPublicToken: async () => "fake-token" };
+}
+
+function makeAppConfig(): CoordinatorConfig {
+  return {
+    databaseUrl: DATABASE_URL ?? "",
+    triggerApiUrl: "https://trigger.example.com",
+    triggerSecretKey: "secret",
+    runtime: "fake",
+    worktreeBase: "/tmp/worktrees",
+    workerModel: "claude-sonnet-4",
+    leadModel: "claude-opus-4",
+    reviewerModel: "claude-sonnet-4",
+    reconcileIntervalMs: 5000,
+    freshnessStaleMs: 30000,
+    uncertainAfterMs: 120000,
+    port: 8787,
+    bindHost: "127.0.0.1",
+  };
+}
 
 function makeSchemaPool(databaseUrl: string, schema: string): pg.Pool {
   const pool = new pg.Pool({ connectionString: databaseUrl });
@@ -696,12 +732,16 @@ test("V-2: second no-attempt pending is open after first rejected; re-reject of 
       );
       assert.equal(r1.ok, true, "reject of first pending must succeed");
 
-      // Insert pending_2: attempt-less plan decision at T2 = now() + 1 minute,
-      // guaranteeing T2 > T1 (rejected_1.at). Simulates a "plan again" scenario.
+      // Insert pending_2: attempt-less plan decision at the DB clock's current time.
+      // The reject command above stamped rejected_1 slightly before this insert,
+      // so the DB's now() here is >= rejected_1.at — pending_2 sorts after rejected_1,
+      // which is what the time-bound guard (AND d2.at >= d.at) checks.
+      // Using a real timestamp (no future-dating) models the realistic "plan again"
+      // sequence without relying on clock skew.
       const pending2Id = `dec-v2-p2-${randomUUID()}`;
       await ctx.client.query(
         `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
-         VALUES ($1, 'plan', 'coordinator', $2, NULL, 'pending_human', now() + interval '1 minute')`,
+         VALUES ($1, 'plan', 'coordinator', $2, NULL, 'pending_human', now())`,
         [pending2Id, workItemId],
       );
 
@@ -787,6 +827,186 @@ test("V-2: second no-attempt pending is open after first rejected; re-reject of 
           "reason = state_mismatch for already-rejected pending (V-2)",
         );
       }
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// Minimal valid ContractBounds JSON for the U-11 test.
+// The HTTP decisions endpoint parses bounds via ContractBoundsSchema; empty '{}' fails.
+const U11_VALID_BOUNDS = JSON.stringify({
+  paths: { allow: ["src/**"], deny: [] },
+  capabilities: {
+    bash: { allow: [], deny: [] },
+    tools: {
+      edit: true,
+      webfetch: false,
+      websearch: false,
+      task: false,
+      external_directory: false,
+      skill: false,
+    },
+  },
+  boundary: "artifact",
+  budget: { maxAttempts: 1, maxDurationSeconds: 60, estimatedSpendUsd: 0.5 },
+  review: "none",
+  changeClass: "editorial",
+  models: { worker: "claude-sonnet-4", reviewer: "claude-sonnet-4" },
+});
+
+// ---------------------------------------------------------------------------
+// U-11: GET /api/decisions — rationale batch-loaded from lead.plan observation
+// ---------------------------------------------------------------------------
+
+test("U-11: GET /api/decisions returns rationale for decision with lead.plan observation; null for decision without one", async (t) => {
+  if (!DATABASE_URL) {
+    console.warn("[db] DATABASE_URL unset; skipping integration test");
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withControlPlaneSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(DATABASE_URL, ctx.schema);
+    try {
+      const projectId = await seedProject(ctx);
+
+      // Helper: seed a contract with valid bounds so the HTTP endpoint can parse it.
+      async function seedContractWithBounds(workItemId: string): Promise<string> {
+        const contractId = `sc-u11-${randomUUID()}`;
+        await ctx.client.query(
+          `INSERT INTO step_contracts
+             (id, work_item_id, project_id, version, base_revision, inputs, criteria,
+              criteria_digest, profile_id, profile_digest, bounds, required_boundaries,
+              human_required, status)
+           VALUES ($1, $2, $3, 1, 'abc123', '{}', '[]', 'cdigest', 'profile1', 'pdigest',
+                   $4::jsonb, '[]', false, 'active')`,
+          [contractId, workItemId, projectId, U11_VALID_BOUNDS],
+        );
+        return contractId;
+      }
+
+      // --- Decision WITH rationale ---
+      const workItemId1 = await seedWorkItem(ctx, projectId, { lifecycle: "active" });
+      const contractId1 = await seedContractWithBounds(workItemId1);
+
+      const attemptId1 = `att-u11a-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO attempts (id, contract_id, contract_version, generation, status, budget_remaining)
+         VALUES ($1, $2, 1, 1, 'running', 0)`,
+        [attemptId1, contractId1],
+      );
+
+      // Insert the plan decision (pending_human) linked to the attempt.
+      const decisionId1 = `dec-u11a-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
+         VALUES ($1, 'plan', 'coordinator', $2, $3, 'pending_human', now())`,
+        [decisionId1, workItemId1, attemptId1],
+      );
+
+      // Seed a dispatch_intent for lead.plan so the batch query finds it.
+      const runId1 = `run-u11a-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO dispatch_intents
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
+         VALUES ($1, $2, 'pd-u11a', $3, 'completed', $4, $5)`,
+        [
+          `di-u11a-${randomUUID()}`,
+          TASK_IDS.leadPlan,
+          attemptId1,
+          runId1,
+          `ikey-u11a-${randomUUID()}`,
+        ],
+      );
+
+      // Seed a run_observation whose payload contains a valid LeadPlanOutput.
+      const EXPECTED_RATIONALE = "U-11 test rationale: the plan is sound";
+      const planPayload = {
+        output: {
+          kind: "proposal",
+          proposal: {
+            criteria: [{ id: "c1", text: "The change is correct", source: "operator" }],
+            profileId: "default",
+            changeClass: "editorial",
+            review: "none",
+            boundary: "artifact",
+            paths: { allow: ["src/**"], deny: [] },
+            capabilities: {
+              bash: { allow: [], deny: [] },
+              tools: {
+                edit: true,
+                webfetch: false,
+                websearch: false,
+                task: false,
+                external_directory: false,
+                skill: false,
+              },
+            },
+            budget: { maxAttempts: 1, maxDurationSeconds: 60, estimatedSpendUsd: 0.5 },
+            models: { worker: "claude-sonnet-4", reviewer: "claude-sonnet-4" },
+            rationale: EXPECTED_RATIONALE,
+            sources: [{ criterionId: "c1", source: "operator", citation: "PRD §1" }],
+          },
+        },
+      };
+      await ctx.client.query(
+        `INSERT INTO run_observations (run_id, generation, stale, payload)
+         VALUES ($1, 1, false, $2::jsonb)`,
+        [runId1, JSON.stringify(planPayload)],
+      );
+
+      // --- Decision WITHOUT rationale (no dispatch_intent / observation) ---
+      const workItemId2 = await seedWorkItem(ctx, projectId, { lifecycle: "active" });
+      const contractId2 = await seedContractWithBounds(workItemId2);
+
+      const attemptId2 = `att-u11b-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO attempts (id, contract_id, contract_version, generation, status, budget_remaining)
+         VALUES ($1, $2, 1, 1, 'running', 0)`,
+        [attemptId2, contractId2],
+      );
+
+      const decisionId2 = `dec-u11b-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
+         VALUES ($1, 'plan', 'coordinator', $2, $3, 'pending_human', now())`,
+        [decisionId2, workItemId2, attemptId2],
+      );
+
+      // Hit the actual HTTP endpoint (no API token configured → no auth required).
+      const app = createApp({
+        pool,
+        flow: makeFakeFlow(),
+        reconciler: makeFakeReconciler(),
+        runtime: makeFakeRuntime(),
+        config: makeAppConfig(),
+        clock: () => NOW_ISO,
+      });
+
+      const res = await app.request("/api/decisions");
+      assert.equal(res.status, 200, "GET /api/decisions should return 200");
+
+      const body = (await res.json()) as {
+        decisions: Array<{ id: string; recommendation: string | null }>;
+      };
+      assert.ok(Array.isArray(body.decisions), "response body should have decisions array");
+
+      const entry1 = body.decisions.find((d) => d.id === decisionId1);
+      assert.ok(entry1, "decision with rationale should appear in response");
+      assert.equal(
+        entry1?.recommendation,
+        EXPECTED_RATIONALE,
+        "U-11: rationale from lead.plan observation should be the recommendation",
+      );
+
+      const entry2 = body.decisions.find((d) => d.id === decisionId2);
+      assert.ok(entry2, "decision without observation should appear in response");
+      assert.equal(
+        entry2?.recommendation,
+        null,
+        "U-11: decision without lead.plan observation should have null recommendation",
+      );
     } finally {
       await pool.end();
     }

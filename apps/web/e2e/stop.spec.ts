@@ -6,7 +6,7 @@
  *   1. Navigate directly to the seeded wiBlocked item (running lifecycle,
  *      running attempt; the seed has no attempt in the `dispatched` state).
  *   2. Click Stop; assert the confirmation names the project, work item,
- *      consequence phrase, and attempt id.
+ *      contract version, consequence phrase, and attempt id.
  *   3. Confirm; assert no error.
  *   4. Reload; assert the Execution card reports "stopping" (or "stopped").
  *
@@ -56,6 +56,7 @@ test("work item page: stop action on running item shows confirm dialog and trans
   expect(message).toContain(ids.wiBlocked);
   expect(message).toMatch(/stops the running attempt/i);
   expect(message).toMatch(/attempt/i);
+  expect(message).toMatch(/contract v\d+/i);
   await page.getByTestId("confirm-ok").click();
 
   // Dialog closes; no error.

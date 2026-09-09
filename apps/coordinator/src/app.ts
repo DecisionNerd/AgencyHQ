@@ -1089,6 +1089,7 @@ export function createApp(deps: AppDeps): Hono {
       const allAttempts: Array<{
         id: string;
         contractId: string;
+        contractVersion: number | null;
         status: string;
         runId: string | null;
         checkpointCommit: string | null;
@@ -1141,6 +1142,7 @@ export function createApp(deps: AppDeps): Hono {
           allAttempts.push({
             id: a.id,
             contractId: contract.id,
+            contractVersion: a.contract_version,
             status: a.status,
             runId: a.run_id ?? null,
             checkpointCommit: a.checkpoint_commit ?? null,

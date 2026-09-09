@@ -258,6 +258,7 @@ export interface DecisionsView {
 export interface EvidenceAttempt {
   id: string;
   contractId: string;
+  contractVersion?: number | null;
   status: string;
   runId?: string | null;
   checkpointCommit?: string | null;
