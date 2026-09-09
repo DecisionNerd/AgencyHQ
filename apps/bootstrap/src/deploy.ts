@@ -136,6 +136,8 @@ function resolveTriggerBin(workspaceRoot: string): string {
 
 /** Name of the buildx builder the Trigger CLI uses by default (`--builder`). */
 const BUILDER_NAME = "trigger";
+/** Docker's embedded DNS resolver, reachable from containers on user-defined networks. */
+const EMBEDDED_DNS = "127.0.0.11";
 
 function docker(args: string[], dockerConfigDir: string): { status: number | null; out: string } {
   const r = spawnSync("docker", args, {
@@ -155,23 +157,39 @@ function docker(args: string[], dockerConfigDir: string): { status: number | nul
  * daemon's host network resolves no Docker service names (observed 2026-09-09:
  * "Failed to fetch environment variables: Connection error." at Containerfile
  * line 75), so the builder is created here, attached to the Docker network the
- * webapp is on; RUN steps then share that network and its embedded DNS.
+ * webapp is on. BuildKit still rewrites the sandbox's resolv.conf to public
+ * nameservers (it drops loopback entries such as Docker's embedded DNS at
+ * 127.0.0.11; observed 2026-09-09), so a buildkitd config pins the embedded DNS
+ * as the sandbox nameserver; RUN steps then resolve service names and reach the
+ * internet through it.
  *
  * The Docker CLI writes buildx state under $DOCKER_CONFIG (default
  * $HOME/.docker); HOME is /app in the image, which the runtime user cannot
  * write to, so the state lives under the writable state directory.
  */
 export function ensureBuilder(dockerConfigDir: string, network: string): void {
-  const wanted = `network="${network}"`;
+  const configPath = join(dockerConfigDir, "buildkitd.toml");
+  const config = `[dns]\n  nameservers = ["${EMBEDDED_DNS}"]\n`;
+  // Marker of the configuration the existing builder was created with; buildx
+  // inspect reports the driver options but not the daemon config file.
+  const markerPath = join(dockerConfigDir, "builder.marker");
+  const marker = `${BUILDER_NAME} network=${network} dns=${EMBEDDED_DNS}`;
+
   const inspect = docker(["buildx", "inspect", BUILDER_NAME], dockerConfigDir);
-  if (inspect.status === 0 && inspect.out.includes(wanted)) {
+  const existingMarker = existsSync(markerPath) ? readFileSync(markerPath, "utf-8") : "";
+  if (
+    inspect.status === 0 &&
+    inspect.out.includes(`network="${network}"`) &&
+    existingMarker === marker
+  ) {
     log(`buildx builder '${BUILDER_NAME}' present on network ${network}`);
     return;
   }
   if (inspect.status === 0) {
-    log(`buildx builder '${BUILDER_NAME}' exists with a different network; recreating`);
+    log(`buildx builder '${BUILDER_NAME}' exists with a different configuration; recreating`);
     docker(["buildx", "rm", "--force", BUILDER_NAME], dockerConfigDir);
   }
+  writeFileSync(configPath, config, "utf-8");
   const create = docker(
     [
       "buildx",
@@ -181,12 +199,15 @@ export function ensureBuilder(dockerConfigDir: string, network: string): void {
       "--driver",
       "docker-container",
       `--driver-opt=network=${network}`,
+      "--buildkitd-config",
+      configPath,
     ],
     dockerConfigDir,
   );
   if (create.status !== 0) {
     throw new Error(`failed to create buildx builder '${BUILDER_NAME}': ${create.out.trim()}`);
   }
+  writeFileSync(markerPath, marker, "utf-8");
   log(`buildx builder '${BUILDER_NAME}' created on network ${network}`);
 }
 
