@@ -130,11 +130,12 @@ test("slots limit: only `slots` items dispatched", () => {
 });
 
 test("mainEffort is chosen even when the top item is busy", () => {
-  // w1 is busy (its repo has an existing attempt); it should still be mainEffort
+  // w1 is busy (its repo has an existing attempt); it should still be mainEffort.
+  // slots=2 so the one active attempt occupies one slot and w2 can be dispatched.
   const result = selectDispatch({
     workItems: [item("w1", 1, "repo-a"), item("w2", 2, "repo-b")],
     activeAttempts: [attempt("w1", "repo-a")],
-    slots: 1,
+    slots: 2,
     uncertainRepositories: [],
   });
   // w1 is skipped already_active; w2 dispatches
@@ -201,6 +202,8 @@ test("already_active: work item with existing attempt skipped", () => {
 });
 
 test("full skipped-reasons table: each reason appears correctly", () => {
+  // slots=2: one slot consumed by the pre-existing active attempt on repo-t,
+  // one remaining slot consumed by active-a.  no-slot then has no slot left.
   const result = selectDispatch({
     workItems: [
       item("proposed", 1, "repo-p", { lifecycle: "proposed" }),
@@ -213,7 +216,7 @@ test("full skipped-reasons table: each reason appears correctly", () => {
       item("no-slot", 8, "repo-v"), // slot used by active-a
     ],
     activeAttempts: [attempt("already", "repo-t")],
-    slots: 1,
+    slots: 2,
     uncertainRepositories: ["repo-u"],
   });
 
@@ -257,4 +260,77 @@ test("completed and halted lifecycles are not eligible", () => {
   });
   assert.equal(result.dispatch.length, 0);
   assert.equal(result.mainEffort, null);
+});
+
+// ---------------------------------------------------------------------------
+// Slot accounting: active attempts count against the slot limit
+// ---------------------------------------------------------------------------
+
+test("slot accounting (a): slots=1, one active attempt on another repo → queued item skipped no_slot", () => {
+  // The active attempt occupies the single slot even though it is on a different
+  // repository.  The queued item is eligible (healthy, admitted, distinct repo)
+  // but must receive no_slot because slotsUsed starts at activeAttempts.length.
+  const result = selectDispatch({
+    workItems: [item("w2", 1, "repo-b")],
+    activeAttempts: [attempt("w1", "repo-a")],
+    slots: 1,
+    uncertainRepositories: [],
+  });
+  assert.deepEqual(result.dispatch, []);
+  assert.equal(result.skipped[0]?.workItemId, "w2");
+  assert.equal(result.skipped[0]?.reason, "no_slot");
+  assert.equal(result.mainEffort, "w2");
+});
+
+test("slot accounting (b): slots=2, one active attempt, two queued items on two other repos → first dispatched, second no_slot", () => {
+  // One active attempt → slotsUsed=1 before this pass.  Only one additional
+  // selection can be made (slots 2 − 1 already used = 1 remaining).
+  const result = selectDispatch({
+    workItems: [item("w2", 1, "repo-b"), item("w3", 2, "repo-c")],
+    activeAttempts: [attempt("w1", "repo-a")],
+    slots: 2,
+    uncertainRepositories: [],
+  });
+  assert.deepEqual(result.dispatch, [{ workItemId: "w2", repositoryId: "repo-b" }]);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0]?.workItemId, "w3");
+  assert.equal(result.skipped[0]?.reason, "no_slot");
+});
+
+test("slot accounting (c): slots=2, zero active, two queued on two repos → both dispatched", () => {
+  // Baseline: with no active attempts slotsUsed=0 and both items dispatch.
+  const result = selectDispatch({
+    workItems: [item("w1", 1, "repo-a"), item("w2", 2, "repo-b")],
+    activeAttempts: [],
+    slots: 2,
+    uncertainRepositories: [],
+  });
+  assert.equal(result.dispatch.length, 2);
+  assert.equal(result.skipped.length, 0);
+});
+
+test("slot accounting (d): dispatched.length + activeAttempts.length <= slots for arbitrary eligible inputs", () => {
+  // Property: the total of pre-existing active attempts plus newly dispatched
+  // selections never exceeds the slot limit.
+  const repos = ["repo-a", "repo-b", "repo-c", "repo-d", "repo-e"];
+  for (const slots of [0, 1, 2, 3]) {
+    for (let activeCount = 0; activeCount <= slots; activeCount++) {
+      const activeAttempts: ActiveAttemptLike[] = repos
+        .slice(0, activeCount)
+        .map((r, i) => attempt(`active-${i}`, r));
+      // Queued items on the remaining repos (those not busy).
+      const freeRepos = repos.slice(activeCount);
+      const workItems: WorkItemLike[] = freeRepos.map((r, i) => item(`queued-${i}`, i + 1, r));
+      const result = selectDispatch({
+        workItems,
+        activeAttempts,
+        slots,
+        uncertainRepositories: [],
+      });
+      assert.ok(
+        result.dispatch.length + activeAttempts.length <= slots,
+        `slots=${slots} active=${activeCount} dispatched=${result.dispatch.length}: total exceeds slot limit`,
+      );
+    }
+  }
 });

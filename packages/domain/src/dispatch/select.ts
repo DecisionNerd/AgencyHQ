@@ -8,6 +8,13 @@
  * exception.
  */
 
+import {
+  concurrencyFor,
+  type EffectiveCapacityStatus,
+  effectiveCapacity,
+  type ProviderCapacity,
+} from "../aggregates/provider-capacity.ts";
+
 /** Minimal work-item shape needed for dispatch selection. */
 export type WorkItemLike = {
   id: string;
@@ -39,6 +46,19 @@ export type WorkItemLike = {
    * this key within a campaign group.
    */
   createdAt?: string;
+  /**
+   * Optional provider identifier for the work item's worker model.
+   * Derived from the step contract's worker model by splitting on "/":
+   *   e.g. "anthropic/claude-opus-4" → provider="anthropic", model="claude-opus-4".
+   * When absent, no provider capacity constraint is applied.
+   */
+  provider?: string;
+  /**
+   * Optional model identifier within the provider (the part after "/").
+   * Used together with `provider` to look up the relevant ProviderCapacity
+   * observation.  When absent, no provider capacity constraint is applied.
+   */
+  model?: string;
 };
 
 /** Minimal active-attempt shape needed to detect busy repositories. */
@@ -56,7 +76,10 @@ export type SkipReason =
   | "repository_uncertain"
   | "no_slot"
   | "already_active"
-  | "integration_pending";
+  | "integration_pending"
+  | "provider_down"
+  | "provider_limited"
+  | "provider_unknown";
 
 /**
  * Design note — `not_main_effort_slot`:
@@ -87,6 +110,29 @@ export type SelectDispatchInput = {
    * use the existing global (rank asc, id asc) order.
    */
   mainEffortByCampaign?: Map<string, string> | Record<string, string>;
+  /**
+   * Provider capacity observations used to gate dispatch based on provider
+   * status.  Each entry describes the capacity of one provider/model pair.
+   * When absent or empty, no provider capacity constraint is applied.
+   */
+  providerCapacity?: ProviderCapacity[];
+  /**
+   * Current time as an ISO 8601 string.  Used to evaluate whether capacity
+   * observations are still within their validity window.  When absent and
+   * providerCapacity entries are present, observations are treated as expired
+   * (conservative "unknown").
+   */
+  now?: string;
+  /**
+   * Active attempt counts keyed by provider string, reflecting running
+   * attempts BEFORE this dispatch pass.  Used to enforce per-provider
+   * concurrency limits (concurrencyFor) when provider capacity is limited or
+   * unknown.
+   *
+   * Keys should match the `provider` field on WorkItemLike.
+   * Absent providers default to 0.
+   */
+  activeByProvider?: Record<string, number>;
 };
 
 export type SelectDispatchOutput = {
@@ -198,7 +244,13 @@ function compareSortKeys(a: SortKey, b: SortKey): number {
  * 4. The item's repository must not be in uncertainRepositories → repository_uncertain
  * 5. The item's repository must not already have an active attempt or an
  *    earlier selection in this pass → repository_busy
- * 6. There must be remaining slot capacity → no_slot
+ * 6. Provider capacity (when item has a provider field and providerCapacity is provided):
+ *    - effectiveCapacity "down"    → provider_down (always skipped)
+ *    - effectiveCapacity "limited" → provider_limited (skipped if concurrency slot taken)
+ *    - effectiveCapacity "unknown" → provider_unknown (skipped if concurrency slot taken)
+ *    - effectiveCapacity "ok"      → no skip
+ * 7. There must be remaining slot capacity (slots − active attempts − selections
+ *    this pass must be > 0) → no_slot
  *
  * Campaign ordering (when mainEffortByCampaign is provided):
  *   Within a campaign the designated main effort is placed first; remaining
@@ -209,7 +261,15 @@ function compareSortKeys(a: SortKey, b: SortKey): number {
  * stable even when the top item is blocked by a busy repository or slots.
  */
 export function selectDispatch(input: SelectDispatchInput): SelectDispatchOutput {
-  const { workItems, activeAttempts, slots, uncertainRepositories } = input;
+  const {
+    workItems,
+    activeAttempts,
+    slots,
+    uncertainRepositories,
+    providerCapacity = [],
+    now = "",
+    activeByProvider = {},
+  } = input;
   const mainEffortMap = toMap(input.mainEffortByCampaign);
 
   // Pre-compute the anchor rank for each campaign (rank of its main effort).
@@ -242,10 +302,15 @@ export function selectDispatch(input: SelectDispatchInput): SelectDispatchOutput
   // Repositories claimed by earlier selections in this pass.
   const selectedRepos = new Set<string>();
 
+  // Per-provider count of attempts chosen in this pass (in addition to
+  // activeByProvider which tracks pre-existing active attempts).
+  const chosenByProvider: Record<string, number> = {};
+
   const dispatch: { workItemId: string; repositoryId: string }[] = [];
   const skipped: { workItemId: string; reason: SkipReason }[] = [];
   let mainEffort: string | null = null;
-  let slotsUsed = 0;
+  // Slots already occupied by active attempts before this pass.
+  let slotsUsed = activeAttempts.length;
 
   for (const item of sorted) {
     // Rule 1: lifecycle gate.
@@ -298,7 +363,34 @@ export function selectDispatch(input: SelectDispatchInput): SelectDispatchOutput
       continue;
     }
 
-    // Rule 6: slots exhausted.
+    // Rule 6: provider capacity gate (only when the item declares a provider).
+    if (item.provider !== undefined && providerCapacity.length > 0) {
+      const obs = providerCapacity.find(
+        (pc) => pc.provider === item.provider && pc.model === item.model,
+      );
+      const cap: EffectiveCapacityStatus = effectiveCapacity(obs, now);
+      const limit = concurrencyFor(cap);
+
+      if (limit === 0) {
+        // Provider is down — no attempts allowed.
+        skipped.push({ workItemId: item.id, reason: "provider_down" });
+        continue;
+      }
+
+      if (limit !== null) {
+        // Finite concurrency (limited or unknown): check if slot is taken.
+        const currentCount =
+          (activeByProvider[item.provider] ?? 0) + (chosenByProvider[item.provider] ?? 0);
+        if (currentCount >= limit) {
+          const reason: SkipReason = cap === "limited" ? "provider_limited" : "provider_unknown";
+          skipped.push({ workItemId: item.id, reason });
+          continue;
+        }
+      }
+      // cap === "ok" (null limit): no constraint — fall through.
+    }
+
+    // Rule 7: slots exhausted.
     if (slotsUsed >= slots) {
       skipped.push({ workItemId: item.id, reason: "no_slot" });
       continue;
@@ -308,6 +400,11 @@ export function selectDispatch(input: SelectDispatchInput): SelectDispatchOutput
     dispatch.push({ workItemId: item.id, repositoryId: item.repositoryId });
     selectedRepos.add(item.repositoryId);
     slotsUsed++;
+
+    // Track chosen count by provider for subsequent provider capacity checks.
+    if (item.provider !== undefined) {
+      chosenByProvider[item.provider] = (chosenByProvider[item.provider] ?? 0) + 1;
+    }
   }
 
   return { dispatch, skipped, mainEffort };

@@ -11,7 +11,10 @@ import {
   claimCommand,
   completeCommand,
   getWorkItem,
+  leadMetrics,
+  listActiveAttemptCountsPerProject,
   listAttemptsByContract,
+  listCurrentCapacity,
   listDecisionsByWorkItem,
   listFindingsByAttempt,
   listIntegrationsByAttempt,
@@ -21,7 +24,9 @@ import {
   listVerificationResultsByAttempt,
   listWorkItemProjects,
   listWorkItemsByProject,
+  recordCapacity,
 } from "@agencyhq/db";
+import { concurrencyFor, effectiveCapacity } from "@agencyhq/domain";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { createBearerAuthMiddleware } from "./auth.ts";
@@ -29,6 +34,7 @@ import type { CoordinatorConfig } from "./config.ts";
 import { buildAuthorityView } from "./views/authority-view.ts";
 import { buildDecisionsView } from "./views/decisions-view.ts";
 import { buildEvidenceView } from "./views/evidence-view.ts";
+import type { OverviewCapacitySummary } from "./views/overview-view.ts";
 import { buildOverviewView } from "./views/overview-view.ts";
 import { openPendingDecisions } from "./views/pending.ts";
 import {
@@ -752,6 +758,39 @@ export function createApp(deps: AppDeps): Hono {
         }
       }
 
+      // Load active attempt counts per project using the same rule as the scheduler
+      // (listActiveAttemptsForScheduling) so the UI and the scheduler agree on what
+      // counts as "active" (F8 fix: was using the raw status rule).
+      const activeAttemptCountRows = await listActiveAttemptCountsPerProject(
+        client as Parameters<typeof listActiveAttemptCountsPerProject>[0],
+      );
+
+      // Load current capacity for the overview summary.
+      const pgClient2 = client as Parameters<typeof listCurrentCapacity>[0];
+      const capacityRows = await listCurrentCapacity(pgClient2, new Date());
+      const overviewNow = new Date().toISOString();
+      const overviewCapacity: OverviewCapacitySummary[] = capacityRows.map((r) => {
+        const obs = {
+          provider: r.provider,
+          model: r.model,
+          status: r.status,
+          observedAt: r.observed_at.toISOString(),
+          validUntil: r.valid_until.toISOString(),
+          source: r.source,
+        };
+        const effStatus = effectiveCapacity(obs, overviewNow);
+        return {
+          provider: r.provider,
+          model: r.model,
+          status: r.status,
+          effective: effStatus,
+          concurrency: concurrencyFor(effStatus),
+          observedAt: r.observed_at.toISOString(),
+          validUntil: r.valid_until.toISOString(),
+          source: r.source,
+        };
+      });
+
       const view = buildOverviewView({
         campaigns: campaignRows.map((r) => ({
           id: r.id,
@@ -778,9 +817,79 @@ export function createApp(deps: AppDeps): Hono {
           attemptId: d.attempt_id,
           at: d.at,
         })),
+        activeAttempts: activeAttemptCountRows.map((r) => ({
+          projectId: r.project_id,
+          count: r.count,
+        })),
+        capacity: overviewCapacity,
       });
 
       return c.json(view);
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/decisions
+  // ------------------------------------------------------------------
+  // ------------------------------------------------------------------
+  // GET /api/metrics/lead?since=<iso>
+  // Lead quality metrics per project, optionally filtered to rows
+  // created on or after `since`.
+  // ------------------------------------------------------------------
+  app.get("/api/metrics/lead", async (c) => {
+    const sinceParam = c.req.query("since");
+    let sinceDate: Date | null = null;
+    if (sinceParam) {
+      const d = new Date(sinceParam);
+      if (isNaN(d.getTime())) {
+        return c.json({ error: "Invalid since parameter — expected ISO 8601" }, 400);
+      }
+      sinceDate = d;
+    }
+    const client = await pool.connect();
+    try {
+      const pgClient = client as Parameters<typeof leadMetrics>[0];
+      const rows = await leadMetrics(pgClient, { since: sinceDate });
+      return c.json({ since: sinceDate ? sinceDate.toISOString() : null, projects: rows });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/capacity
+  // Current provider capacity rows with effective status and concurrency.
+  // ------------------------------------------------------------------
+  app.get("/api/capacity", async (c) => {
+    const client = await pool.connect();
+    try {
+      const pgClient = client as Parameters<typeof listCurrentCapacity>[0];
+      const capacityRows = await listCurrentCapacity(pgClient, new Date());
+      const capNow = new Date().toISOString();
+      const result = capacityRows.map((r) => {
+        const obs = {
+          provider: r.provider,
+          model: r.model,
+          status: r.status,
+          observedAt: r.observed_at.toISOString(),
+          validUntil: r.valid_until.toISOString(),
+          source: r.source,
+        };
+        const effStatus = effectiveCapacity(obs, capNow);
+        return {
+          provider: r.provider,
+          model: r.model,
+          status: r.status,
+          effective: effStatus,
+          concurrency: concurrencyFor(effStatus),
+          observedAt: r.observed_at.toISOString(),
+          validUntil: r.valid_until.toISOString(),
+          source: r.source,
+        };
+      });
+      return c.json({ now: capNow, providers: result });
     } finally {
       client.release();
     }
@@ -1695,6 +1804,62 @@ export function createApp(deps: AppDeps): Hono {
         }
         const result = await commands.updateAuthority({ commandId, projectId, authority, actor });
         return c.json({ commandId, result }, 200);
+      }
+
+      // Design 2: set_capacity — operator-sourced provider capacity override.
+      // Idempotent by commandId (via claimCommand), decision row kind='capacity'.
+      if (kind === "set_capacity") {
+        const setCapProvider = body.provider;
+        const setCapModel = body.model;
+        const setCapStatus = body.status;
+        const setCapValidUntil = body.validUntil;
+        if (!setCapProvider || typeof setCapProvider !== "string") {
+          return c.json({ error: "provider required for set_capacity" }, 400);
+        }
+        if (!setCapModel || typeof setCapModel !== "string") {
+          return c.json({ error: "model required for set_capacity" }, 400);
+        }
+        if (setCapStatus !== "ok" && setCapStatus !== "limited" && setCapStatus !== "down") {
+          return c.json({ error: "status must be ok|limited|down for set_capacity" }, 400);
+        }
+        if (!setCapValidUntil || typeof setCapValidUntil !== "string") {
+          return c.json({ error: "validUntil (ISO 8601) required for set_capacity" }, 400);
+        }
+        const validUntilDate = new Date(setCapValidUntil);
+        if (isNaN(validUntilDate.getTime())) {
+          return c.json({ error: "validUntil is not a valid ISO 8601 timestamp" }, 400);
+        }
+        const setCapClient = await pool.connect();
+        try {
+          const setCapPg = setCapClient as Parameters<typeof claimCommand>[0];
+          const setCap_claim = await claimCommand(setCapPg, commandId, "set_capacity");
+          if (!setCap_claim.claimed) {
+            const inFlight = "inFlight" in setCap_claim && setCap_claim.inFlight === true;
+            return c.json(
+              {
+                commandId,
+                replayed: true,
+                inFlight,
+                result: inFlight ? null : setCap_claim.result,
+              },
+              200,
+            );
+          }
+          const now = new Date();
+          const capResult = await recordCapacity(setCapPg, {
+            provider: setCapProvider,
+            model: setCapModel,
+            status: setCapStatus,
+            observed_at: now,
+            valid_until: validUntilDate,
+            source: "operator",
+          });
+          const result = { ok: true, result: capResult.result };
+          await completeCommand(setCapPg, commandId, result);
+          return c.json({ commandId, replayed: false, result }, 200);
+        } finally {
+          setCapClient.release();
+        }
       }
     } else {
       // Fallback when commands are not wired (legacy / test mode)

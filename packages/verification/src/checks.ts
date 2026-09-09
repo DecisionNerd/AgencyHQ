@@ -83,4 +83,22 @@ export const CHECK_CATALOG: Record<string, CheckDef> = {
     command: ["node", fileURLToPath(new URL("./manifest-consumer-cmd.mjs", import.meta.url))],
     timeoutSeconds: 900,
   },
+  /**
+   * pnpm-install@1: installs dependencies from the lockfile.
+   *
+   * Uses --frozen-lockfile so the run fails (non-zero exit) when the lockfile
+   * is out of date with package.json.  This is intentional: a worker that
+   * changed package.json without updating the lockfile must fail verification
+   * here rather than silently passing because pnpm auto-installed new packages.
+   *
+   * Introduced 2026-09-08 after live defects where fresh git worktrees had no
+   * node_modules and pnpm's implicit auto-install was unreliable inside the
+   * task process, causing pnpm-typecheck@1 to fail with TS2688.
+   */
+  "pnpm-install@1": {
+    id: "pnpm-install@1",
+    version: "1",
+    command: ["pnpm", "install", "--frozen-lockfile"],
+    timeoutSeconds: 600,
+  },
 };

@@ -23,6 +23,18 @@ export type CoordinatorConfig = {
    * Default: 2.
    */
   integrateRetries?: number | undefined;
+  /**
+   * Number of concurrent worker slots.  Admission queues when all slots are
+   * occupied; the scheduler dispatches queued intents when a slot becomes free.
+   * Default: 1.
+   */
+  workerSlots?: number | undefined;
+  /**
+   * When true, the reconciler subscribes to the runtime push feed (subscribe
+   * port) and wakes up on any run observation rather than waiting for the next
+   * polling interval.  Default: false.
+   */
+  realtimeWakeup?: boolean | undefined;
   webDist?: string;
   port: number;
   bindHost: string;
@@ -128,6 +140,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
   const freshnessStaleMs = integer("FRESHNESS_STALE_MS", 30000);
   const uncertainAfterMs = integer("AGENCYHQ_UNCERTAIN_AFTER_MS", 120_000);
   const integrateRetries = integer("AGENCYHQ_INTEGRATE_RETRIES", 2);
+  const workerSlots = integer("AGENCYHQ_WORKER_SLOTS", 1);
+  const realtimeWakeupRaw = optional("AGENCYHQ_REALTIME_WAKEUP");
+  const realtimeWakeup = realtimeWakeupRaw === "true" || realtimeWakeupRaw === "1";
   const webDist = optional("WEB_DIST");
   const port = portNum("PORT", 8787);
   const bindHost = optional("AGENCYHQ_BIND_HOST") ?? "127.0.0.1";
@@ -157,6 +172,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     freshnessStaleMs,
     uncertainAfterMs,
     integrateRetries,
+    workerSlots: workerSlots,
+    realtimeWakeup: realtimeWakeup,
     port,
     bindHost,
   };

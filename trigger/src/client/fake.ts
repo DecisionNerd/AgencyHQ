@@ -42,6 +42,8 @@ type FakeRunRecord = {
   metadata?: Record<string, unknown>;
   error?: { message: string; name?: string };
   cancelledAt?: string;
+  /** Tags attached at trigger time, used to route subscribe() notifications. */
+  tags: string[];
   /** Remaining scripted steps (consumed by advance()). */
   pendingSteps: FakeRunStep[];
 };
@@ -66,8 +68,18 @@ export type FakeScriptHandler = (
 
 /** One entry in the calls log. */
 export type FakeCallRecord = {
-  method: "trigger" | "cancel" | "retrieve" | "createPublicToken";
+  method: "trigger" | "cancel" | "retrieve" | "createPublicToken" | "subscribe";
   args: readonly unknown[];
+};
+
+// ---------------------------------------------------------------------------
+// Subscribe record (internal)
+// ---------------------------------------------------------------------------
+
+type FakeSubscription = {
+  tags: string[];
+  onObservation: (obs: RunObservation) => void;
+  signal: AbortSignal;
 };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +128,9 @@ export class FakeExecutionRuntime implements ExecutionRuntime {
 
   /** Per-task script handlers. */
   private readonly scripts = new Map<string, FakeScriptHandler>();
+
+  /** Active subscribe() registrations, keyed for O(n) iteration on advance(). */
+  private readonly _subscriptions: FakeSubscription[] = [];
 
   /** When true, the next trigger() will register the run then throw. */
   private _dropNext = false;
@@ -197,6 +212,7 @@ export class FakeExecutionRuntime implements ExecutionRuntime {
       task,
       payload,
       status: "QUEUED",
+      tags: options.tags ?? [],
       pendingSteps: [],
     };
 
@@ -260,6 +276,46 @@ export class FakeExecutionRuntime implements ExecutionRuntime {
     return `public_token:tags=${tagStr}:expires=${input.expiresIn}`;
   }
 
+  /**
+   * Subscribe to observations for runs carrying any of `input.tags`.
+   *
+   * The returned promise resolves when `input.signal` is aborted.  While the
+   * subscription is active, every `advance()` call that transitions a run
+   * whose tags intersect `input.tags` will call `onObservation` with the
+   * current snapshot of that run — mirroring the real
+   * `runs.subscribeToRunsWithTag` wake-up semantics.
+   *
+   * This is a **wake-up hint**; polling via `retrieve` remains the path of
+   * record.
+   */
+  async subscribe(
+    input: { tags: string[]; signal: AbortSignal },
+    onObservation: (obs: RunObservation) => void,
+  ): Promise<void> {
+    this.calls.push({ method: "subscribe", args: [input] });
+
+    if (input.signal.aborted) return;
+
+    const sub: FakeSubscription = {
+      tags: input.tags,
+      onObservation,
+      signal: input.signal,
+    };
+    this._subscriptions.push(sub);
+
+    return new Promise<void>((resolve) => {
+      input.signal.addEventListener(
+        "abort",
+        () => {
+          const idx = this._subscriptions.indexOf(sub);
+          if (idx !== -1) this._subscriptions.splice(idx, 1);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Test-control helpers
   // -------------------------------------------------------------------------
@@ -270,6 +326,10 @@ export class FakeExecutionRuntime implements ExecutionRuntime {
    * The built-in progression is QUEUED → EXECUTING → scripted steps.
    * If the run is already in a final status or has no more steps, this is a
    * no-op.
+   *
+   * After the step is applied, any active subscribe() subscriptions whose tag
+   * set intersects this run's tags receive an observation — mirroring the
+   * real `subscribeToRunsWithTag` wake-up behaviour.
    */
   advance(runId: string): void {
     const run = this._requireRun(runId);
@@ -289,6 +349,17 @@ export class FakeExecutionRuntime implements ExecutionRuntime {
         if (rid === runId) {
           this.idempotency.delete(key);
           break;
+        }
+      }
+    }
+
+    // Notify any active subscribers whose tag set intersects this run's tags.
+    if (run.tags.length > 0) {
+      const obs = this._observe(run);
+      for (const sub of this._subscriptions) {
+        if (sub.signal.aborted) continue;
+        if (sub.tags.some((t) => run.tags.includes(t))) {
+          sub.onObservation(obs);
         }
       }
     }

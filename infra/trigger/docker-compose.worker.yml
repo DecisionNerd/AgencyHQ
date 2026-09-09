@@ -1,0 +1,120 @@
+# trigger.dev worker stack overlay (container profile)
+#
+# Source: https://raw.githubusercontent.com/triggerdotdev/trigger.dev/v4.5.16/hosting/docker/worker/docker-compose.yml
+# Read: 2026-09-08
+#
+# Vendored from Trigger.dev tag v4.5.16 with a small set of edits (see
+# UPSTREAM.md § "Worker stack (docker-compose.worker.yml)" for the full list).
+# This worker stack has not yet been exercised — status is:
+# pending: Slice 6 container spike.
+#
+# Usage: overlay with the webapp file so the trigger worker stack container
+# trigger worker stack container (supervisor) can reach the shared volume the webapp bootstraps:
+#
+#   docker compose \
+#     -f infra/trigger/docker-compose.yml \
+#     -f infra/trigger/docker-compose.worker.yml \
+#     --env-file infra/trigger/.env \
+#     up -d supervisor docker-proxy  # trigger worker stack services only
+
+name: trigger
+
+x-logging: &logging-config
+  driver: ${LOGGING_DRIVER:-local}
+  options:
+    max-size: ${LOGGING_MAX_SIZE:-20m}
+    max-file: ${LOGGING_MAX_FILES:-5}
+    compress: ${LOGGING_COMPRESS:-true}
+
+services:
+  supervisor: # trigger.dev worker stack container
+    # agencyhq: pin the default tag to the vendored release instead of
+    # upstream's floating `latest`; matches TRIGGER_IMAGE_TAG in .env.example.
+    image: ghcr.io/triggerdotdev/supervisor:${TRIGGER_IMAGE_TAG:-v4.5.16}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    logging: *logging-config
+    depends_on:
+      - docker-proxy
+    networks:
+      - supervisor # trigger worker stack
+      - docker-proxy
+      - webapp
+    volumes:
+      - shared:/home/node/shared
+    # Only needed for bootstrap
+    user: root
+    # Only needed for bootstrap
+    command: sh -c "chown -R node:node /home/node/shared && exec /usr/bin/dumb-init -- pnpm run --filter supervisor start"  # trigger worker stack container init
+    environment:
+      # This needs to match the token of the worker group you want to connect to.
+      # Use the bootstrap token written by the webapp into the shared volume
+      # (TRIGGER_BOOTSTRAP_WORKER_TOKEN_PATH in docker-compose.yml); or set
+      # TRIGGER_WORKER_TOKEN in .env to a token created in the dashboard
+      # (Trigger → Worker groups) to bypass the bootstrap file.
+      # TRIGGER_WORKER_TOKEN: ${TRIGGER_WORKER_TOKEN}
+      # Use the bootstrap token created by the webapp (trigger worker stack default)
+      TRIGGER_WORKER_TOKEN: file:///home/node/shared/worker_token
+      MANAGED_WORKER_SECRET: ${MANAGED_WORKER_SECRET}
+      TRIGGER_API_URL: ${TRIGGER_API_URL:-http://webapp:3000}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://webapp:3000/otel}
+      TRIGGER_WORKLOAD_API_DOMAIN: supervisor # worker stack internal routing domain
+      TRIGGER_WORKLOAD_API_PORT_EXTERNAL: 8020
+      # Optional settings — kept as upstream defaults
+      DEBUG: 1
+      ENFORCE_MACHINE_PRESETS: 1
+      TRIGGER_DEQUEUE_INTERVAL_MS: 1000
+      DOCKER_HOST: tcp://docker-proxy:2375
+      DOCKER_RUNNER_NETWORKS: webapp,supervisor # trigger worker stack networks
+      # agencyhq: default follows the registry's publish port (5001, not
+      # upstream's 5000 — macOS AirPlay Receiver holds 5000 on this host).
+      DOCKER_REGISTRY_URL: ${DOCKER_REGISTRY_URL:-localhost:5001}
+      DOCKER_REGISTRY_USERNAME: ${DOCKER_REGISTRY_USERNAME:-}
+      DOCKER_REGISTRY_PASSWORD: ${DOCKER_REGISTRY_PASSWORD:-}
+      DOCKER_AUTOREMOVE_EXITED_CONTAINERS: 0
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "http.get('http://localhost:8020/health', res => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  docker-proxy:
+    # agencyhq: pin the default tag instead of upstream's floating `latest`;
+    # v0.5.0 chosen from the Docker Hub tags API on 2026-09-08.
+    image: tecnativa/docker-socket-proxy:${DOCKER_PROXY_IMAGE_TAG:-v0.5.0}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    logging: *logging-config
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-proxy
+    environment:
+      - LOG_LEVEL=info
+      - POST=1
+      - CONTAINERS=1
+      - IMAGES=1
+      - INFO=1
+      - NETWORKS=1
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "2375"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  shared:
+
+networks:
+  docker-proxy:
+    name: docker-proxy
+  supervisor: # trigger worker stack
+    name: supervisor # trigger worker stack
+  webapp:
+    name: webapp

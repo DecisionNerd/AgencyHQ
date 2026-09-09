@@ -18,6 +18,7 @@ import { getDecision, insertDecision, listDecisionsByWorkItem } from "../../src/
 import {
   getDispatchIntent,
   insertDispatchIntent,
+  listActiveAttemptCountsPerProject,
   listOpenDispatchIntents,
   updateDispatchIntentStatus,
 } from "../../src/repos/dispatch-intents.ts";
@@ -830,5 +831,176 @@ test("transitions: insertTransition writes an audit row", async (t) => {
     assert.ok(row.id > 0);
     assert.equal(row.aggregate, "attempts");
     assert.equal(row.to_state, "admitted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listActiveAttemptCountsPerProject (F8 active-attempt rule fix)
+// ---------------------------------------------------------------------------
+
+test("listActiveAttemptCountsPerProject: counts dispatched attempt with triggered worker.attempt intent", async (t) => {
+  await withTestSchema(t, async ({ client }) => {
+    // Setup: project → work_item → step_contract → attempt (dispatched) +
+    // dispatch_intent (worker.attempt, triggered).
+    await insertProject(client, {
+      id: "proj-aac",
+      authority: HOST_TRIAL_AUTHORITY,
+      authority_version: "1",
+    });
+    await insertWorkItem(client, {
+      id: "wi-aac",
+      project_id: "proj-aac",
+      rank: 1,
+      intent: "test active count",
+      boundary: "artifact",
+      lifecycle: "running",
+      condition: "healthy",
+    });
+    await insertStepContract(client, {
+      id: "sc-aac",
+      work_item_id: "wi-aac",
+      project_id: "proj-aac",
+      version: 1,
+      base_revision: "aac0000",
+      inputs: {},
+      criteria: [CRITERION],
+      criteria_digest: DIGEST,
+      profile_id: "p",
+      profile_digest: DIGEST,
+      bounds: BOUNDS,
+      required_boundaries: ["artifact"],
+      human_required: false,
+      status: "active",
+    });
+    await insertAttempt(client, {
+      id: "att-aac",
+      contract_id: "sc-aac",
+      contract_version: 1,
+      generation: 1,
+      status: "dispatched",
+      budget_remaining: 100,
+    });
+    await insertDispatchIntent(client, {
+      id: "di-aac",
+      task: "worker.attempt",
+      payload_digest: DIGEST,
+      attempt_id: "att-aac",
+      status: "triggered",
+      run_id: "run-aac",
+      idempotency_key: "idem-aac",
+    });
+
+    // The dispatched attempt with a triggered worker.attempt intent → count = 1.
+    const rows = await listActiveAttemptCountsPerProject(client);
+    const found = rows.find((r) => r.project_id === "proj-aac");
+    assert.ok(found, "project-aac must appear in active counts");
+    assert.equal(found.count, 1, "count must be 1 for one active attempt");
+  });
+});
+
+test("listActiveAttemptCountsPerProject: stopping attempt counted without open intent", async (t) => {
+  await withTestSchema(t, async ({ client }) => {
+    await insertProject(client, {
+      id: "proj-aac2",
+      authority: HOST_TRIAL_AUTHORITY,
+      authority_version: "1",
+    });
+    await insertWorkItem(client, {
+      id: "wi-aac2",
+      project_id: "proj-aac2",
+      rank: 1,
+      intent: "test stopping",
+      boundary: "artifact",
+      lifecycle: "running",
+      condition: "healthy",
+    });
+    await insertStepContract(client, {
+      id: "sc-aac2",
+      work_item_id: "wi-aac2",
+      project_id: "proj-aac2",
+      version: 1,
+      base_revision: "aac20000",
+      inputs: {},
+      criteria: [CRITERION],
+      criteria_digest: DIGEST,
+      profile_id: "p",
+      profile_digest: DIGEST,
+      bounds: BOUNDS,
+      required_boundaries: ["artifact"],
+      human_required: false,
+      status: "active",
+    });
+    await insertAttempt(client, {
+      id: "att-aac2",
+      contract_id: "sc-aac2",
+      contract_version: 1,
+      generation: 1,
+      status: "stopping",
+      budget_remaining: 100,
+    });
+    // No dispatch_intent: stopping is counted regardless of open intent.
+
+    const rows = await listActiveAttemptCountsPerProject(client);
+    const found = rows.find((r) => r.project_id === "proj-aac2");
+    assert.ok(found, "proj-aac2 must appear (stopping attempt counts as active)");
+    assert.equal(found.count, 1, "stopping attempt counted as active even without open intent");
+  });
+});
+
+test("listActiveAttemptCountsPerProject: terminal lifecycle excludes attempt", async (t) => {
+  await withTestSchema(t, async ({ client }) => {
+    // Attempt is dispatched with triggered worker.attempt intent, BUT the work item
+    // has lifecycle='halted' → excluded from active counts.
+    await insertProject(client, {
+      id: "proj-aac3",
+      authority: HOST_TRIAL_AUTHORITY,
+      authority_version: "1",
+    });
+    await insertWorkItem(client, {
+      id: "wi-aac3",
+      project_id: "proj-aac3",
+      rank: 1,
+      intent: "test halted exclusion",
+      boundary: "artifact",
+      lifecycle: "halted",
+      condition: "healthy",
+    });
+    await insertStepContract(client, {
+      id: "sc-aac3",
+      work_item_id: "wi-aac3",
+      project_id: "proj-aac3",
+      version: 1,
+      base_revision: "aac30000",
+      inputs: {},
+      criteria: [CRITERION],
+      criteria_digest: DIGEST,
+      profile_id: "p",
+      profile_digest: DIGEST,
+      bounds: BOUNDS,
+      required_boundaries: ["artifact"],
+      human_required: false,
+      status: "active",
+    });
+    await insertAttempt(client, {
+      id: "att-aac3",
+      contract_id: "sc-aac3",
+      contract_version: 1,
+      generation: 1,
+      status: "dispatched",
+      budget_remaining: 100,
+    });
+    await insertDispatchIntent(client, {
+      id: "di-aac3",
+      task: "worker.attempt",
+      payload_digest: DIGEST,
+      attempt_id: "att-aac3",
+      status: "triggered",
+      run_id: "run-aac3",
+      idempotency_key: "idem-aac3",
+    });
+
+    const rows = await listActiveAttemptCountsPerProject(client);
+    const found = rows.find((r) => r.project_id === "proj-aac3");
+    assert.equal(found, undefined, "halted work item must be excluded from active counts");
   });
 });

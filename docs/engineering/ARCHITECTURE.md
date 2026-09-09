@@ -85,20 +85,22 @@ generated); `impact` (work item, contract version, attempt); `noActionConsequenc
 (fixed text: `"stays pending; no dispatch"`); and available `actions`
 (`approve`/`reject` for accept decisions).
 
-### Coordinator API (Slice 5)
+### Coordinator API (Slice 6)
 
 All routes require `Authorization: Bearer <token>`.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/overview` | Campaigns with main effort, projects, ranked work items |
+| `GET` | `/api/overview` | Campaigns with main effort, projects, ranked work items with active-attempt counts and optional skip-reason |
 | `GET` | `/api/decisions` | Open `pending_human` decisions (filtered by `isOpenPending`) |
 | `GET` | `/api/work-items/:id/evidence` | Full evidence for one work item |
 | `GET` | `/api/work-items/:id/view` | Single-item return view including integrations and manifest rows |
 | `GET` | `/api/projects/:id/authority` | Current authority and full `authority_versions` history |
 | `PUT` | `/api/projects/:id/authority` | Dispatches `update_authority` command |
+| `GET` | `/api/capacity` | Current `provider_capacity` rows with `effective` and `concurrency` |
+| `GET` | `/api/metrics/lead` | Per-project Lead quality metrics (plans, escalation rate, acceptances, reversal rate, review yield, findings by disposition, integrations by outcome) with optional `since` query parameter |
 
-**Slice 5 commands** (`POST /api/commands`, idempotent by `commandId`):
+**Slice 5–6 commands** (`POST /api/commands`, idempotent by `commandId`):
 
 | `kind` | Effect |
 | --- | --- |
@@ -109,6 +111,7 @@ All routes require `Authorization: Bearer <token>`.
 | `set_main_effort` | Sets `main_effort_work_item_id` on a campaign; work item must belong to the campaign (`not_a_member` otherwise) |
 | `set_rank` | Optimistic CAS on work item `version`; returns `stale_version` on mismatch |
 | `update_authority` | Schema-validated; integer-major version must increase; `SELECT FOR UPDATE` row lock + CAS on `authority_version`; concurrent same-base update returns `version_not_increasing`; backfills initial version history on first update attributed to actor `backfill` at the project's `created_at`; appends to `authority_versions`; inserts `authority_update` decision; frozen contract bounds untouched (R-018) |
+| `set_capacity` | Sets a `provider_capacity` row for a provider/model pair with a `status` (`ok`\|`limited`\|`down`) and an explicit `validUntil` timestamp; `source = "operator"`. Reflected immediately in `selectDispatch` capacity gating and in `/api/capacity`. |
 
 ### Coordinator
 
@@ -121,7 +124,14 @@ Owns the ledger and the policy:
 - consumes run outputs and final statuses idempotently into attempt reports,
   Artifacts, VerificationResults, Reviews, and failure records;
 - commits Lead proposals as Decisions only when they pass the authority check;
-- holds the Trigger secret key and AgencyHQ's own secrets.
+- holds the Trigger secret key and AgencyHQ's own secrets;
+- on admission records the worker intent as `queued` and `BoundedRepairFlow.onLeadPlanOutput` calls `scheduleQueuedIntents` (`apps/coordinator/src/flow/schedule.ts`) directly, applying every gate at admission time; if the admitted item's own worker dispatch fails, a failure row and `pending_human` decision are recorded and the worker intent is marked `failed`; failures of other queued items during the pass are logged and those items are retried on the next poll;
+- the reconciler's polling wrapper (`Reconciler.scheduleOnce`) also calls `scheduleQueuedIntents` on every polling pass: `selectDispatch` selects the highest-ranked eligible work items up to `AGENCYHQ_WORKER_SLOTS`, deducting active attempts (attempts in `stopping` status or with an in-flight `worker.attempt` intent, whose work item is not halted/completed/done — `listActiveAttemptsForScheduling`) and applying provider capacity gating before the slot gate; the provider gate is skipped entirely when the `provider_capacity` table is empty;
+- when `AGENCYHQ_REALTIME_WAKEUP=true`, subscribes to `runs.subscribeToRunsWithTag`
+  for the tags of all non-terminal work items; the subscription refreshes after every
+  poll and resubscribes when the tag set changes (observed 2026-09-08, `@trigger.dev/sdk` 4.5.16:
+  `subscribeToRunsWithTag` replays current run states on subscribe — absorbed by the
+  pollOnce in-flight guard); polling remains the authoritative observation path.
 
 ### Lead
 
@@ -193,17 +203,17 @@ host profile and does not cause R-016 rejection; only contracts that enable
 
 | Boundary | Host profile | Kind | Container profile |
 | --- | --- | --- | --- |
-| Worktree per attempt | Separate `git worktree` folder; never shared with a replacement. | Before action | Fresh clone per container. |
-| Filesystem isolation from the host | None; the worker can read host files. | Advisory | Container filesystem. |
-| CPU, memory | None. | Advisory | Machine preset. |
-| Duration | Trigger `maxDuration` from the contract. | Before action | Same. |
-| Tool and command capability | OpenCode permission rules generated from the contract; `deny` survives `--auto`. | Before action | Same. |
-| Output paths | Adapter diff check against `paths.allow/deny`; violations quarantine the attempt. | On output | Same. |
-| Git pushes from the worker | Scrubbed child environment (no SSH agent, no tokens, empty credential helper) plus `deny` on `git push`/`git remote`. | Before action | No credential exists. |
-| Merge, deploy, publish | Only `integrate.merge`, after acceptance, serialized, compare-and-set. | Before action | Same, with operation-scoped token. |
-| Termination | Generation revoked → `runs.cancel` → `onCancel` checkpoint commit and process-group kill → adapter confirms no survivors → Trigger final status. | Trusted observation | Supervisor removes the container. |
-| Egress and provider spend | None; spend is an estimate. | Advisory | Gateway with per-attempt keys (later). |
-| Nested agents | OpenCode `task` tool denied for worker agents. | Before action | Same. |
+| Worktree per attempt | Separate `git worktree` folder; never shared with a replacement. | Before action | Fresh clone per container. not observed (no clone-from-remote step exists). |
+| Filesystem isolation from the host | None; the worker can read host files. | Advisory | Container filesystem. spike-observed (2026-09-08): cwd /app, no host paths visible. |
+| CPU, memory | None. | Advisory | Machine preset. not observed. |
+| Duration | Trigger `maxDuration` from the contract. | Before action | Same. not observed. |
+| Tool and command capability | OpenCode permission rules generated from the contract; `deny` survives `--auto`. | Before action | Same. not observed. |
+| Output paths | Adapter diff check against `paths.allow/deny`; violations quarantine the attempt. | On output | Same. not observed. |
+| Git pushes from the worker | Scrubbed child environment (no SSH agent, no tokens, empty credential helper) plus `deny` on `git push`/`git remote`. | Before action | No credential exists. spike-observed (2026-09-08): env = TRIGGER_*/OTEL_*/NODE_* only; SSH_AUTH_SOCK and GIT_* credential helper variables not present in the environment. |
+| Merge, deploy, publish | Only `integrate.merge`, after acceptance, serialized, compare-and-set. | Before action | Same, with operation-scoped token. not observed. |
+| Termination | Generation revoked → `runs.cancel` → `onCancel` checkpoint commit and process-group kill → adapter confirms no survivors → Trigger final status. | Trusted observation | Supervisor removes the container. not observed (DOCKER_AUTOREMOVE_EXITED_CONTAINERS=0 was set; the exited container remained). |
+| Egress and provider spend | None; spend is an estimate. | Advisory | Gateway with per-attempt keys (deferred; evidence requirement: ADR plus measured spend baseline). not observed. |
+| Nested agents | OpenCode `task` tool denied for worker agents. | Before action | Same. not observed. |
 
 ## Dependency rule
 
@@ -224,6 +234,22 @@ management API. On the host profile, the Trigger API reports a final run status
 before the adapter finishes cleanup; confirmation comes from the adapter's stop
 record on disk (`<runDir>/stop.ndjson`), not from run status alone — see the
 [Slice 1 execution trial](trials/2026-09-slice1.md).
+
+Container profile spike (Slice 6, 2026-09-08): the trigger worker stack
+(trigger worker stack supervisor v4.5.16 + docker-proxy) overlay was started
+on the same host. The trigger worker stack supervisor read the bootstrap worker
+token from the shared volume and connected to the platform. With a
+user-approved temporary TCP forwarder, `trigger deploy --local-build`
+succeeded: version 20260908.2, 7 tasks, image 238.78 MB pushed to the bundled
+registry. `spike.echo` run run_cmtt9txxd00hl3qp3tygv0v2k ran inside a
+container (DEQUEUED 22:58:53Z, COMPLETED 22:59:02Z; exited 0). Inside the
+container spike-observed (2026-09-08): cwd /app, no host paths visible;
+environment limited to TRIGGER_*/OTEL_*/NODE_* keys (SSH_AUTH_SOCK and GIT_*
+credential helper variables not present in the environment); git 2.39.5
+present. OpenCode binary not on PATH
+(build-extension gap — `additionalPackages` installs into /app/node_modules
+but does not add the binary to PATH); `worker.attempt` was not attempted in a
+container. See [trials/2026-09-slice6.md](trials/2026-09-slice6.md).
 
 ## Security baseline
 

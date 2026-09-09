@@ -24,6 +24,7 @@ import {
   leadAgentPermissions,
 } from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
+import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
 import { scrubbedChildEnv } from "../lib/env.ts";
 import { worktreeAdd, worktreeRemove } from "../lib/git.ts";
 import { buildLeadPlanPrompt } from "../opencode/lead-prompt.ts";
@@ -109,6 +110,21 @@ export const leadPlan = task({
       onPhase: (phase) => metadata.set("phase", phase),
       timeoutMs: 270_000, // 4.5 min soft limit inside 5 min maxDuration
     });
+
+    // Classify provider capacity from invalid_output errors (the lead session
+    // uses the OpenCode SDK server mode, so there is no NDJSON event stream;
+    // we reconstruct a synthetic event from the failure reason instead).
+    if (output.kind === "invalid_output") {
+      const syntheticEvent = { type: "error", error: { message: output.reason } };
+      const capacity = classifyCapacity([syntheticEvent], {
+        provider: providerFromModel(payload.model),
+        model: payload.model,
+        now: new Date(),
+      });
+      if (capacity !== null) {
+        metadata.set("capacity", capacity);
+      }
+    }
 
     return output;
   },

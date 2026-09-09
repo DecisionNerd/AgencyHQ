@@ -11,6 +11,7 @@ import type { LeadAcceptPayload } from "@agencyhq/contracts";
 import { LeadAcceptPayloadSchema } from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
 
+import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
 import { leadPrompt } from "../opencode/sdk.ts";
 import type { AcceptTaskOutput } from "../types.ts";
 import { runAccept } from "./lead-accept-core.ts";
@@ -58,6 +59,16 @@ export const leadAccept = task({
 
     if ("kind" in result && result.kind === "invalid_output") {
       metadata.set("phase", "invalid_output");
+      // Classify capacity from the failure reason (no NDJSON events in SDK mode).
+      const syntheticEvent = { type: "error", error: { message: result.reason } };
+      const capacity = classifyCapacity([syntheticEvent], {
+        provider: providerFromModel(payload.model),
+        model: payload.model,
+        now: new Date(),
+      });
+      if (capacity !== null) {
+        metadata.set("capacity", capacity);
+      }
     } else {
       metadata.set("phase", "done");
     }

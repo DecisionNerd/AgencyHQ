@@ -16,15 +16,16 @@
 
 import type { LeadPlanOutput } from "@agencyhq/contracts";
 import { LeadPlanOutputSchema, TASK_IDS } from "@agencyhq/contracts";
-import { applyObservation, listOpenDispatchIntents } from "@agencyhq/db";
+import { applyObservation, listOpenDispatchIntents, recordCapacity } from "@agencyhq/db";
 import type { CommandId, RunObservation } from "@agencyhq/domain";
-import { FINAL_RUN_STATUSES } from "@agencyhq/domain";
-
+import { effectiveCapacity, FINAL_RUN_STATUSES } from "@agencyhq/domain";
+import type pg from "pg";
 import { confirmStop, readStopEvidence } from "../commands/confirm-stop.ts";
 import { stopAttempt } from "../commands/stop.ts";
 import type { BoundedRepairFlow, LeadHandlerResult } from "./bounded-repair.ts";
 import { generationOfIntent as getIntentGen } from "./bounded-repair.ts";
 import { onIntegrateFinal } from "./integrate.ts";
+import { scheduleQueuedIntents } from "./schedule.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -41,11 +42,26 @@ export class Reconciler {
   private _polling = false;
   /** Passed to confirmStop as config.uncertainAfterMs. */
   private readonly _uncertainAfterMs: number | undefined;
+  /** Whether realtime wake-up is enabled (Design 3). */
+  private readonly _realtimeWakeup: boolean;
+  /** AbortController for the overall wake-up lifecycle (Design 3). */
+  private _wakeupAbort: AbortController | null = null;
+  /** AbortController for the current per-subscription (swapped on tag-set change). */
+  private _subAbort: AbortController | null = null;
+  /** Tags of the currently-active subscription; null when not subscribed. */
+  private _subscribedTags: string[] | null = null;
+  /** True when the last subscribe() call threw; triggers retry on next refresh. */
+  private _subscribeError = false;
 
-  constructor(deps: FlowDeps, flow: BoundedRepairFlow, options?: { uncertainAfterMs?: number }) {
+  constructor(
+    deps: FlowDeps,
+    flow: BoundedRepairFlow,
+    options?: { uncertainAfterMs?: number; workerSlots?: number; realtimeWakeup?: boolean },
+  ) {
     this.deps = deps;
     this.flow = flow;
     this._uncertainAfterMs = options?.uncertainAfterMs;
+    this._realtimeWakeup = options?.realtimeWakeup ?? false;
   }
 
   /**
@@ -62,8 +78,8 @@ export class Reconciler {
   }
 
   /**
-   * Single poll: lists open DispatchIntents, retrieves each run, routes
-   * final observations to flow handlers.
+   * Single poll: runs the scheduler pass then lists open DispatchIntents,
+   * retrieves each run, routes final observations to flow handlers.
    *
    * Failures mark freshness stale but do NOT throw (so the caller's
    * setInterval loop is not broken).
@@ -73,6 +89,9 @@ export class Reconciler {
     if (this._polling) return;
     this._polling = true;
     try {
+      // Design 1: scheduler pass first, then observation routing.
+      await this.scheduleOnce();
+
       const { pool } = this.deps;
       const client = await pool.connect();
       let intents: Awaited<ReturnType<typeof listOpenDispatchIntents>>;
@@ -166,6 +185,13 @@ export class Reconciler {
           await this.recordFinalObservation(obs, intent, dispatchedGen);
         }
 
+        // Design 2: if the observation metadata carries provider capacity info,
+        // record it (source: adapter). Done before routing so the capacity store
+        // is updated even if routing fails later.
+        if (obs.metadata?.capacity && isFinalStatus(obs.status)) {
+          await this.recordCapacityFromRun(obs, intent.run_id ?? "");
+        }
+
         try {
           if (intent.task === TASK_IDS.workerAttempt) {
             await this.flow.onWorkerFinal(obs, commandId);
@@ -233,6 +259,207 @@ export class Reconciler {
     } finally {
       this._polling = false;
       this._lastPollAt = new Date().toISOString();
+      // Design 3: refresh wake-up subscription after every poll.
+      if (this._realtimeWakeup && this.deps.runtime.subscribe && this._wakeupAbort) {
+        await this._refreshWakeupSubscription().catch((err: unknown) => {
+          console.error("[reconciler] wake-up refresh failed", err);
+        });
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Design 1: Scheduler
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Scheduler pass: loads queued worker intents, selects which to dispatch via
+   * the domain's selectDispatch, triggers the chosen ones via retryDispatch,
+   * and records skip_reason on the rest.
+   *
+   * Called at the top of pollOnce() (so it runs on every poll and on wake-up).
+   * Protected by the pollOnce() in-flight guard — never concurrent.
+   *
+   * scheduleQueuedIntents never throws for individual dispatch errors — those
+   * are logged and returned in outcome.failed so each intent is attempted.
+   * Non-dispatch errors (e.g. DB connectivity) are caught here and logged;
+   * the intent remains queued and the next poll retries.
+   */
+  async scheduleOnce(): Promise<void> {
+    try {
+      await scheduleQueuedIntents(this.deps, (id) => this.flow.retryDispatch(id));
+    } catch (err) {
+      // Non-fatal in poll context: log and continue.  The intent remains queued
+      // and the next poll will retry dispatch.
+      console.error("[scheduler] scheduleOnce failed", err);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Design 2: Capacity recording from run metadata
+  // ---------------------------------------------------------------------------
+
+  /**
+   * When a final run observation carries metadata.capacity, record it in the
+   * provider_capacity table (source: adapter).  Idempotent via the table's
+   * primary key (provider, model, observed_at).
+   */
+  private async recordCapacityFromRun(obs: RunObservation, runId: string): Promise<void> {
+    const raw = obs.metadata?.capacity;
+    if (!raw || typeof raw !== "object") return;
+    const cap = raw as {
+      provider?: unknown;
+      model?: unknown;
+      status?: unknown;
+      observedAt?: unknown;
+      validUntil?: unknown;
+    };
+    if (
+      typeof cap.provider !== "string" ||
+      typeof cap.model !== "string" ||
+      (cap.status !== "ok" && cap.status !== "limited" && cap.status !== "down") ||
+      typeof cap.observedAt !== "string" ||
+      typeof cap.validUntil !== "string"
+    ) {
+      return;
+    }
+    const client = await this.deps.pool.connect();
+    try {
+      await recordCapacity(client, {
+        provider: cap.provider,
+        model: cap.model,
+        status: cap.status,
+        observed_at: new Date(cap.observedAt),
+        valid_until: new Date(cap.validUntil),
+        source: "adapter",
+        run_id: runId || null,
+      });
+    } catch (err) {
+      console.error("[reconciler] recordCapacity failed", err);
+    } finally {
+      client.release();
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Design 3: Wake-up subscription
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start a realtime wake-up subscription.
+   *
+   * Performs an initial subscription attempt (no-op when there is no open work
+   * yet).  The subscription is refreshed automatically at the end of every
+   * pollOnce() call: new projects are added, removed projects drop out, and a
+   * subscribe() failure from a previous cycle is retried.
+   *
+   * Does NOT give up when the initial tag set is empty — the first pollOnce()
+   * after work is admitted will subscribe.
+   *
+   * Called only when AGENCYHQ_REALTIME_WAKEUP=true and the runtime implements
+   * subscribe().  Resolves when stopWakeup() is called.
+   */
+  async startWakeup(): Promise<void> {
+    if (!this._realtimeWakeup || !this.deps.runtime.subscribe) return;
+
+    this._wakeupAbort = new AbortController();
+
+    // Initial subscription attempt (cheap; no-op when no open work yet).
+    await this._refreshWakeupSubscription();
+
+    // Resolve only when stopWakeup() aborts the global controller.
+    if (this._wakeupAbort.signal.aborted) return;
+    return new Promise<void>((resolve) => {
+      this._wakeupAbort!.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+
+  /**
+   * Internal: compute the current wake-up tag set and (re)subscribe if it
+   * differs from the active subscription, or if the last subscribe() failed.
+   *
+   * Fire-and-forget for the subscribe() call itself; the promise returned by
+   * this method resolves once the tag-set decision is made.
+   */
+  private async _refreshWakeupSubscription(): Promise<void> {
+    if (!this._realtimeWakeup || !this.deps.runtime.subscribe) return;
+    if (!this._wakeupAbort || this._wakeupAbort.signal.aborted) return;
+
+    const { pool } = this.deps;
+    const client = await pool.connect();
+    let newTags: string[];
+    try {
+      newTags = await wakeupTags(client);
+    } finally {
+      client.release();
+    }
+
+    if (this._wakeupAbort.signal.aborted) return;
+
+    const newSet = new Set(newTags);
+    const oldSet = new Set(this._subscribedTags ?? []);
+    const unchanged = newSet.size === oldSet.size && [...newSet].every((t) => oldSet.has(t));
+
+    if (unchanged && !this._subscribeError) return;
+
+    // Abort the current per-subscription controller (if any).
+    if (this._subAbort) {
+      this._subAbort.abort();
+      this._subAbort = null;
+    }
+    this._subscribeError = false;
+
+    if (newTags.length === 0) {
+      if (this._subscribedTags !== null) {
+        console.log("[reconciler] realtime wake-up unsubscribed (no open work)");
+      }
+      this._subscribedTags = null;
+      return;
+    }
+
+    const isInitial = this._subscribedTags === null;
+    this._subscribedTags = newTags;
+
+    const subAbort = new AbortController();
+    this._subAbort = subAbort;
+
+    if (isInitial) {
+      console.log(`[reconciler] realtime wake-up subscribed to ${newTags.length} project tag(s)`);
+    } else {
+      console.log(`[reconciler] realtime wake-up resubscribed (${newTags.length} tags)`);
+    }
+
+    // Fire-and-forget: subscribe() resolves when subAbort fires.
+    this.deps.runtime
+      .subscribe({ tags: newTags, signal: subAbort.signal }, (_obs: RunObservation) => {
+        console.log(`[reconciler] realtime wake-up: run ${_obs.runId} ${_obs.status} -> pollOnce`);
+        // Wake-up hint: kick off a poll. The observation itself is NOT applied
+        // here — it goes through the normal applyObservation path (R-010).
+        void this.pollOnce();
+      })
+      .catch((err: unknown) => {
+        console.error("[reconciler] realtime wake-up subscribe failed", err);
+        this._subscribeError = true;
+        this._subscribedTags = null;
+        if (this._subAbort === subAbort) {
+          this._subAbort = null;
+        }
+      });
+  }
+
+  /**
+   * Stop the realtime wake-up subscription.
+   */
+  stopWakeup(): void {
+    if (this._wakeupAbort) {
+      // Abort the active per-subscription controller first.
+      if (this._subAbort) {
+        this._subAbort.abort();
+        this._subAbort = null;
+      }
+      this._subscribedTags = null;
+      this._wakeupAbort.abort();
+      this._wakeupAbort = null;
     }
   }
 
@@ -426,28 +653,63 @@ export class Reconciler {
 
   /**
    * Start polling on the given interval (milliseconds).
+   * When AGENCYHQ_REALTIME_WAKEUP is true and the runtime supports subscribe(),
+   * also starts the wake-up subscription.
    */
   start(intervalMs: number): void {
     if (this._timer !== null) return;
     this._timer = setInterval(() => {
       void this.pollOnce();
     }, intervalMs);
+    if (this._realtimeWakeup && this.deps.runtime.subscribe) {
+      void this.startWakeup();
+    }
   }
 
   /**
-   * Stop polling.
+   * Stop polling and any wake-up subscription.
    */
   stop(): void {
     if (this._timer !== null) {
       clearInterval(this._timer);
       this._timer = null;
     }
+    this.stopWakeup();
   }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Wake-up tag helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the set of `project:<id>` tags that the realtime wake-up
+ * subscription should cover.
+ *
+ * A project is included when it has at least one:
+ *   - work item in a non-terminal lifecycle (admitted, active, reopened), OR
+ *   - open dispatch intent (queued or triggered).
+ *
+ * Exported for unit/integration tests.
+ */
+export async function wakeupTags(client: pg.PoolClient): Promise<string[]> {
+  const { rows } = await client.query<{ project_id: string }>(`
+    SELECT DISTINCT wi.project_id
+    FROM work_items wi
+    WHERE wi.lifecycle IN ('admitted', 'active', 'reopened')
+    UNION
+    SELECT DISTINCT sc.project_id
+    FROM dispatch_intents di
+    JOIN attempts       a  ON a.id  = di.attempt_id
+    JOIN step_contracts sc ON sc.id = a.contract_id
+    WHERE di.status IN ('queued', 'triggered')
+  `);
+  return rows.map((r) => `project:${r.project_id}`);
+}
 
 function isFinalStatus(status: string): boolean {
   return (FINAL_RUN_STATUSES as ReadonlySet<string>).has(status);

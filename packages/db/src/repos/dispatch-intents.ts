@@ -69,6 +69,190 @@ export async function listOpenDispatchIntents(client: pg.PoolClient): Promise<Di
   return rows.map((r) => DispatchIntentRowSchema.parse(r));
 }
 
+// ---------------------------------------------------------------------------
+// Queued worker intents (scheduler)
+// ---------------------------------------------------------------------------
+
+/**
+ * Queued worker intent with joined work item + project data for the scheduler.
+ * Returned by listQueuedWorkerIntents so scheduleOnce() can call selectDispatch.
+ */
+export type QueuedWorkerIntentRow = {
+  intent_id: string;
+  idempotency_key: string;
+  attempt_id: string;
+  attempt_generation: number;
+  work_item_id: string;
+  project_id: string;
+  wi_rank: number;
+  wi_main_effort: boolean;
+  wi_lifecycle: string;
+  wi_condition: string;
+  wi_campaign_id: string | null;
+  wi_created_at: Date | null;
+  bounds: Record<string, unknown>;
+  has_open_integrate_intent: boolean;
+};
+
+/**
+ * Load all queued worker dispatch intents with the associated work item and
+ * step contract data needed for selectDispatch.
+ *
+ * "Queued" = status = 'queued', task = 'worker.attempt'.
+ * Includes a flag indicating whether the same work item has an open
+ * integrate.merge intent (for hasOpenIntegrateIntent).
+ */
+export async function listQueuedWorkerIntents(
+  client: pg.PoolClient,
+): Promise<QueuedWorkerIntentRow[]> {
+  const { rows } = await client.query<{
+    intent_id: string;
+    idempotency_key: string;
+    attempt_id: string;
+    attempt_generation: number;
+    work_item_id: string;
+    project_id: string;
+    wi_rank: number;
+    wi_main_effort: boolean;
+    wi_lifecycle: string;
+    wi_condition: string;
+    wi_campaign_id: string | null;
+    wi_created_at: Date | null;
+    bounds: Record<string, unknown>;
+    has_open_integrate_intent: boolean;
+  }>(`
+    SELECT
+      di.id                            AS intent_id,
+      di.idempotency_key,
+      a.id                             AS attempt_id,
+      a.generation                     AS attempt_generation,
+      sc.work_item_id,
+      sc.project_id,
+      wi.rank                          AS wi_rank,
+      wi.main_effort                   AS wi_main_effort,
+      wi.lifecycle                     AS wi_lifecycle,
+      wi.condition                     AS wi_condition,
+      wi.campaign_id                   AS wi_campaign_id,
+      wi.created_at                    AS wi_created_at,
+      sc.bounds,
+      EXISTS (
+        SELECT 1
+        FROM dispatch_intents di2
+        JOIN attempts a2       ON a2.id  = di2.attempt_id
+        JOIN step_contracts s2 ON s2.id  = a2.contract_id
+        WHERE s2.work_item_id = sc.work_item_id
+          AND di2.task        = 'integrate.merge'
+          AND di2.status      = 'triggered'
+      )                                AS has_open_integrate_intent
+    FROM dispatch_intents di
+    JOIN attempts       a  ON a.id  = di.attempt_id
+    JOIN step_contracts sc ON sc.id = a.contract_id
+    JOIN work_items     wi ON wi.id = sc.work_item_id
+    WHERE di.status = 'queued'
+      AND di.task   = 'worker.attempt'
+    ORDER BY di.created_at
+  `);
+  return rows as QueuedWorkerIntentRow[];
+}
+
+// ---------------------------------------------------------------------------
+// Active attempts for scheduling
+// ---------------------------------------------------------------------------
+
+/**
+ * A row returned by listActiveAttemptsForScheduling.
+ */
+export type ActiveAttemptForScheduling = {
+  work_item_id: string;
+  project_id: string;
+  status: string;
+  bounds: Record<string, unknown>;
+};
+
+/**
+ * List attempts that are "active" for scheduling — i.e. a worker process is
+ * or may be running in their worktree.
+ *
+ * An attempt is active when:
+ *   (a) its status is 'stopping' (worker shutdown in progress), OR
+ *   (b) its status is 'dispatched' or 'running' AND there is an open
+ *       dispatch_intents row (task='worker.attempt', status='triggered').
+ *
+ * Attempts whose only open intents are verify/review/accept runs, and attempts
+ * with no open intent at all, are NOT counted — no worker process exists in
+ * their worktree and holding a slot or repo-busy flag would block new work.
+ *
+ * Terminal work item lifecycles (halted, completed, done) are excluded so
+ * halted items never pin a repository as busy.
+ */
+export async function listActiveAttemptsForScheduling(
+  client: pg.PoolClient,
+): Promise<ActiveAttemptForScheduling[]> {
+  const { rows } = await client.query<ActiveAttemptForScheduling>(
+    `SELECT a.status, sc.work_item_id, sc.project_id, sc.bounds
+     FROM attempts a
+     JOIN step_contracts sc ON sc.id = a.contract_id
+     JOIN work_items wi      ON wi.id = sc.work_item_id
+     WHERE wi.lifecycle NOT IN ('halted', 'completed', 'done')
+       AND (
+         a.status = 'stopping'
+         OR (
+           a.status IN ('dispatched', 'running')
+           AND EXISTS (
+             SELECT 1 FROM dispatch_intents di
+             WHERE di.attempt_id = a.id
+               AND di.task       = 'worker.attempt'
+               AND di.status     = 'triggered'
+           )
+         )
+       )`,
+  );
+  return rows;
+}
+
+/**
+ * Per-project count of "active" attempts using the same rule as the scheduler
+ * (listActiveAttemptsForScheduling).  Used by the overview API so the UI's
+ * active-attempt indicator is consistent with what the scheduler considers busy.
+ *
+ * An attempt is active when:
+ *   (a) its status is 'stopping', OR
+ *   (b) its status is 'dispatched'|'running' AND there is an open
+ *       worker.attempt dispatch intent (status='triggered').
+ *
+ * Terminal work item lifecycles (halted, completed, done) are excluded.
+ */
+export type ActiveAttemptCountByProject = {
+  project_id: string;
+  count: number;
+};
+
+export async function listActiveAttemptCountsPerProject(
+  client: pg.PoolClient,
+): Promise<ActiveAttemptCountByProject[]> {
+  const { rows } = await client.query<{ project_id: string; cnt: string }>(
+    `SELECT sc.project_id, COUNT(*) AS cnt
+     FROM attempts a
+     JOIN step_contracts sc ON sc.id = a.contract_id
+     JOIN work_items wi      ON wi.id = sc.work_item_id
+     WHERE wi.lifecycle NOT IN ('halted', 'completed', 'done')
+       AND (
+         a.status = 'stopping'
+         OR (
+           a.status IN ('dispatched', 'running')
+           AND EXISTS (
+             SELECT 1 FROM dispatch_intents di
+             WHERE di.attempt_id = a.id
+               AND di.task       = 'worker.attempt'
+               AND di.status     = 'triggered'
+           )
+         )
+       )
+     GROUP BY sc.project_id`,
+  );
+  return rows.map((r) => ({ project_id: r.project_id, count: Number(r.cnt) }));
+}
+
 /**
  * Transition a dispatch intent's status.
  * Uses optimistic concurrency: WHERE id = $1 AND status = $2.

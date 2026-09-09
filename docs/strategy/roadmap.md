@@ -148,3 +148,19 @@ on it.
   with pinned Git and OpenCode, API-key providers, generation-bound push
   tokens; then a model gateway with per-attempt keys, upgrading isolation,
   egress, and spend from advisory to enforced.
+- Outcome (2026-09-08): on admission the worker intent is recorded `queued` and `BoundedRepairFlow.onLeadPlanOutput` calls `scheduleQueuedIntents` (`apps/coordinator/src/flow/schedule.ts`) directly, applying every gate at admission time; dispatch errors are per-intent: own-intent failure fires recovery (failure row + `pending_human` + worker intent `failed`), other-intent failures are logged and retried on the next poll; the reconciler polling wrapper also calls `scheduleQueuedIntents` on every polling pass; batch scheduler (`selectDispatch`) wired into the coordinator polling loop; `AGENCYHQ_WORKER_SLOTS` environment limit; per-pass slot counting deducts active attempts (attempts in `stopping` status or with an in-flight `worker.attempt` intent, whose work item is not halted/completed/done — `listActiveAttemptsForScheduling`); the overview uses `listActiveAttemptCountsPerProject` with the same rule; repository serialization release point confirmed as worker-run completion; provider capacity gate (`ProviderCapacity` aggregate with conservative stale handling) precedes the slot gate in `selectDispatch`; gate skipped entirely when the `provider_capacity` table is empty (unconstrained); operator `set_capacity` command and `/api/capacity` route;
+  Lead quality metrics via `lead_metrics` SQL view and `/api/metrics/lead` route;
+  `AGENCYHQ_REALTIME_WAKEUP` subscription follows non-terminal work items and
+  resubscribes on change; v2 verification profiles (`node-pnpm-v2`,
+  `multi-repo-v2`) prepend `pnpm-install@1`. 7 defects found and fixed live,
+  all with deterministic tests. Container spike: supervisor v4.5.16 connected
+  to the trigger.dev platform; with a user-approved TCP forwarder the image
+  built (238.78 MB, linux/amd64) and was pushed to the bundled registry;
+  `spike.echo` ran in a container (run_cmtt9txxd00hl3qp3tygv0v2k, COMPLETED
+  22:59:02Z); spike-observed: cwd /app, no host paths in the environment;
+  environment limited to TRIGGER_*/OTEL_*/NODE_* keys (SSH_AUTH_SOCK and GIT_*
+  credential helper variables not present); git 2.39.5 present; OpenCode not on PATH
+  (build-extension gap); `worker.attempt` not attempted.
+  Multi-machine, generation-bound push tokens, and model gateway are deferred
+  with evidence requirements.
+  Full record: [trials/2026-09-slice6.md](../engineering/trials/2026-09-slice6.md).

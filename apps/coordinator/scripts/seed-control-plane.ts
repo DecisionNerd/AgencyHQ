@@ -645,6 +645,22 @@ async function runSeed(dbUrl: string): Promise<void> {
     });
 
     // ---------------------------------------------------------------------------
+    // Provider capacity row: openai/gpt-5.6-sol (for browser capacity panel test)
+    // Uses a fixed observed_at so the row is deterministic across re-runs.
+    // validUntil is set 1 year from a fixed epoch so the row is always "current".
+    // ---------------------------------------------------------------------------
+
+    const capacityObservedAt = new Date("2025-01-01T00:00:00Z");
+    const capacityValidUntil = new Date("2099-12-31T23:59:59Z");
+    await client.query(
+      `INSERT INTO provider_capacity (provider, model, status, observed_at, valid_until, source)
+       VALUES ($1, $2, 'ok', $3, $4, 'operator')
+       ON CONFLICT (provider, model, observed_at) DO UPDATE
+         SET status = 'ok', valid_until = $4`,
+      ["openai", "gpt-5.6-sol", capacityObservedAt.toISOString(), capacityValidUntil.toISOString()],
+    );
+
+    // ---------------------------------------------------------------------------
     // Output
     // ---------------------------------------------------------------------------
 

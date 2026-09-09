@@ -11,6 +11,7 @@ export type Route =
   | { page: "work-item"; id: string }
   | { page: "decisions" }
   | { page: "authority"; projectId: string }
+  | { page: "metrics" }
   | { page: "not-found" };
 
 /**
@@ -21,6 +22,7 @@ export type Route =
  *   #/work-items/:id → work-item
  *   #/decisions → decisions
  *   #/projects/:id/authority → authority
+ *   #/metrics   → metrics
  *   anything else → not-found
  */
 export function parseRoute(hash: string): Route {
@@ -37,6 +39,10 @@ export function parseRoute(hash: string): Route {
 
   if (path === "/decisions") {
     return { page: "decisions" };
+  }
+
+  if (path === "/metrics") {
+    return { page: "metrics" };
   }
 
   const workItemMatch = /^\/work-items\/([^/]+)$/.exec(path);
@@ -473,4 +479,139 @@ export function formatAuthorityErrors(errors: AuthoritySchemaError[]): string {
       return e.message;
     })
     .join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Lead metrics helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Format a rate (0.0–1.0) as a percentage string, e.g. "75.0%".
+ * Returns "not available" when rate is null.
+ */
+export function formatPercentage(rate: number | null): string {
+  if (rate === null) return "not available";
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
+/**
+ * Build a title attribute string showing numerator/denominator.
+ * e.g. "3/4 = 75.0%"
+ */
+export function formatRateTitle(
+  numerator: number,
+  denominator: number,
+  rate: number | null,
+): string {
+  if (rate === null) return `${numerator}/${denominator}`;
+  return `${numerator}/${denominator} = ${(rate * 100).toFixed(1)}%`;
+}
+
+// ---------------------------------------------------------------------------
+// Since-window helpers
+// ---------------------------------------------------------------------------
+
+export type SinceWindow = "7d" | "30d" | "all";
+
+/**
+ * Convert a since-window label to an ISO 8601 timestamp, or null for "all time".
+ * The optional `now` parameter allows deterministic testing.
+ */
+export function sinceWindowToISO(window: SinceWindow, now?: Date): string | null {
+  if (window === "all") return null;
+  const base = now ? new Date(now) : new Date();
+  const days = window === "7d" ? 7 : 30;
+  base.setDate(base.getDate() - days);
+  return base.toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// Capacity row model
+// ---------------------------------------------------------------------------
+
+import type { CapacityProviderEntry } from "./api.js";
+
+export interface CapacityRowModel {
+  provider: string;
+  model: string;
+  status: "ok" | "limited" | "down";
+  effective: "ok" | "limited" | "down" | "unknown";
+  concurrency: number | null;
+  source: "adapter" | "operator";
+  evidence?: string;
+  observedAt: string;
+  validUntil: string;
+  isStale: boolean;
+  /** Human-readable validity: "valid until …" or "stale since …". */
+  validityLabel: string;
+}
+
+/** Status icon + text label — text and icon, never color alone. */
+export function capacityStatusLabel(status: "ok" | "limited" | "down" | "unknown"): {
+  icon: string;
+  text: string;
+} {
+  switch (status) {
+    case "ok":
+      return { icon: "✓", text: "ok" };
+    case "limited":
+      return { icon: "⚠", text: "limited" };
+    case "down":
+      return { icon: "✗", text: "down" };
+    default:
+      return { icon: "?", text: "unknown" };
+  }
+}
+
+/**
+ * Build a display row model for a capacity provider entry.
+ * Computes whether the observation is stale (validUntil < now).
+ * The optional `now` parameter allows deterministic testing.
+ */
+export function buildCapacityRow(entry: CapacityProviderEntry, now?: Date): CapacityRowModel {
+  const d = now ?? new Date();
+  const until = new Date(entry.validUntil);
+  const stale = until < d;
+  const row: CapacityRowModel = {
+    provider: entry.provider,
+    model: entry.model,
+    status: entry.status,
+    effective: entry.effective,
+    concurrency: entry.concurrency,
+    source: entry.source,
+    observedAt: entry.observedAt,
+    validUntil: entry.validUntil,
+    isStale: stale,
+    validityLabel: stale
+      ? `stale since ${formatTimestamp(entry.validUntil)}`
+      : `valid until ${formatTimestamp(entry.validUntil)}`,
+  };
+  if (entry.evidence !== undefined) {
+    row.evidence = entry.evidence;
+  }
+  return row;
+}
+
+// ---------------------------------------------------------------------------
+// Set-capacity command body builder
+// ---------------------------------------------------------------------------
+
+export interface SetCapacityParams {
+  commandId: string;
+  provider: string;
+  model: string;
+  status: "ok" | "limited" | "down";
+  validUntil: string;
+}
+
+/** Build the POST /api/commands body for a set_capacity command. */
+export function buildSetCapacityBody(params: SetCapacityParams): Record<string, unknown> {
+  return {
+    commandId: params.commandId,
+    kind: "set_capacity",
+    provider: params.provider,
+    model: params.model,
+    status: params.status,
+    validUntil: params.validUntil,
+  };
 }

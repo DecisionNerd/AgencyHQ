@@ -30,6 +30,8 @@ export async function seedProjectAndWorkItem(
     defect?: string;
     boundary?: "artifact" | "merge" | "deploy";
     authority?: Authority;
+    /** Lifecycle to create the work item with. Defaults to 'proposed'. */
+    lifecycle?: "proposed" | "admitted" | "active" | "reopened" | "completed" | "halted";
   },
 ): Promise<SeedResult> {
   const projectId = newId("prj");
@@ -53,8 +55,8 @@ export async function seedProjectAndWorkItem(
   await client.query(
     `INSERT INTO work_items
        (id, project_id, rank, intent, defect, boundary, lifecycle, condition, main_effort, version)
-     VALUES ($1, $2, 1, $3, $4, $5, 'proposed', 'healthy', true, 1)`,
-    [workItemId, projectId, intent, opts?.defect ?? null, boundary],
+     VALUES ($1, $2, 1, $3, $4, $5, $6, 'healthy', true, 1)`,
+    [workItemId, projectId, intent, opts?.defect ?? null, boundary, opts?.lifecycle ?? "proposed"],
   );
 
   return { projectId, workItemId };

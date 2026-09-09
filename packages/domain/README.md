@@ -46,13 +46,26 @@ and the reason every other item was skipped.
 5. The item's repository must not be listed as uncertain — `repository_uncertain`
 6. The item's repository must not already have an active attempt or an
    earlier selection in this pass — `repository_busy`
-7. There must be remaining slot capacity — `no_slot`
+7. There must be remaining slot capacity — `no_slot`; the slot count deducts all currently active attempts (dispatched, running, or stopping) before considering selections made in this pass, so active attempts from earlier scheduler passes fully count against the limit.
 
 `mainEffort` is the id of the highest-ranked item passing rules 1–2, whether
 or not it was dispatched. It is stable when the top item is blocked by a busy
 repository or exhausted slots — the UI always shows the correct main effort.
 
 **Campaign ordering** (when `mainEffortByCampaign` is provided): campaign members cluster at their campaign's main effort's rank. Within the cluster, the designated main effort sorts first; remaining members follow in `(rank, createdAt, id)` order. Items without a `campaignId` keep the existing global `(rank, id)` order. No new skip reason (`not_main_effort_slot`) is introduced — the main effort is prioritised entirely through sort ordering.
+
+**Provider capacity gating** (when `providerCapacity` and `now` are provided): each dispatched work item carries an optional `provider` and `model` field. `selectDispatch` looks up the matching `ProviderCapacity` observation, computes `effectiveCapacity(obs, now)`, and applies `concurrencyFor(status)`:
+
+| effective status | concurrencyFor | skip reason when blocked |
+| --- | --- | --- |
+| `ok` | null (unbounded) | — |
+| `limited` | 1 | `provider_limited` |
+| `unknown` | 1 (conservative) | `provider_unknown` |
+| `down` | 0 | `provider_down` (always skipped) |
+
+`activeByProvider: Record<string, number>` counts active attempts per provider before this pass. The combined count (active + chosen this pass) never exceeds `concurrencyFor`. Observations past their `validUntil` are treated as `unknown` (conservative stale handling, R-008/Slice 6).
+
+**Provider gate caveat**: the gate runs only when `providerCapacity.length > 0`. With an empty `provider_capacity` table the gate is skipped entirely — all items are unconstrained by it. Once any row exists (for any provider), a missing or expired observation for a specific `provider`/`model` pair yields `unknown` → concurrency 1. Live evidence: T1 concurrent workers (run_cmtt6e0rj / run_cmtt6evmq, 21:23:08–21:23:14Z) ran with an empty table (first `set_capacity` at 21:25:14Z); K7 hit `provider_unknown` after the operator row expired at 21:44Z (22:08Z, coordinator restart log).
 
 The function is pure (no I/O) and deterministic (ties broken by `id` ascending).
 ## Authority
@@ -91,7 +104,8 @@ Each violation carries a `ViolationCode`, a dot-path, and a detail string. Codes
 
 - **`ids.ts`** — Branded id types (`ProjectId`, `WorkItemId`, `StepContractId`, `AttemptId`, `DispatchIntentId`, `ArtifactId`, `VerificationResultId`, `ReviewId`, `DecisionId`, `ApprovalId`, `FindingId`, `FailureId`, `CommandId`). `newId(prefix)` generates a UUID-backed id. `asXId(s)` performs a prefix-check cast.
 - **`result.ts`** — `Ok<T>`, `Err<E>`, `Result<T,E>` discriminated union with `ok()`, `err()`, `isOk()`, `mapResult()` helpers. No dependencies.
-- **`ports.ts`** — Port interfaces: `ExecutionRuntime` (trigger/cancel/retrieve/createPublicToken), `Clock` (now), `IdGen` (next). Also exports `TriggerRunStatus`, `FINAL_RUN_STATUSES`, and `RunObservation`.
+- **`ports.ts`** — Port interfaces: `ExecutionRuntime` (trigger/cancel/retrieve/createPublicToken, optional `subscribe?`), `Clock` (now), `IdGen` (next). Also exports `TriggerRunStatus`, `FINAL_RUN_STATUSES`, and `RunObservation`. Adapters that report provider capacity include a `capacity` key in `RunObservation.metadata`; the coordinator updates the `ProviderCapacity` store after the normal dedupe path (R-010). The optional `subscribe?` method on `ExecutionRuntime` is a wake-up hint only — the coordinator must still poll and apply observations through the dedupe path.
+- **`aggregates/provider-capacity.ts`** — `ProviderCapacity` aggregate: `{ provider, model, status: "ok"|"limited"|"down", observedAt, validUntil, source: "adapter"|"operator" }`. `effectiveCapacity(obs, now)` returns `"ok"|"limited"|"down"|"unknown"` (past `validUntil` or absent → `"unknown"`). `concurrencyFor(status)` maps `ok→null`, `limited→1`, `unknown→1`, `down→0` (conservative stale handling). Capacity gating observed live 2026-09-08: operator rows (down/limited/ok) reflected immediately in `selectDispatch`; provider gate precedes the slot gate; expired row treated as `unknown` (K7 skipped `provider_unknown` at 22:08Z — see [trials/2026-09-slice6.md](../../docs/engineering/trials/2026-09-slice6.md)).
 - **`aggregates/campaign.ts`** — `Campaign` aggregate: `{ id, name, mainEffortWorkItemId: string | null }`. `setMainEffort(campaign, workItem)` returns `Ok(campaign)` when the work item's `campaignId` matches the campaign id, else `Err("work_item_not_in_campaign")`. `campaignRankOrder(items)` returns a new array sorted by `(rank asc, createdAt asc, id asc)` — a total order guaranteeing no two distinct items compare equal.
 - **`aggregates/project.ts`** — `Project` aggregate: remote, clone path, worktree base, allowed refs, profile catalog, delegated authority.
 - **`aggregates/work-item.ts`** — `WorkItem` aggregate: ranked, scoped unit of intended change with lifecycle and condition.

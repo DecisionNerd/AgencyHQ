@@ -83,6 +83,7 @@ import type pg from "pg";
 
 import { deriveTargetRef } from "./integrate.ts";
 import { buildLeadPlanIntent } from "./payloads.ts";
+import { scheduleQueuedIntents } from "./schedule.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -864,10 +865,13 @@ export class BoundedRepairFlow {
     output: LeadPlanOutput,
     commandId: string,
   ): Promise<void> {
-    const { pool, runtime, ids, config, profile, profileResolver } = this.deps;
+    const { pool, ids, config, profile, profileResolver } = this.deps;
 
     // Captured early so the catch block can record a recovery decision (Defect 4).
     let recoveryWorkItemId: string | null = null;
+    // Hoisted after COMMIT so the outer catch can mark the worker intent failed
+    // for non-dispatch errors (e.g. a DB error inside scheduleQueuedIntents).
+    let recoveryWorkerIntentId: string | null = null;
 
     const client = await pool.connect();
     try {
@@ -1225,33 +1229,18 @@ export class BoundedRepairFlow {
       );
 
       await client.query("COMMIT");
+      // Worker intent is now committed to the DB. Hoist its id so the outer
+      // catch can mark it failed if a non-dispatch error (e.g. a DB error inside
+      // scheduleQueuedIntents) propagates after this point.
+      recoveryWorkerIntentId = String(workerIntentId);
 
-      // Trigger AFTER commit (R-002)
-      const { runId } = await runtime.trigger({
-        intentId: workerIntentId,
-        task: TASK_IDS.workerAttempt,
-        payload: workerPayload,
-        options: {
-          idempotencyKey: workerIntentKey,
-          maxDurationSeconds: contract.bounds.budget.maxDurationSeconds,
-          concurrencyKey: String(contract.projectId),
-          tags: triggerTags({
-            projectId: String(contract.projectId),
-            workItemId: String(contract.workItemId),
-            contractId: String(contractId),
-            contractVersion: contract.version,
-            attemptId: String(attemptId),
-          }),
-        },
-      });
-
+      // Always queue: let scheduleQueuedIntents() apply all gates (provider capacity,
+      // repository busy, slot count) — the same code path as the normal poll
+      // (R-008).  A free, unconstrained slot still dispatches immediately
+      // because scheduleQueuedIntents() is called directly after queuing.
       await pool.query(
-        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-        [String(workerIntentId), runId],
-      );
-      await pool.query(
-        "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",
-        [String(attemptId), runId],
+        "UPDATE dispatch_intents SET status = 'queued', updated_at = now() WHERE id = $1",
+        [String(workerIntentId)],
       );
 
       await completeCommand(client, commandId, {
@@ -1259,8 +1248,82 @@ export class BoundedRepairFlow {
         contractId: String(contractId),
         attemptId: String(attemptId),
         workerIntentId: String(workerIntentId),
-        runId,
+        queued: true,
       });
+
+      // Immediately run a scheduling pass so a free slot dispatches without
+      // waiting for the next poll interval. All gates (provider capacity,
+      // repository busy, slot count) apply here too — R-008.
+      //
+      // scheduleQueuedIntents never throws for a single intent's dispatch error;
+      // it returns per-intent outcomes. We inspect the result for the newly
+      // queued worker intent only. Failures of OTHER queued intents during this
+      // pass are logged and left queued — the next poll retries them.
+      const scheduleResult = await scheduleQueuedIntents(this.deps, (id) => this.retryDispatch(id));
+
+      // Log failures for other intents (they stay queued; next poll retries).
+      for (const f of scheduleResult.failed) {
+        if (f.intentId !== String(workerIntentId)) {
+          console.warn(
+            "[scheduler] other intent dispatch failed during admission, will retry on next poll",
+            f.intentId,
+            f.error,
+          );
+        }
+      }
+
+      // If OWN worker intent's dispatch failed, fire recovery inline (Defect-4
+      // recovery path): failure row + pending_human + mark own worker intent
+      // failed so it is not re-dispatched under a pending_human decision.
+      const ownFailure = scheduleResult.failed.find((f) => f.intentId === String(workerIntentId));
+      if (ownFailure) {
+        const recoveryClient = await pool.connect();
+        try {
+          await recoveryClient.query("BEGIN");
+          await recoveryClient.query(
+            `INSERT INTO failures (id, class, phase, run_id, cause, evidence)
+             VALUES ($1, 'execution', 'plan', NULL, $2, $3)`,
+            [
+              String(ids.next("fl")),
+              (ownFailure.error instanceof Error
+                ? ownFailure.error.message
+                : String(ownFailure.error)
+              ).slice(0, 500),
+              JSON.stringify({ intentId, error: String(ownFailure.error) }),
+            ],
+          );
+          await recoveryClient.query(
+            `INSERT INTO decisions (id, kind, actor, work_item_id, outcome, at)
+             VALUES ($1, 'plan', 'coordinator', $2, 'pending_human', $3)`,
+            [String(ids.next("dec")), workItemId, new Date()],
+          );
+          // Close lead.plan intent so it is not re-processed.
+          await recoveryClient.query(
+            "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
+            [intentId],
+          );
+          // Mark own worker intent failed so a subsequent poll cannot dispatch it
+          // while the work item is parked pending_human.
+          await recoveryClient.query(
+            "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
+            [String(workerIntentId)],
+          );
+          await recoveryClient.query("COMMIT");
+        } catch (recErr) {
+          console.error("[onLeadPlanOutput] own dispatch recovery failed", recErr);
+          try {
+            await recoveryClient.query("ROLLBACK");
+          } catch {
+            /* best-effort */
+          }
+        } finally {
+          recoveryClient.release();
+        }
+        console.error(
+          "[onLeadPlanOutput] own worker dispatch failed (recovered)",
+          ownFailure.error,
+        );
+      }
     } catch (err) {
       // Rollback any open transaction.
       try {
@@ -1294,6 +1357,16 @@ export class BoundedRepairFlow {
             "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
             [intentId],
           );
+          // Mark own worker intent failed (if already committed) so a subsequent
+          // poll cannot dispatch it while the work item is parked pending_human.
+          // Covers non-dispatch errors (e.g. DB errors inside scheduleQueuedIntents)
+          // that propagate after the main transaction commits (R1 fix).
+          if (recoveryWorkerIntentId) {
+            await recoveryClient.query(
+              "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
+              [recoveryWorkerIntentId],
+            );
+          }
           await recoveryClient.query("COMMIT");
         } catch (recErr) {
           console.error("[onLeadPlanOutput] recovery transaction failed", recErr);
@@ -2707,7 +2780,7 @@ export class BoundedRepairFlow {
     });
 
     await pool.query(
-      "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+      "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, skip_reason = NULL, updated_at = now() WHERE id = $1",
       [intentId, runId],
     );
     await pool.query(

@@ -11,16 +11,17 @@
     "echo": "node --env-file=.env scripts/echo.ts"
   },
   "dependencies": {
-    "@trigger.dev/sdk": "4.5.16",
-    "@opencode-ai/sdk": "1.18.29",
     "@agencyhq/contracts": "workspace:*",
     "@agencyhq/domain": "workspace:*",
-    "@agencyhq/verification": "workspace:*"
+    "@agencyhq/verification": "workspace:*",
+    "@opencode-ai/sdk": "1.18.29",
+    "@trigger.dev/sdk": "4.5.16"
   },
   "devDependencies": {
+    "@trigger.dev/build": "4.5.16",
+    "@types/node": "^24",
     "trigger.dev": "4.5.16",
-    "typescript": "^5.9",
-    "@types/node": "^24"
+    "typescript": "^5.9"
   },
   "exports": {
     ".": "./src/index.ts",

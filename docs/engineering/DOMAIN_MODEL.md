@@ -24,7 +24,7 @@ Concepts marked *deferred* are vocabulary now and code later.
 | IntegrationDecision | The outcome of one `integrate.merge` run: `integrated`, `already_integrated`, `base_moved`, `conflict`, or `push_rejected`. Non-integrated outcomes produce a `pending_human` decision with an `integration_conflict` finding. | 4 |
 | ProcessDefinition | Versioned step/gate sequence. The bounded repair process is code until a second process exists; extract when a second catalog entry needs a different step/gate sequence. *Deferred.* | 4 |
 | AuthorityVersion | Append-only log of delegated-authority schema versions per project: `(project_id, version)` primary key, `authority` jsonb, `actor`, `at`. The `update_authority` command validates the proposed schema with `AuthoritySchema`, requires strictly increasing version, writes the project row, appends the `authority_versions` row (idempotent on `(project_id, version)`), and records an `authority_update` decision. Frozen `step_contracts` rows are never modified (R-018); only future Lead proposals are governed by the new schema. | 5 |
-| ProviderCapacity | Timestamped capacity observation with validity window. *Deferred.* | 6 |
+| ProviderCapacity | Timestamped capacity observation with validity window. `{ provider, model, status: "ok"|"limited"|"down", observedAt, validUntil, source: "adapter"|"operator" }`. `effectiveCapacity(obs, now)` returns `"ok"|"limited"|"down"|"unknown"` (past `validUntil` → `"unknown"`). `concurrencyFor(status)` maps `ok→null` (unconstrained), `limited→1`, `unknown→1`, `down→0` (conservative stale handling). **Provider gate applies only when the `provider_capacity` table is non-empty**: with no rows the gate is skipped entirely (unconstrained). Once any row exists, a missing or expired observation for a `provider`/`model` pair yields `unknown` → concurrency 1. Live caveat: T1 concurrent workers (run_cmtt6e0rj / run_cmtt6evmq, 21:23:08–21:23:14Z) ran with an empty capacity table — no observation, no gate. K7 hit `provider_unknown` at 22:08Z after the operator row for `openai/gpt-5.6-terra` expired (validUntil 21:44Z). | 6 |
 
 *Implementation: all Slice 2 aggregates in `packages/domain/src/aggregates/`; lifecycle transitions namespaced per aggregate in `packages/domain/src/transitions/`.*
 
@@ -94,13 +94,20 @@ The Project's **verification profile catalog is an authority ceiling**: the Lead
 
 ## Allocation
 
-Until slice 6, allocation is: the coordinator dispatches at most the
-environment's configured number of worker attempts, in WorkItem rank order,
-with Trigger serializing attempts per repository (`concurrencyKey`). Rank is
-explicit; the highest-ranked runnable WorkItem is the main effort. Being
-blocked does not change rank. Running attempts are not preempted by rank
-changes. Every time supporting work runs ahead of the main effort, the reason
-(blocked, awaiting decision, repository busy) is recorded.
+The coordinator dispatches at most `AGENCYHQ_WORKER_SLOTS` worker attempts per
+polling pass, in WorkItem rank order, with Trigger serializing attempts per
+repository (`concurrencyKey`). Rank is explicit; the highest-ranked runnable
+WorkItem is the main effort. Being blocked does not change rank. Running attempts
+are not preempted by rank changes. Every time supporting work runs ahead of the
+main effort, the reason (blocked, awaiting decision, repository busy,
+provider_down, provider_limited, provider_unknown, no_slot) is recorded.
+
+Active attempts are counted by `listActiveAttemptsForScheduling`: only attempts
+with an in-flight `worker.attempt` intent or in `stopping` status count; attempts
+left `dispatched` after a `verify.run`/`lead.review`/`lead.accept` dispatch, and
+attempts belonging to halted or completed items, are excluded. Provider capacity
+gating (`ProviderCapacity` aggregate) precedes the slot gate in `selectDispatch`
+(Slice 6, confirmed live 2026-09-08).
 
 Lifecycle (queued, active, paused, completed, cancelled), execution condition
 (ready, running, blocked, awaiting decision), and rank are distinct. A

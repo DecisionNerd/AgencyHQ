@@ -29,6 +29,83 @@ Node's built-in TypeScript type stripping.
 See `.env.example` for the environment variables these scripts and
 `trigger dev` expect.
 
+## Container profile (deploy build)
+
+The container profile runs each task in its own Docker container managed by the
+trigger.dev worker stack (supervisor + docker-proxy). Task images are built with
+`trigger deploy` using the build extensions declared in `trigger.config.ts`.
+
+### Deploy build configuration
+
+`trigger.config.ts` declares two build extensions that run only during
+`trigger deploy` — they have no effect on `trigger dev`:
+
+- **`aptGet({ packages: ["git"] })`** — installs the `git` binary inside the
+  task image via apt-get. Required because `worker.attempt` calls `git
+  worktree add`, `git diff`, and `git commit` inside the container.
+- **`additionalPackages({ packages: ["opencode-ai@1.18.29"] })`** — installs
+  the `opencode` CLI from npm at the pinned version (1.18.29, matching the host
+  OpenCode version qualified by the Slice 1 trial). Required because
+  `worker.attempt` calls `spawnOpenCode` to run the agent.
+
+Both extensions are `BuildExtension` types from `@trigger.dev/build/extensions/core`
+(verified from the installed .d.ts and https://trigger.dev/docs/config/extensions/aptGet,
+read 2026-09-08). The JSDoc for `additionalPackages` states "when deploying".
+
+### Environment the deployed tasks expect
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AGENCYHQ_OPENCODE_BIN` | `opencode` (on PATH) | Path to the `opencode` binary inside the container; defaults to the `opencode` installed by `additionalPackages`. |
+| `AGENCYHQ_WORKTREE_BASE` | (required) | Base directory for worktrees and run directories inside the container. |
+| `TRIGGER_PROJECT_REF` | (required) | Trigger project reference, set via Trigger environment variables in the dashboard. |
+
+Provider credentials (API keys for model providers) must be supplied as Trigger
+environment variables in the dashboard — they are never baked into the image.
+The container profile uses API-key providers only; subscription-based logins
+from `~/.local/share/opencode/auth.json` are host-bound and not available
+inside task containers.
+
+### Slice 6 container spike (2026-09-08, partial)
+
+**Observed:**
+
+- Supervisor v4.5.16 + docker-proxy v0.5.0 started as a trigger worker stack
+  overlay alongside the running webapp stack.
+- The trigger worker stack supervisor (v4.5.16) read the bootstrap worker token
+  from the shared volume at `/home/node/shared/worker_token` and connected to
+  the trigger.dev platform ("Connected to platform" — `s6/supervisor-boot.log`).
+- First `trigger deploy --local-build` failed at the indexer stage: "Failed to
+  fetch environment variables: Connection error." The CLI rewrites
+  localhost→host.docker.internal and adds
+  `--add-host host.docker.internal:192.168.1.173` (buildImage.js:744-768 of
+  trigger.dev 4.5.16, read 2026-09-08) while the webapp is published on
+  127.0.0.1 only (`WEBAPP_PUBLISH_IP`). With a user-approved temporary TCP
+  forwarder on the LAN IP the deploy succeeded: version 20260908.2, 7 tasks,
+  image 238.78 MB (linux/amd64 on arm64 host) pushed to localhost:5001 and
+  promoted current for prod (`s6/deploy-2.log`).
+- `spike.echo` run run_cmtt9txxd00hl3qp3tygv0v2k: DEQUEUED 22:58:53Z, EXECUTING 22:58:59Z, COMPLETED 22:59:02Z. Container runner-cmtt9txxd… pulled the image from localhost:5001 and exited 0 (trigger worker stack `s6/supervisor-run.log`).
+- Inside the container (`s6/container-spike-echo.log`): git 2.39.5 present;
+  node v21.7.3 (image node, not host v24); cwd /app; uid 1000; HOME unset;
+  platform linux/x64 (amd64 image emulated on arm64 host); env =
+  TRIGGER_*/OTEL_*/NODE_* only (no host environment, no SSH agent, no git
+  credential helper, no OpenCode auth).
+
+**Not observed:**
+
+- `opencode` and `pnpm` on PATH inside the container (ENOENT). Build extension
+  `additionalPackages({opencode-ai})` installs the package into
+  /app/node_modules but does not add the binary to PATH — this is the
+  build-extension gap that must be closed before `worker.attempt` can run in a
+  container. Next step: configure the extension or entrypoint to put the binary
+  on PATH.
+- `worker.attempt` executing inside a container (OpenCode not runnable via PATH;
+  adapters also need a local repository path — no clone-from-remote step exists).
+- Push token handling (generation-bound token issuance for container profile
+  attempts).
+- PAT push from a container.
+- Provider credentials as Trigger env vars.
+
 ## Libraries
 
 `src/lib/**` holds pure adapter functions for the `worker.attempt` effect
@@ -160,13 +237,15 @@ The trial script is `scripts/trial.ts`; run one item at a time with
 
 ### `ExecutionRuntime` interface (`src/client/index.ts`)
 
-Defines the four operations every execution-runtime adapter must provide:
+Defines the five operations every execution-runtime adapter must provide:
 
 - `trigger(input)` — start a task run with a global-scope idempotency key,
   an optional concurrency key (serialises per repository), and tags.
 - `cancel(runId)` — cancel an in-flight run; resolves even if already final.
 - `retrieve(runId)` — fetch the current `RunObservation` for a run.
 - `createPublicToken(input)` — create a short-lived public access token.
+- `subscribe?(input, onObservation)` — **optional** real-time wake-up hint
+  (see below).
 
 `TriggerRunStatus` is the full 13-status v4 union.  `FINAL_RUN_STATUSES`
 lists the statuses a run never leaves.  `FAILURE_RUN_STATUSES` lists those
@@ -214,6 +293,75 @@ unit tests (so tests never need a live Trigger instance).
   `{ scopes: { read: { tags } }, expirationTime: expiresIn }`.
 - All SDK errors are wrapped in `RuntimeError { name, cause }` and re-thrown;
   no retries or error swallowing here.
+- `subscribe()` (R-008, R-010) — calls `runs.subscribeToRunsWithTag(tag)` for
+  each requested tag (SDK 4.5.16 async iterator); all per-tag subscriptions
+  run concurrently; on error the subscription ends and the promise resolves so
+  the caller falls back to polling.
+
+### Subscribe — wake-up hint semantics
+
+`subscribe?(input: { tags: string[]; signal: AbortSignal }, onObservation)`
+
+Callers use `subscribe` to receive real-time run-state notifications without
+polling.  **Polling via `retrieve` remains the authoritative path of record;
+`subscribe` is an acceleration hint only.**
+
+- The returned promise resolves when `signal` is aborted or an error ends the
+  subscription.
+- `onObservation` is called with the same `RunObservation` shape as `retrieve`,
+  including `runId`, `status`, `output`, `metadata`, `error`, and `observedAt`.
+- On error the subscription ends silently; no exception is propagated to the
+  caller.
+- The method is optional (`?`) — implementations that do not support real-time
+  delivery may omit it; the coordinator checks for its presence before calling.
+
+`FakeExecutionRuntime.subscribe` emits one observation per `advance()` call
+for runs whose tags intersect the subscriber's tag set, enabling coordinator
+tests to drive the subscribe path without a live Trigger.dev server.
+
+### Capacity metadata (`src/lib/capacity.ts`)
+
+`classifyCapacity(events, { provider, model, now })` scans an OpenCode event
+stream for error signals and returns a `CapacityClassification` or `null`.
+
+Classification rules (first match wins):
+
+| Signal | Status | `validUntil` |
+|---|---|---|
+| HTTP 401/403 · "invalid api key" · "insufficient credits" | `"down"` | +30 min |
+| HTTP 429 · "rate limit" · "quota" · "overloaded" | `"limited"` | +5 min |
+| HTTP 5xx · "unavailable" | `"limited"` | +2 min |
+| no match | *(null — returned)* | — |
+
+**Metadata key**: `"capacity"` on the Trigger run.
+
+**Shape**:
+
+```ts
+{
+  provider: string;        // e.g. "openai"
+  model: string;           // full "provider/model" string
+  status: "limited" | "down";
+  observedAt: string;      // ISO-8601
+  validUntil: string;      // ISO-8601; re-evaluate after this time
+  evidence: string;        // ≤200-char excerpt from the triggering event
+}
+```
+
+Tasks that run a model (`worker.attempt`, `lead.plan`, `lead.review`,
+`lead.accept`) call `classifyCapacity` after the model run and, when non-null,
+call `metadata.set("capacity", ...)`.
+
+- For `worker.attempt` the full NDJSON event list is passed directly.
+- For lead tasks (OpenCode SDK server mode, no NDJSON stream) a synthetic
+  `{ type: "error", error: { message: reason } }` event is constructed from
+  the `invalid_output.reason` string and classified the same way.
+
+`providerFromModel(model)` extracts the provider segment from a
+`"provider/model"` string (e.g. `"openai/gpt-4"` → `"openai"`).
+
+Neither `capacity.ts` nor any `*-core.ts` file imports the Trigger SDK
+(asserted by C5 in the packet and the architecture baseline tests).
 
 ## Worktree retention policy (`src/retention.ts`)
 

@@ -170,10 +170,13 @@ export interface OverviewWorkItemEntry {
   boundary: "artifact" | "merge" | "deploy";
   campaignId: string | null;
   pendingDecisionCount: number;
+  /** Why the item is queued rather than dispatched. Null when not queued or reason unknown. */
+  skipReason?: string | null;
 }
 
 export interface OverviewProjectEntry {
   id: string;
+  activeAttempts: number;
   workItems: OverviewWorkItemEntry[];
 }
 
@@ -183,9 +186,48 @@ export interface OverviewCampaignEntry {
   mainEffortWorkItemId: string | null;
 }
 
+export interface CapacityProviderEntry {
+  provider: string;
+  model: string;
+  status: "ok" | "limited" | "down";
+  effective: "ok" | "limited" | "down" | "unknown";
+  concurrency: number | null;
+  observedAt: string;
+  validUntil: string;
+  source: "adapter" | "operator";
+  evidence?: string;
+}
+
+export interface CapacityView {
+  now: string;
+  providers: CapacityProviderEntry[];
+}
+
 export interface OverviewView {
   campaigns: OverviewCampaignEntry[];
   projects: OverviewProjectEntry[];
+  /** Top-level capacity snapshot, identical to GET /api/capacity providers array. */
+  capacity: CapacityProviderEntry[];
+}
+
+export interface LeadMetricsProjectEntry {
+  project_id: string;
+  plans_total: number;
+  plans_escalated: number;
+  escalation_rate: number | null;
+  acceptances: number;
+  invalidations: number;
+  reversal_rate: number | null;
+  reviews_total: number;
+  reviews_with_findings: number;
+  review_yield: number | null;
+  findings_by_disposition: Record<string, number>;
+  integrations_by_outcome: Record<string, number>;
+}
+
+export interface LeadMetricsView {
+  since: string | null;
+  projects: LeadMetricsProjectEntry[];
 }
 
 export interface DecisionImpact {
@@ -437,4 +479,28 @@ export async function postCommand(body: Record<string, unknown>): Promise<Comman
   if (res.status === 401) throw handle401(safeStorage);
   if (!res.ok) throw new Error(`postCommand: ${res.status} ${res.statusText}`);
   return res.json() as Promise<CommandResult>;
+}
+
+/**
+ * Fetch lead quality metrics. Returns null when the route is not yet available (404).
+ * The `since` parameter is an ISO timestamp or null (all time).
+ */
+export async function fetchLeadMetrics(since: string | null): Promise<LeadMetricsView | null> {
+  const url = since ? `/api/metrics/lead?since=${encodeURIComponent(since)}` : "/api/metrics/lead";
+  const res = await fetch(url, { headers: buildAuthHeaders(getToken()) });
+  if (res.status === 401) throw handle401(safeStorage);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`fetchLeadMetrics: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<LeadMetricsView>;
+}
+
+/**
+ * Fetch provider capacity observations. Returns null when the route is not yet available (404).
+ */
+export async function fetchCapacity(): Promise<CapacityView | null> {
+  const res = await fetch("/api/capacity", { headers: buildAuthHeaders(getToken()) });
+  if (res.status === 401) throw handle401(safeStorage);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`fetchCapacity: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<CapacityView>;
 }
