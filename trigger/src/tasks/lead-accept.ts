@@ -8,7 +8,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import type { LeadAcceptPayload } from "@agencyhq/contracts";
-import { LeadAcceptPayloadSchema } from "@agencyhq/contracts";
+import { LeadAcceptPayloadAnySchema } from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
 
 import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
@@ -36,14 +36,15 @@ export const leadAccept = task({
   retry: { maxAttempts: 1 },
 
   run: async (rawPayload: unknown): Promise<AcceptTaskOutput> => {
-    // Validate the payload against the contract schema.
-    let payload: LeadAcceptPayload;
-    try {
-      payload = LeadAcceptPayloadSchema.parse(rawPayload);
-    } catch (error: unknown) {
-      const reason = error instanceof Error ? error.message : String(error);
-      throw new AbortTaskRunError(`Invalid lead.accept payload: ${reason}`);
+    // Validate payload with the union schema (accepts v1 and v2).
+    const parseResult = LeadAcceptPayloadAnySchema.safeParse(rawPayload);
+    if (!parseResult.success) {
+      throw new AbortTaskRunError(
+        `Invalid lead.accept payload: ${JSON.stringify(parseResult.error.flatten())}`,
+      );
     }
+    // v2 is structurally identical to v1 (no host paths); cast to v1 for the core.
+    const payload = parseResult.data as LeadAcceptPayload;
 
     metadata.set("phase", "payload_valid");
     metadata.set("attemptId", payload.attemptId);

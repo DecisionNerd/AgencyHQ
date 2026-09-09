@@ -31,6 +31,8 @@ export type ReviewDeps = {
   gitDiff: (repoPath: string, base: string, attempt: string) => Promise<string>;
   leadSession: LeadSession;
   now: () => Date;
+  /** Optional: override the computed worktree path. Used by the v2 adapter. */
+  worktreePath?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -112,11 +114,13 @@ export async function runReview(
   // Runtime invariant (ADR-0006): assert no worker-internal keys leaked in.
   assertNoWorkerContext(payload as unknown as Record<string, unknown>);
 
-  const worktreePath = resolveReviewWorktreePath({
-    worktreeBase: payload.worktreeBase,
-    attemptId: payload.attemptId,
-    generation: payload.generation,
-  });
+  const worktreePath =
+    deps.worktreePath ??
+    resolveReviewWorktreePath({
+      worktreeBase: payload.worktreeBase,
+      attemptId: payload.attemptId,
+      generation: payload.generation,
+    });
   const runDir = resolveReviewRunDir({
     worktreeBase: payload.worktreeBase,
     attemptId: payload.attemptId,

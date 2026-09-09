@@ -62,3 +62,86 @@ test('no helper outside integrate-merge* and lib/git.ts contains "push" as a git
     `"push" command found in unexpected files under trigger/src: ${forbidden.join(", ")}`,
   );
 });
+
+// P18.3 push-boundary extension: v2 adapters (broker, runtime, source,
+// artifact-upload, evidence) must contain no git push code paths.
+test("P18.3 v2 lib modules contain no git push code paths", async () => {
+  const V2_MODULES = [
+    "lib/broker.ts",
+    "lib/runtime.ts",
+    "lib/source.ts",
+    "lib/artifact-upload.ts",
+    "lib/evidence.ts",
+  ];
+
+  let grepOutput = "";
+  try {
+    const { stdout } = await execFileAsync("grep", ["-rln", '"push"', "."], { cwd: triggerSrcDir });
+    grepOutput = stdout;
+  } catch (err: unknown) {
+    const execErr = err as { code?: number | string };
+    if (execErr.code === 1) {
+      return; // no matches at all
+    }
+    throw err;
+  }
+
+  const matchedFiles = grepOutput
+    .trim()
+    .split("\n")
+    .map((f) => f.trim())
+    .filter((f) => f.length > 0);
+
+  const v2Violations = matchedFiles.filter((file) => {
+    const normalised = file.replace(/\\/g, "/");
+    return V2_MODULES.some((mod) => normalised.includes(mod));
+  });
+
+  assert.deepEqual(
+    v2Violations,
+    [],
+    `"push" found in v2 lib modules (must never push): ${v2Violations.join(", ")}`,
+  );
+});
+
+// Integrate adapter must refuse to push without an integrate lease.
+// This is enforced structurally: pushForceWithLease in lib/git.ts is only
+// called from integrate-merge.ts, and that file checks for an integrate lease
+// before calling it. The test above (no "push" outside allowed files) already
+// enforces this at the source level. Here we add an explicit note that:
+//   - worker-attempt (host and v2) has no push code path
+//   - verify-run (host and v2) has no push code path
+//   - lead-review (host and v2) has no push code path
+//   - lead-accept has no push code path
+test("worker/verify/review/accept adapters have no push code paths (source-level invariant)", async () => {
+  const NON_PUSH_ADAPTERS = ["worker-attempt", "verify-run", "lead-review", "lead-accept"];
+
+  let grepOutput = "";
+  try {
+    const { stdout } = await execFileAsync("grep", ["-rln", '"push"', "."], { cwd: triggerSrcDir });
+    grepOutput = stdout;
+  } catch (err: unknown) {
+    const execErr = err as { code?: number | string };
+    if (execErr.code === 1) {
+      return;
+    }
+    throw err;
+  }
+
+  const matchedFiles = grepOutput
+    .trim()
+    .split("\n")
+    .map((f) => f.trim())
+    .filter((f) => f.length > 0);
+
+  const violations = matchedFiles.filter((file) => {
+    const normalised = file.replace(/\\/g, "/");
+    return NON_PUSH_ADAPTERS.some((adapter) => normalised.includes(adapter));
+  });
+
+  assert.deepEqual(
+    violations,
+    [],
+    `"push" found in non-push adapter files: ${violations.join(", ")}`,
+  );
+});

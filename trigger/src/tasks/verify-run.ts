@@ -10,12 +10,16 @@
 //   - This task reads nothing from the worker's report.
 //   - The verify worktree is removed in a finally block; the attempt worktree is retained.
 
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import type { VerifyRunOutput } from "@agencyhq/contracts";
-import { VerifyRunPayloadSchema } from "@agencyhq/contracts";
+import { isV2VerifyRunPayload, VerifyRunPayloadAnySchema } from "@agencyhq/contracts";
 import { buildVerificationResult, environmentFingerprint, runCheck } from "@agencyhq/verification";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
+import { createBroker } from "../lib/broker.ts";
 import { scrubbedChildEnv } from "../lib/env.ts";
 import { changedPaths, diffDigest, worktreeAdd, worktreeRemove } from "../lib/git.ts";
+import { materializeSource } from "../lib/source.ts";
 import type { RunProfileInput, VerificationRunner } from "./verify-run-core.ts";
 import { runVerification } from "./verify-run-core.ts";
 
@@ -84,14 +88,95 @@ export const verifyRun = task({
   retry: { maxAttempts: 1 },
 
   run: async (rawPayload: unknown, { signal }): Promise<VerifyRunOutput> => {
-    // Validate payload with the contracts schema.
-    const parseResult = VerifyRunPayloadSchema.safeParse(rawPayload);
+    // Validate payload with the contracts schema (accepts v1 and v2).
+    const parseResult = VerifyRunPayloadAnySchema.safeParse(rawPayload);
     if (!parseResult.success) {
       throw new AbortTaskRunError(
         `invalid payload: ${JSON.stringify(parseResult.error.flatten())}`,
       );
     }
     const payload = parseResult.data;
+
+    // v2: materialize the artifact bundle at attemptRevision, run checks in the
+    // clone dir, then delete the clone in a finally block.
+    if (isV2VerifyRunPayload(payload)) {
+      const coordinatorUrl =
+        process.env.AGENCYHQ_COORDINATOR_INTERNAL_URL ??
+        (() => {
+          throw new AbortTaskRunError("missing AGENCYHQ_COORDINATOR_INTERNAL_URL");
+        })();
+      const runRoot =
+        process.env.AGENCYHQ_RUN_ROOT ??
+        (() => {
+          throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
+        })();
+      const broker = createBroker(coordinatorUrl);
+      const cloneDir = join(runRoot, "runs", `verify-${payload.attemptId}`, "src");
+
+      // Use the upload token from the env (coordinator supplies it for verify tasks).
+      const uploadToken = process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
+
+      const sourceResult = await materializeSource({
+        source: { ...payload.source, revision: payload.attemptRevision },
+        dir: cloneDir,
+        broker,
+        token: uploadToken,
+      });
+
+      if (!sourceResult.ok) {
+        throw new AbortTaskRunError(
+          `verify source materialization failed: ${sourceResult.failureKind}`,
+        );
+      }
+
+      const clonedDir = sourceResult.clonedDir;
+
+      try {
+        const env = scrubbedChildEnv({ attemptId: payload.attemptId });
+        const runner = createRealRunner(env);
+        signal.addEventListener("abort", () => runner.abort?.(), { once: true });
+        metadata.set("phase", "integrity_checked");
+
+        // Synthesize a v1-compatible payload for runVerification (which expects
+        // repoPath and worktreeBase). The actual worktree path is overridden via
+        // deps.worktreePath so these placeholder values are unused for git ops.
+        const v1Payload = {
+          ...payload,
+          repoPath: clonedDir,
+          worktreeBase: clonedDir,
+          payloadVersion: 1 as const,
+        };
+
+        const output = await runVerification(v1Payload, {
+          worktreeAdd: async () => {
+            // v2: clone is already materialized; no worktree needed.
+          },
+          worktreeRemove: async () => {
+            // v2: cleanup handled in finally.
+          },
+          diffDigest: async (args) => {
+            const hex = await diffDigest({
+              worktreePath: clonedDir,
+              baseRev: args.baseRev,
+            });
+            return hex;
+          },
+          changedPaths: (args) => changedPaths({ worktreePath: clonedDir, baseRev: args.baseRev }),
+          runner,
+          fingerprint: buildFingerprint,
+          now: () => new Date().toISOString(),
+          // Override worktree path with the clone dir.
+          worktreePath: clonedDir,
+        });
+
+        metadata.set("phase", "done");
+        metadata.set("integrity", output.integrity);
+        const { diffDigestMatches: _dm, ...contractIntegrity } = output.integrity;
+        return { results: output.results, integrity: contractIntegrity };
+      } finally {
+        await rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
 
     // Extract coordinator-supplied manifest extension fields from the raw payload.
     // These are not in the contracts schema and must be pulled directly from the raw object.

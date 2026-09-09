@@ -133,6 +133,10 @@ export function buildOutput(args: {
     denials: EventDenial[];
     errors: string[];
   };
+  /** v2 artifact ref; absent on v1 (host profile) paths. */
+  artifact?: WorkerAttemptOutput["artifact"];
+  /** v2 upload statuses; absent on v1 (host profile) paths. */
+  uploads?: WorkerAttemptOutput["uploads"];
 }): WorkerAttemptOutput {
   const sessionId = args.sessionId ?? args.opencode.sessionID ?? "unknown";
   const report: WorkerReportLite = args.report ?? {
@@ -143,7 +147,7 @@ export function buildOutput(args: {
     limitations: [],
     findings: [],
   };
-  return {
+  const base: WorkerAttemptOutput = {
     attemptId: args.attemptId,
     sessionId,
     report,
@@ -158,6 +162,13 @@ export function buildOutput(args: {
     survivors: args.survivors,
     opencode: args.opencode,
   };
+  if (args.artifact !== undefined) {
+    base.artifact = args.artifact;
+  }
+  if (args.uploads !== undefined) {
+    base.uploads = args.uploads;
+  }
+  return base;
 }
 
 /** Per-run bookkeeping registered when the OpenCode child starts, looked up

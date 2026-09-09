@@ -177,6 +177,9 @@ export type WorkerReportLite = {
   findings: { subject: string; cause: string; description: string }[];
 };
 
+/** Upload disposition for a single upload operation on v2 payloads. */
+export type UploadStatus = "uploaded" | "failed" | "skipped";
+
 export type WorkerAttemptOutput = {
   attemptId: string;
   /** OpenCode session id, or "unknown" when the session never reported one. */
@@ -197,6 +200,20 @@ export type WorkerAttemptOutput = {
     denials: EventDenial[];
     errors: string[];
   };
+  /**
+   * Reference to the uploaded artifact bundle (v2 payloads / container profile only).
+   * Null when no commit was made, the upload failed, or this is a v1 payload.
+   */
+  artifact?: ArtifactRef | null;
+  /**
+   * Upload disposition per-item (v2 payloads only).
+   * Absent on v1 payloads (host profile).
+   */
+  uploads?: {
+    artifact: UploadStatus;
+    checkpoint: UploadStatus;
+    stopEvidence: UploadStatus;
+  };
 };
 
 // Appended for lead review and accept tasks (Packet 3.D).
@@ -204,6 +221,7 @@ export type WorkerAttemptOutput = {
 
 import type {
   AcceptanceProposal,
+  ArtifactRef,
   ContractBounds,
   PermissionRuleset as ContractsPermissionRuleset,
   ReviewOutput,
