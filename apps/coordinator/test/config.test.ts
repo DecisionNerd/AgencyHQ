@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { ConfigError, loadConfig, readSecretFile, readTriggerKeyFromState } from "../src/config.ts";
@@ -85,12 +86,10 @@ describe("loadConfig — apiToken / bindHost validation", () => {
 // ---------------------------------------------------------------------------
 
 describe("readSecretFile", () => {
-  const SCRATCHPAD =
-    "/private/tmp/claude-501/-Users-davidspencer-Code-GitHub-AgencyHQ/7492d762-bf2c-42d2-b217-19a1e7f80b22/scratchpad";
   let tmpDir: string;
 
   before(() => {
-    tmpDir = join(SCRATCHPAD, `secrets-test-${Date.now()}`);
+    tmpDir = join(tmpdir(), `secrets-test-${Date.now()}`);
     mkdirSync(tmpDir, { recursive: true });
   });
 
@@ -138,12 +137,10 @@ describe("readSecretFile", () => {
 // ---------------------------------------------------------------------------
 
 describe("readTriggerKeyFromState", () => {
-  const SCRATCHPAD =
-    "/private/tmp/claude-501/-Users-davidspencer-Code-GitHub-AgencyHQ/7492d762-bf2c-42d2-b217-19a1e7f80b22/scratchpad";
   let tmpDir: string;
 
   before(() => {
-    tmpDir = join(SCRATCHPAD, `trigger-key-test-${Date.now()}`);
+    tmpDir = join(tmpdir(), `trigger-key-test-${Date.now()}`);
     mkdirSync(tmpDir, { recursive: true });
   });
 
@@ -175,14 +172,12 @@ describe("readTriggerKeyFromState", () => {
 // ---------------------------------------------------------------------------
 
 describe("loadConfig — secret precedence (env wins over file)", () => {
-  const SCRATCHPAD =
-    "/private/tmp/claude-501/-Users-davidspencer-Code-GitHub-AgencyHQ/7492d762-bf2c-42d2-b217-19a1e7f80b22/scratchpad";
   let secretsDir: string;
   let stateDir: string;
 
   before(() => {
-    secretsDir = join(SCRATCHPAD, `load-config-secrets-${Date.now()}`);
-    stateDir = join(SCRATCHPAD, `load-config-state-${Date.now()}`);
+    secretsDir = join(tmpdir(), `load-config-secrets-${Date.now()}`);
+    stateDir = join(tmpdir(), `load-config-state-${Date.now()}`);
     mkdirSync(secretsDir, { recursive: true });
     mkdirSync(stateDir, { recursive: true });
   });

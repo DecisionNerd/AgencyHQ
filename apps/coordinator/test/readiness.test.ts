@@ -239,10 +239,7 @@ describe("readBootstrapJson", () => {
   let tmpDir: string;
 
   before(() => {
-    tmpDir = join(
-      "/private/tmp/claude-501/-Users-davidspencer-Code-GitHub-AgencyHQ/7492d762-bf2c-42d2-b217-19a1e7f80b22/scratchpad",
-      `bootstrap-test-${Date.now()}`,
-    );
+    tmpDir = join(tmpdir(), `bootstrap-test-${Date.now()}`);
     mkdirSync(tmpDir, { recursive: true });
   });
 
@@ -320,10 +317,7 @@ describe("readDeploymentJson", () => {
   let tmpDir: string;
 
   before(() => {
-    tmpDir = join(
-      "/private/tmp/claude-501/-Users-davidspencer-Code-GitHub-AgencyHQ/7492d762-bf2c-42d2-b217-19a1e7f80b22/scratchpad",
-      `deployment-test-${Date.now()}`,
-    );
+    tmpDir = join(tmpdir(), `deployment-test-${Date.now()}`);
     mkdirSync(tmpDir, { recursive: true });
   });
 

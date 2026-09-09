@@ -22,6 +22,7 @@
 
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { readBootstrapJson, readDeploymentJson } from "../src/readiness/loader.ts";
@@ -31,10 +32,7 @@ import { readBootstrapJson, readDeploymentJson } from "../src/readiness/loader.t
 // ---------------------------------------------------------------------------
 
 function makeTmpDir(suffix: string): string {
-  const dir = join(
-    "/private/tmp/claude-501/-Users-davidspencer-Code-GitHub-AgencyHQ/7492d762-bf2c-42d2-b217-19a1e7f80b22/scratchpad",
-    `fixture-alignment-${suffix}-${Date.now()}`,
-  );
+  const dir = join(tmpdir(), `fixture-alignment-${suffix}-${Date.now()}`);
   mkdirSync(dir, { recursive: true });
   return dir;
 }
