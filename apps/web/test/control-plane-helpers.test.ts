@@ -470,6 +470,35 @@ test("confirmMessage: consequence appears on a new line", () => {
   assert.ok(msg.includes("stops the running attempt"), "should contain stop consequence");
 });
 
+test("confirmMessage: stop includes contract version and consequence", () => {
+  const msg = confirmMessage({
+    action: "stop",
+    projectId: "prj-stop",
+    workItemId: "wi-stop",
+    attemptId: "att-stop-1",
+    contractVersion: 3,
+    consequence: "stops the running attempt; the checkpoint is kept",
+  });
+  assert.ok(/v3/.test(msg), "should contain contract version v3");
+  assert.ok(msg.includes("att-stop-1"), "should contain attemptId");
+  assert.ok(msg.includes("stops the running attempt"), "should contain stop consequence");
+  assert.ok(msg.includes("\n"), "consequence should be on a new line");
+});
+
+test("confirmMessage: pause includes consequence and version when provided", () => {
+  const msg = confirmMessage({
+    action: "pause",
+    projectId: "prj-pause",
+    workItemId: "wi-pause",
+    attemptId: "att-pause-1",
+    contractVersion: 2,
+    consequence: "pauses dispatch for this work item; running attempts continue",
+  });
+  assert.ok(/v2/.test(msg), "should contain contract version v2");
+  assert.ok(msg.includes("att-pause-1"), "should contain attemptId");
+  assert.ok(msg.includes("pauses dispatch"), "should contain pause consequence");
+});
+
 test("confirmMessage: omits consequence when not provided", () => {
   const msg = confirmMessage({
     action: "pause",

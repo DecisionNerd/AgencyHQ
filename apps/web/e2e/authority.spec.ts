@@ -47,9 +47,9 @@ test("authority page: invalid JSON shows a parse error without sending a request
 });
 
 test("authority page: invalid schema shows authority-errors after confirm", async ({ page }) => {
-  // NOTE: this journey depends on the coordinator returning 422 for schema
-  // failures (PUT /api/projects/:id/authority). Marked "verified against
-  // contract, pending merge" — the current coordinator does not yet return 422.
+  // The coordinator returns 422 for schema failures (PUT /api/projects/:id/authority,
+  // validated by AuthoritySchema before the command). This journey confirms, sends the
+  // request, and asserts that the authority-errors element is non-empty.
   const ids = seedIds();
   expect(ids.projectId, "seed must publish projectId").toBeTruthy();
 

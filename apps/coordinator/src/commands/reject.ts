@@ -65,6 +65,9 @@ export async function rejectWorkItem(
     // no resolving outcome; for no-attempt rows, same work_item + kind +
     // contract_version (nulls equal via IS NOT DISTINCT FROM) must have none.
     // This ensures reject-after-approve and double-reject both return state_mismatch.
+    // d2.at >= d.at: only count resolving decisions created at or after the pending,
+    // so that a later no-attempt pending (e.g. a second plan) is not blocked by a
+    // resolved row from a prior pending on the same work item + kind (V-2 fix).
     const { rows: decisionRows } = await client.query<{
       id: string;
       kind: string | null;
@@ -80,6 +83,7 @@ export async function rejectWorkItem(
            WHERE d2.outcome IN ('approved', 'rejected', 'accepted', 'invalidated')
              AND (d2.kind IS NOT DISTINCT FROM d.kind)
              AND d2.work_item_id = d.work_item_id
+             AND d2.at >= d.at
              AND (
                (d.attempt_id IS NOT NULL AND d2.attempt_id = d.attempt_id)
                OR

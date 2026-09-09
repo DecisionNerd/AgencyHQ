@@ -9,9 +9,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { HOST_TRIAL_AUTHORITY } from "@agencyhq/contracts";
+import { HOST_TRIAL_AUTHORITY, TASK_IDS } from "@agencyhq/contracts";
 import type { TestDbContext } from "@agencyhq/db";
+import { createPool } from "@agencyhq/db";
 import pg from "pg";
+import { FakeExecutionRuntime } from "../../../../trigger/src/client/fake.ts";
+import type { ApproveDeps } from "../../src/commands/approve.ts";
+import { approveWorkItem } from "../../src/commands/approve.ts";
 import {
   assignCampaign,
   createCampaign,
@@ -125,89 +129,138 @@ async function seedAttemptWithDecision(
 // T-4: APPROVAL_VERSION_MISMATCH → approval_mismatch outcome, pending stays open
 // ---------------------------------------------------------------------------
 
-test("T-4: mismatch decision remains open in view and a later correct approve succeeds", async (t) => {
+test("T-4: approveWorkItem with mismatched revision writes approval_mismatch; pending stays open in decisions view", async (t) => {
   await withControlPlaneSchema(t, async (ctx) => {
-    // Seed a pending decision and a sibling approval_mismatch decision (as approve would write).
-    const projectId = await seedProject(ctx);
-    const workItemId = await seedWorkItem(ctx, projectId, { lifecycle: "active" });
-    const contractId = await seedContract(ctx, workItemId, projectId);
-    const { attemptId, decisionId: pendingId } = await seedAttemptWithDecision(
-      ctx,
-      contractId,
-      workItemId,
-      { decisionOutcome: "pending_human" },
-    );
-
-    // Insert an approval_mismatch decision (same attempt, same kind) — this is what
-    // the approve command now writes on a version mismatch (T-4).
-    const mismatchId = `dec-mismatch-${randomUUID()}`;
-    await ctx.client.query(
-      `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
-       VALUES ($1, 'accept', 'human', $2, $3, 'approval_mismatch', now())`,
-      [mismatchId, workItemId, attemptId],
-    );
-
-    // The pending_human decision must still be open (not resolved by approval_mismatch).
-    const { rows: openRows } = (await ctx.client.query(
-      `SELECT outcome FROM decisions WHERE work_item_id = $1 AND outcome = 'pending_human'`,
-      [workItemId],
-    )) as { rows: Array<{ outcome: string }> };
-    assert.equal(openRows.length, 1, "pending_human decision still open after approval_mismatch");
-
-    // There is no resolved decision (approved/rejected/accepted/invalidated) for the attempt,
-    // so the approve command's NOT EXISTS guard will find the pending decision.
-    const { rows: resolvedRows } = (await ctx.client.query(
-      `SELECT outcome FROM decisions WHERE attempt_id = $1
-       AND outcome IN ('approved', 'rejected', 'accepted', 'invalidated')`,
-      [attemptId],
-    )) as { rows: Array<{ outcome: string }> };
-    assert.equal(resolvedRows.length, 0, "no resolving decision — pending remains open for retry");
-
-    // U-13: exercise the decisions view builder — the pending must appear as open,
-    // and the approval_mismatch decision must exist in the DB. The view function
-    // runs openPendingDecisions, which must not close the pending due to mismatch.
-    const viewDecisions = [
-      {
-        id: pendingId,
+    // Use createPool with search_path in URL options so pool.query() (used by
+    // bounded-repair.ts / evaluateAcceptanceForAttempt) sees the isolated schema.
+    // makeSchemaPool only overrides pool.connect(), missing direct pool.query() calls.
+    const poolUrl = new URL(process.env.DATABASE_URL ?? "");
+    poolUrl.searchParams.set("options", `-c search_path=${ctx.schema},public`);
+    const pool = createPool(poolUrl.toString());
+    try {
+      const projectId = await seedProject(ctx);
+      const workItemId = await seedWorkItem(ctx, projectId, { lifecycle: "active" });
+      const contractId = await seedContract(ctx, workItemId, projectId);
+      const { attemptId, decisionId: pendingId } = await seedAttemptWithDecision(
+        ctx,
+        contractId,
         workItemId,
-        kind: "accept",
-        outcome: "pending_human",
-        at: new Date().toISOString(),
-        attemptId,
-        contractVersion: 1 as number | null,
-        rationale: null as string | null,
-      },
-      {
-        id: mismatchId,
-        workItemId,
-        kind: "accept",
-        outcome: "approval_mismatch",
-        at: new Date().toISOString(),
-        attemptId,
-        contractVersion: 1 as number | null,
-        rationale: null as string | null,
-      },
-    ];
-    const decisionsView = buildDecisionsView({
-      decisions: viewDecisions,
-      attempts: [],
-      contracts: [],
-      findings: [],
-    });
-    // The decisions view should list the pending as open (approval_mismatch is not resolving).
-    assert.equal(
-      decisionsView.decisions.length,
-      1,
-      "decisions view: pending still open (not resolved by approval_mismatch)",
-    );
-    assert.equal(decisionsView.decisions[0]?.id, pendingId, "open pending id matches");
+        { decisionOutcome: "pending_human" },
+      );
 
-    // The approval_mismatch decision must exist in the DB (command side covered by approve.test.ts).
-    const { rows: mismatchRows } = (await ctx.client.query(
-      `SELECT outcome FROM decisions WHERE id = $1`,
-      [mismatchId],
-    )) as { rows: Array<{ outcome: string }> };
-    assert.equal(mismatchRows[0]?.outcome, "approval_mismatch", "approval_mismatch decision in DB");
+      // Seed artifact for the attempt (needed by evaluateAcceptanceForAttempt).
+      const artifactRevision = "abc123-known-revision-000000000000000000000";
+      await ctx.client.query(
+        `INSERT INTO artifacts (id, attempt_id, revision, diff_digest, changed_paths)
+         VALUES ($1, $2, $3, 'dd-test', '[]'::jsonb)`,
+        [`art-${randomUUID()}`, attemptId, artifactRevision],
+      );
+
+      // Seed dispatch_intents and run_observations so approveWorkItem can load
+      // the AcceptanceProposal from the lead.accept run (approve.ts step 3).
+      const runId = `run-accept-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO dispatch_intents (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
+         VALUES ($1, $2, 'pd-test', $3, 'completed', $4, $5)`,
+        [
+          `di-${randomUUID()}`,
+          TASK_IDS.leadAccept,
+          attemptId,
+          runId,
+          `accept-ikey-${randomUUID()}`,
+        ],
+      );
+      const acceptanceProposal = {
+        accept: true,
+        criteria: [],
+        findingDispositions: [],
+        rationale: "T-4 rework test — mismatched revision triggers APPROVAL_VERSION_MISMATCH",
+      };
+      await ctx.client.query(
+        `INSERT INTO run_observations (run_id, generation, stale, payload)
+         VALUES ($1, 1, false, $2::jsonb)`,
+        [runId, JSON.stringify({ output: acceptanceProposal })],
+      );
+
+      // Call approveWorkItem with a WRONG attemptRevision (not hand-inserting the row — T-4).
+      const WRONG_REVISION = "0000000000000000000000000000000000000000";
+      const approveDeps: ApproveDeps = {
+        pool,
+        runtime: new FakeExecutionRuntime(),
+        clock: { now: () => new Date().toISOString() },
+      };
+      const result = await approveWorkItem(approveDeps, {
+        commandId: `cmd-t4-${randomUUID()}`,
+        workItemId,
+        contractId,
+        contractVersion: 1,
+        attemptRevision: WRONG_REVISION,
+        actor: "test-human",
+      });
+
+      assert.equal(result.ok, false, "approveWorkItem with wrong revision must not be ok");
+      if (!result.ok) {
+        assert.equal(
+          result.reason,
+          "APPROVAL_VERSION_MISMATCH",
+          "reason = APPROVAL_VERSION_MISMATCH",
+        );
+      }
+
+      // Build decisions view from actual DB decisions — the pending must still appear as open.
+      // U-13: openPendingDecisions must not close the pending due to approval_mismatch.
+      const { rows: dbDecisions } = (await ctx.client.query(
+        `SELECT id, work_item_id, kind, outcome, at, attempt_id, contract_version
+         FROM decisions WHERE work_item_id = $1 ORDER BY at`,
+        [workItemId],
+      )) as {
+        rows: Array<{
+          id: string;
+          work_item_id: string;
+          kind: string;
+          outcome: string;
+          at: Date;
+          attempt_id: string | null;
+          contract_version: number | null;
+        }>;
+      };
+
+      const decisionsView = buildDecisionsView({
+        decisions: dbDecisions.map((d) => ({
+          id: d.id,
+          workItemId: d.work_item_id,
+          kind: d.kind,
+          outcome: d.outcome,
+          at: d.at.toISOString(),
+          attemptId: d.attempt_id,
+          contractVersion: d.contract_version,
+        })),
+        attempts: [],
+        contracts: [],
+        findings: [],
+      });
+
+      // The decisions view must list the pending as open (approval_mismatch is not resolving).
+      assert.equal(
+        decisionsView.decisions.length,
+        1,
+        "decisions view: pending still open (not resolved by approval_mismatch)",
+      );
+      assert.equal(decisionsView.decisions[0]?.id, pendingId, "open pending id matches");
+
+      // The approval_mismatch decision must now exist in the DB (written by approveWorkItem, not hand-inserted).
+      const { rows: mismatchRows } = (await ctx.client.query(
+        `SELECT outcome FROM decisions WHERE work_item_id = $1 AND outcome = 'approval_mismatch'`,
+        [workItemId],
+      )) as { rows: Array<{ outcome: string }> };
+      assert.equal(
+        mismatchRows.length,
+        1,
+        "approval_mismatch decision written to DB by approveWorkItem (T-4)",
+      );
+    } finally {
+      await pool.end();
+    }
   });
 });
 
@@ -605,6 +658,135 @@ test("U-3: invalidate_acceptance succeeds on coordinator-accepted (outcome='acce
         "reopened",
         "work item lifecycle = reopened after invalidation",
       );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// V-2: no-attempt pending time bound — second plan pending stays open after
+// first was rejected (reject.ts NOT EXISTS guard: AND d2.at >= d.at).
+// ---------------------------------------------------------------------------
+
+test("V-2: second no-attempt pending is open after first rejected; re-reject of first returns state_mismatch", async (t) => {
+  await withControlPlaneSchema(t, async (ctx) => {
+    const pool = makeSchemaPool(process.env.DATABASE_URL ?? "", ctx.schema);
+    try {
+      const projectId = await seedProject(ctx);
+      const workItemId = await seedWorkItem(ctx, projectId, { lifecycle: "active" });
+
+      // Insert pending_1: attempt-less plan decision at T0 (older timestamp).
+      const pending1Id = `dec-v2-p1-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
+         VALUES ($1, 'plan', 'coordinator', $2, NULL, 'pending_human', now() - interval '10 seconds')`,
+        [pending1Id, workItemId],
+      );
+
+      // Reject pending_1 — the command writes rejected_1 at approximately now() (T1 > T0).
+      const r1 = await rejectWorkItem(
+        { pool },
+        {
+          commandId: `cmd-v2-r1-${randomUUID()}`,
+          workItemId,
+          decisionId: pending1Id,
+          reason: "first plan rejected",
+        },
+      );
+      assert.equal(r1.ok, true, "reject of first pending must succeed");
+
+      // Insert pending_2: attempt-less plan decision at T2 = now() + 1 minute,
+      // guaranteeing T2 > T1 (rejected_1.at). Simulates a "plan again" scenario.
+      const pending2Id = `dec-v2-p2-${randomUUID()}`;
+      await ctx.client.query(
+        `INSERT INTO decisions (id, kind, actor, work_item_id, attempt_id, outcome, at)
+         VALUES ($1, 'plan', 'coordinator', $2, NULL, 'pending_human', now() + interval '1 minute')`,
+        [pending2Id, workItemId],
+      );
+
+      // Build the decisions view from the actual DB rows — pending_2 must appear as open.
+      const { rows: dbDecisions } = (await ctx.client.query(
+        `SELECT id, work_item_id, kind, outcome, at, attempt_id, contract_version
+         FROM decisions WHERE work_item_id = $1 ORDER BY at`,
+        [workItemId],
+      )) as {
+        rows: Array<{
+          id: string;
+          work_item_id: string;
+          kind: string;
+          outcome: string;
+          at: Date;
+          attempt_id: string | null;
+          contract_version: number | null;
+        }>;
+      };
+
+      const decisionsView = buildDecisionsView({
+        decisions: dbDecisions.map((d) => ({
+          id: d.id,
+          workItemId: d.work_item_id,
+          kind: d.kind,
+          outcome: d.outcome,
+          at: d.at.toISOString(),
+          attemptId: d.attempt_id,
+          contractVersion: d.contract_version,
+        })),
+        attempts: [],
+        contracts: [],
+        findings: [],
+      });
+
+      assert.equal(
+        decisionsView.decisions.length,
+        1,
+        "decisions view: second pending open after first rejected (V-2)",
+      );
+      assert.equal(
+        decisionsView.decisions[0]?.id,
+        pending2Id,
+        "open decision is the second pending (V-2)",
+      );
+
+      // Reject pending_2 — must succeed because rejected_1.at < pending_2.at (V-2 fix).
+      const r2 = await rejectWorkItem(
+        { pool },
+        {
+          commandId: `cmd-v2-r2-${randomUUID()}`,
+          workItemId,
+          decisionId: pending2Id,
+          reason: "second plan rejected",
+        },
+      );
+      assert.equal(
+        r2.ok,
+        true,
+        "reject of second pending must succeed (V-2: time bound lets it through)",
+      );
+
+      // Re-reject pending_1 with a new commandId — must return state_mismatch because
+      // rejected_1.at >= pending_1.at (the original resolution stands).
+      const r3 = await rejectWorkItem(
+        { pool },
+        {
+          commandId: `cmd-v2-r3-${randomUUID()}`,
+          workItemId,
+          decisionId: pending1Id,
+          reason: "late reject attempt",
+        },
+      );
+      assert.equal(
+        r3.ok,
+        false,
+        "re-reject of first (already resolved) pending must return state_mismatch (V-2)",
+      );
+      if (!r3.ok) {
+        assert.equal(
+          r3.reason,
+          "state_mismatch",
+          "reason = state_mismatch for already-rejected pending (V-2)",
+        );
+      }
     } finally {
       await pool.end();
     }

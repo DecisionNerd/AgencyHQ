@@ -99,10 +99,9 @@ test("work item page: reject button is disabled when reason is empty", async ({ 
   await expect(reasonInput).toBeVisible({ timeout: 5_000 });
   await expect(reasonInput).toHaveValue("");
 
-  // Reject button must be disabled when reason is empty
-  // NOTE: action-reject is only rendered when openPendingDecisions is non-empty.
-  // This journey depends on the coordinator sending openPendingDecisions.
-  // If the button is not visible (old server), the test is marked pending merge.
+  // Reject button must be disabled when reason is empty.
+  // action-reject is only rendered when openPendingDecisions is non-empty; the
+  // coordinator sends openPendingDecisions in every work-item view response.
   const rejectBtn = page.getByTestId("action-reject");
   await expect(rejectBtn).toBeVisible({ timeout: 5_000 });
   await expect(rejectBtn).toBeDisabled();

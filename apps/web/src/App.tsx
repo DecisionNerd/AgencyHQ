@@ -1294,6 +1294,11 @@ function WorkItemPage({
                         projectId: projectId ?? "unknown",
                         workItemId: item.workItemId,
                         attemptId: latestAttempt.id,
+                        contractVersion:
+                          openDecision?.contractVersion ??
+                          evidence?.decisions.find(
+                            (d) => d.attemptId === latestAttempt.id && d.contractVersion != null,
+                          )?.contractVersion,
                         consequence: "stops the running attempt; the checkpoint is kept",
                       }),
                       () =>
@@ -1323,6 +1328,9 @@ function WorkItemPage({
                       action: "pause",
                       projectId: projectId ?? "unknown",
                       workItemId: item.workItemId,
+                      attemptId: openDecision?.attemptId,
+                      contractVersion: openDecision?.contractVersion,
+                      consequence: "pauses dispatch for this work item; running attempts continue",
                     }),
                     () =>
                       runAction(
@@ -1414,6 +1422,11 @@ function WorkItemPage({
                           projectId: projectId ?? "unknown",
                           workItemId: item.workItemId,
                           attemptId: latestAttempt.id,
+                          contractVersion:
+                            openDecision?.contractVersion ??
+                            evidence?.decisions.find(
+                              (d) => d.attemptId === latestAttempt.id && d.contractVersion != null,
+                            )?.contractVersion,
                           consequence: "invalidates the recorded acceptance; the item reopens",
                         }),
                         () =>

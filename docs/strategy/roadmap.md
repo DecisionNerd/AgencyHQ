@@ -122,24 +122,22 @@ on it.
   batch scheduling that calls `selectDispatch` is Slice 6 scope (planned).
   Hash-router web app (`#/`, `#/decisions`, `#/work-items/:id`,
   `#/projects/:id/authority`, `#/return`) with bearer-auth token prompt on 401;
-  work-item actions (approve, reject, stop, invalidate) each show a confirm
-  dialog naming the project and work item; approve, reject, and invalidate also
-  name the contract version. Playwright browser tests: 17 journeys on a
+  work-item actions (approve, reject, stop, invalidate, pause) each show a confirm
+  dialog naming the project, work item, contract version (where available), and
+  consequence phrase. Playwright browser tests: 20 journeys on a
   fake-runtime seeded coordinator (return after interruption; four state-card
   source/timestamp checks; six work-item states; approve from decisions and
-  work-item pages; reject to halted; authority invalid/valid edits; stop to
-  stopping — proving the deterministic half only, as the fake runtime does not
-  produce adapter evidence for the full stop cycle); CI job `browser`; browser
+  work-item pages; reject to halted; authority invalid/valid/parse-error flows;
+  stop to stopping and confirm dialog names contract version); CI job `browser`; browser
   suite red at `be841ff`, fixed at `04c3893`, green in CI at `04c3893` per
-  PR #12. One live trial item: approve via the operator UI on the real stack
+  PR #12; rework 2 CI green at runs 34282513541 and 34282515774. One live trial item: approve via the operator UI on the real stack
   (merge boundary, `pending_human` at 174 s, approve clicked, `integrate.merge`
   dispatched in one transaction, remote `main` advanced from `b1f48d0` to
   `5cbff2c`, work item `completed/healthy`). One defect found by screenshot
   (single work-item view missing integration and manifest rows; page had no
   lifecycle/condition label); fixed in `6ab2f2f`. Rework commit `84cdb08`
   (open-pending rule, persisted reasons, membership guard, authority CAS; see
-  trial record §Rework). 1,181 unit tests, 238 integration tests (83 db + 155
-  coordinator), 17 browser tests. Full record:
+  trial record §Rework). 20 browser tests. Full record:
   [trials/2026-09-slice5.md](../engineering/trials/2026-09-slice5.md).
 
 ## Slice 6 — capacity (current)
