@@ -869,6 +869,9 @@ export class BoundedRepairFlow {
 
     // Captured early so the catch block can record a recovery decision (Defect 4).
     let recoveryWorkItemId: string | null = null;
+    // Hoisted after COMMIT so the outer catch can mark the worker intent failed
+    // for non-dispatch errors (e.g. a DB error inside scheduleQueuedIntents).
+    let recoveryWorkerIntentId: string | null = null;
 
     const client = await pool.connect();
     try {
@@ -1226,6 +1229,10 @@ export class BoundedRepairFlow {
       );
 
       await client.query("COMMIT");
+      // Worker intent is now committed to the DB. Hoist its id so the outer
+      // catch can mark it failed if a non-dispatch error (e.g. a DB error inside
+      // scheduleQueuedIntents) propagates after this point.
+      recoveryWorkerIntentId = String(workerIntentId);
 
       // Always queue: let scheduleQueuedIntents() apply all gates (provider capacity,
       // repository busy, slot count) — the same code path as the normal poll
@@ -1350,6 +1357,16 @@ export class BoundedRepairFlow {
             "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
             [intentId],
           );
+          // Mark own worker intent failed (if already committed) so a subsequent
+          // poll cannot dispatch it while the work item is parked pending_human.
+          // Covers non-dispatch errors (e.g. DB errors inside scheduleQueuedIntents)
+          // that propagate after the main transaction commits (R1 fix).
+          if (recoveryWorkerIntentId) {
+            await recoveryClient.query(
+              "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
+              [recoveryWorkerIntentId],
+            );
+          }
           await recoveryClient.query("COMMIT");
         } catch (recErr) {
           console.error("[onLeadPlanOutput] recovery transaction failed", recErr);

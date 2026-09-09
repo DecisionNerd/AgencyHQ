@@ -2457,3 +2457,122 @@ test("scheduling(admission-N2): another queued item B fails dispatch during C's 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// R1: non-dispatch error (pool.connect rejection) inside the admission
+//     scheduling pass → outer catch recovery parks item AND marks worker intent
+//     failed so the next scheduleOnce() does not re-dispatch it.
+// ---------------------------------------------------------------------------
+
+test("scheduling(admission-R1): non-dispatch error inside scheduling pass → failure row, pending_human, intents failed, next scheduleOnce does not dispatch", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 2 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 2 });
+
+      // Plan the work item.
+      const { intentId: pi, runId: pr } = await flow.plan(workItemId, newId("cmd"));
+      fake.advance(pr);
+      fake.advance(pr);
+
+      // Intercept the 2nd promise-style pool.connect() call — the one that
+      // scheduleQueuedIntents makes when loading the queue. Callback-style
+      // calls (pg internals) are passed through unmodified.
+      const origConnect = pool.connect.bind(pool);
+      let connectCount = 0;
+      (pool as unknown as { connect: unknown }).connect = (...args: unknown[]) => {
+        if (args.length > 0) {
+          // Callback-style: delegate to original.
+          return (origConnect as (...a: unknown[]) => unknown)(...args);
+        }
+        connectCount += 1;
+        if (connectCount === 2) {
+          return Promise.reject(new Error("simulated pool.connect failure (scheduling pass)"));
+        }
+        return origConnect();
+      };
+
+      // Admission must NOT throw even though the scheduling pass fails.
+      await assert.doesNotReject(
+        flow.onLeadPlanOutput(pi, goodPlanOutput(), newId("cmd")),
+        "onLeadPlanOutput must not throw when scheduleQueuedIntents fails with a non-dispatch error",
+      );
+
+      // Restore pool.connect immediately after the call.
+      (pool as unknown as { connect: unknown }).connect = origConnect;
+
+      // A failure row must be recorded.
+      const { rows: failRows } = await client.query<{ class: string; phase: string }>(
+        "SELECT class, phase FROM failures WHERE phase = 'plan'",
+      );
+      assert.equal(failRows.length, 1, "one failure row recorded");
+      assert.equal(failRows[0]?.class, "execution", "failure class = execution");
+
+      // A pending_human decision must be recorded for the work item.
+      const { rows: phRows } = await client.query<{ outcome: string }>(
+        "SELECT outcome FROM decisions WHERE kind = 'plan' AND work_item_id = $1",
+        [workItemId],
+      );
+      const pending = phRows.filter((r) => r.outcome === "pending_human");
+      assert.equal(pending.length, 1, "one pending_human plan decision recorded");
+
+      // The lead.plan intent must be marked failed.
+      const { rows: lpRows } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE id = $1",
+        [pi],
+      );
+      assert.equal(lpRows[0]?.status, "failed", "lead.plan intent must be failed");
+
+      // The own worker intent must be marked failed — not left queued/recorded
+      // (this was the R1 bug: non-dispatch errors bypassed the worker-intent failure).
+      const { rows: workerRows } = await client.query<{ status: string; run_id: string | null }>(
+        `SELECT di.status, di.run_id
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      assert.equal(
+        workerRows[0]?.status,
+        "failed",
+        "own worker intent must be failed (not queued) after non-dispatch error",
+      );
+
+      // A subsequent scheduleOnce() must NOT dispatch the failed intent.
+      await reconciler.scheduleOnce();
+      const { rows: afterPoll } = await client.query<{ status: string }>(
+        `SELECT di.status
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      assert.equal(
+        afterPoll[0]?.status,
+        "failed",
+        "worker intent must still be failed after scheduleOnce — not re-dispatched while parked pending_human",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
