@@ -47,7 +47,7 @@ The first executable slice needs a minimal view for this journey:
 
 The acceptance scenario is an operator who can correctly identify what advanced,
 what needs them, what continues, and why completion is justified without opening
-worker logs. Keep the initial view small; add Campaign navigation in slice 5.
+worker logs. The initial view is small; Campaign navigation was added in Slice 5.
 
 ## Interaction principles
 
@@ -67,6 +67,6 @@ worker logs. Keep the initial view small; add Campaign navigation in slice 5.
 ## Accessibility and safety
 
 All state distinctions require text and iconography rather than color alone.
-Potentially destructive actions identify the exact Project, WorkItem, attempt,
-contract version, and consequence, and require the coordinator to revalidate
-authority and generation at command time.
+Potentially destructive actions identify the exact Project, WorkItem, attempt
+(where applicable), contract version, and consequence, and require the coordinator
+to revalidate authority and generation at command time.

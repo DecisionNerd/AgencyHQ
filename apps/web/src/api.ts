@@ -79,15 +79,37 @@ export interface ManifestInfo {
   total: number;
 }
 
+/**
+ * An open pending decision returned by GET /api/work-items/:id/view.
+ * This is the only source of truth for whether Approve/Reject/Invalidate
+ * actions are live on the work item page.
+ */
+export interface OpenPendingDecision {
+  id: string;
+  kind: string;
+  attemptId: string | null;
+  contractVersion: number | null;
+  at: string;
+}
+
 export interface Item {
   workItemId: string;
   intent: string;
+  /** Lifecycle phase of the work item (e.g. "proposed", "active", "completed"). */
+  lifecycle: string;
+  /** Readiness condition of the work item (e.g. "nominal", "blocked"). */
+  condition: string;
   contract: State;
   execution: State;
   verification: State;
   acceptance: State;
   integration: IntegrationInfo | null;
   manifest: ManifestInfo | null;
+  /**
+   * Source of truth for whether Approve/Reject/Invalidate actions are live.
+   * When absent (older server), treat as no open decisions.
+   */
+  openPendingDecisions?: OpenPendingDecision[];
 }
 
 export interface PendingDecision {
@@ -135,6 +157,178 @@ export interface Command {
 }
 
 // ---------------------------------------------------------------------------
+// Control-plane types (mirrors coordinator view output types)
+// ---------------------------------------------------------------------------
+
+export interface OverviewWorkItemEntry {
+  id: string;
+  intent: string;
+  rank: number;
+  mainEffort: boolean;
+  lifecycle: string;
+  condition: string;
+  boundary: "artifact" | "merge" | "deploy";
+  campaignId: string | null;
+  pendingDecisionCount: number;
+}
+
+export interface OverviewProjectEntry {
+  id: string;
+  workItems: OverviewWorkItemEntry[];
+}
+
+export interface OverviewCampaignEntry {
+  id: string;
+  name: string;
+  mainEffortWorkItemId: string | null;
+}
+
+export interface OverviewView {
+  campaigns: OverviewCampaignEntry[];
+  projects: OverviewProjectEntry[];
+}
+
+export interface DecisionImpact {
+  workItemId: string | null;
+  contractVersion: number | null;
+  attemptId: string | null;
+  /** The step_contract id required by the approve command. */
+  contractId: string | null;
+  /** The artifact revision (git SHA) required by the approve command. */
+  attemptRevision: string | null;
+}
+
+export interface DecisionEntry {
+  id: string;
+  workItemId: string | null;
+  obstacle: string;
+  recommendation: string | null;
+  impact: DecisionImpact;
+  noActionConsequence: string;
+  actions: string[];
+  at: string;
+}
+
+export interface DecisionsView {
+  decisions: DecisionEntry[];
+}
+
+export interface EvidenceAttempt {
+  id: string;
+  contractId: string;
+  contractVersion?: number | null;
+  status: string;
+  runId?: string | null;
+  checkpointCommit?: string | null;
+  commitSha?: string | null;
+  updatedAt: string;
+}
+
+export interface EvidenceArtifact {
+  id: string;
+  attemptId: string;
+  revision: string;
+  diffDigest: string;
+  changedPaths?: unknown;
+  updatedAt: string;
+}
+
+export interface EvidenceVerificationResult {
+  id: string;
+  attemptId: string;
+  stepContractId: string;
+  result: string;
+  updatedAt: string;
+}
+
+export interface EvidenceReview {
+  id: string;
+  attemptId: string;
+  attemptRevision?: string | null;
+  diffDigest?: string | null;
+  updatedAt: string;
+}
+
+export interface EvidenceFinding {
+  id: string;
+  attemptId?: string | null;
+  severity: string;
+  kind: string;
+  description?: string;
+  evidence?: string | null;
+  disposition?: string | null;
+  updatedAt: string;
+}
+
+export interface EvidenceDecision {
+  id: string;
+  kind: string;
+  actor: string;
+  outcome: string | null;
+  contractVersion?: number | null;
+  attemptId?: string | null;
+  at: string;
+}
+
+export interface EvidenceApproval {
+  id: string;
+  decisionId: string;
+  contractId?: string | null;
+  contractVersion?: number | null;
+  attemptRevision?: string | null;
+  humanActor?: string | null;
+  at?: string | null;
+}
+
+export interface EvidenceIntegration {
+  id: string;
+  attemptId: string;
+  targetRef: string;
+  outcome?: string | null;
+  resultingRevision?: string | null;
+  at: string;
+}
+
+export interface EvidenceManifestRow {
+  workItemId: string;
+  position: number;
+  resultRevision?: string | null;
+}
+
+export interface EvidenceView {
+  workItemId: string;
+  attempts: EvidenceAttempt[];
+  artifacts: EvidenceArtifact[];
+  verificationResults: EvidenceVerificationResult[];
+  reviews: EvidenceReview[];
+  findings: EvidenceFinding[];
+  decisions: EvidenceDecision[];
+  approvals: EvidenceApproval[];
+  integrations: EvidenceIntegration[];
+  manifestRows: EvidenceManifestRow[];
+}
+
+export interface AuthorityVersionEntry {
+  version: string;
+  authority: Record<string, unknown>;
+  actor: string;
+  at: string;
+}
+
+export interface AuthorityView {
+  projectId: string;
+  currentVersion: string;
+  authority: Record<string, unknown>;
+  history: AuthorityVersionEntry[];
+}
+
+export interface CommandResult {
+  commandId: string;
+  replayed: boolean;
+  result?: unknown;
+}
+
+// ---------------------------------------------------------------------------
 // Fetch helpers
 // ---------------------------------------------------------------------------
 
@@ -147,7 +341,7 @@ export async function fetchReturnView(since: string | null): Promise<ReturnView>
 }
 
 export async function fetchWorkItem(id: string): Promise<Item> {
-  const res = await fetch(`/api/work-items/${encodeURIComponent(id)}`, {
+  const res = await fetch(`/api/work-items/${encodeURIComponent(id)}/view`, {
     headers: buildAuthHeaders(getToken()),
   });
   if (res.status === 401) throw handle401(safeStorage);
@@ -164,13 +358,83 @@ export async function fetchRealtimeToken(id: string): Promise<RealtimeToken> {
   return res.json() as Promise<RealtimeToken>;
 }
 
-export async function postCommand(cmd: Omit<Command, "commandId">): Promise<void> {
-  const body: Command = { commandId: crypto.randomUUID(), ...cmd };
+export async function fetchOverview(): Promise<OverviewView> {
+  const res = await fetch("/api/overview", { headers: buildAuthHeaders(getToken()) });
+  if (res.status === 401) throw handle401(safeStorage);
+  if (!res.ok) throw new Error(`fetchOverview: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<OverviewView>;
+}
+
+export async function fetchDecisions(): Promise<DecisionsView> {
+  const res = await fetch("/api/decisions", { headers: buildAuthHeaders(getToken()) });
+  if (res.status === 401) throw handle401(safeStorage);
+  if (!res.ok) throw new Error(`fetchDecisions: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<DecisionsView>;
+}
+
+export async function fetchEvidence(workItemId: string): Promise<EvidenceView> {
+  const res = await fetch(`/api/work-items/${encodeURIComponent(workItemId)}/evidence`, {
+    headers: buildAuthHeaders(getToken()),
+  });
+  if (res.status === 401) throw handle401(safeStorage);
+  if (!res.ok) throw new Error(`fetchEvidence: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<EvidenceView>;
+}
+
+export async function fetchAuthority(projectId: string): Promise<AuthorityView> {
+  const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/authority`, {
+    headers: buildAuthHeaders(getToken()),
+  });
+  if (res.status === 401) throw handle401(safeStorage);
+  if (!res.ok) throw new Error(`fetchAuthority: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<AuthorityView>;
+}
+
+export type PutAuthorityResult =
+  | { commandId: string; result: { ok: true; version: number } }
+  | { commandId: string; result: { ok: false; reason: string; currentVersion: number } }
+  | { commandId: string; errors: Array<{ message: string; path?: string[] }> };
+
+export async function putAuthority(
+  projectId: string,
+  body: { authority: Record<string, unknown>; expectedVersion: number },
+): Promise<PutAuthorityResult> {
+  const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/authority`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...buildAuthHeaders(getToken()) },
+    body: JSON.stringify({ commandId: crypto.randomUUID(), actor: "operator", ...body }),
+  });
+  if (res.status === 401) throw handle401(safeStorage);
+  // 422 carries schema errors inline — return them rather than throwing
+  if (res.status === 422) {
+    return res.json() as Promise<{
+      commandId: string;
+      errors: Array<{ message: string; path?: string[] }>;
+    }>;
+  }
+  // 409 carries version conflict details inline — return them rather than throwing
+  if (res.status === 409) {
+    return res.json() as Promise<{
+      commandId: string;
+      result: { ok: false; reason: string; currentVersion: number };
+    }>;
+  }
+  if (!res.ok) throw new Error(`putAuthority: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<{ commandId: string; result: { ok: true; version: number } }>;
+}
+
+/**
+ * Post an arbitrary command body. Adds a fresh commandId and auth header.
+ * Returns the parsed result including `replayed`.
+ */
+export async function postCommand(body: Record<string, unknown>): Promise<CommandResult> {
+  const fullBody = { commandId: crypto.randomUUID(), ...body };
   const res = await fetch("/api/commands", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...buildAuthHeaders(getToken()) },
-    body: JSON.stringify(body),
+    body: JSON.stringify(fullBody),
   });
   if (res.status === 401) throw handle401(safeStorage);
   if (!res.ok) throw new Error(`postCommand: ${res.status} ${res.statusText}`);
+  return res.json() as Promise<CommandResult>;
 }

@@ -528,6 +528,13 @@ describe("POST /api/commands kind=approve — field validation", () => {
       }),
       disposition: async () => ({ ok: true, outcome: "backlog" as const }),
       lastAckAt: async () => null,
+      reject: async () => ({ ok: true, decisionId: "dec-fake" }),
+      invalidateAcceptance: async () => ({ ok: true, invalidationDecisionId: "inv-fake" }),
+      createCampaign: async () => ({ ok: true, campaignId: "cmp-fake" }),
+      assignCampaign: async () => ({ ok: true }),
+      setMainEffort: async () => ({ ok: true }),
+      setWorkItemRank: async () => ({ ok: true }),
+      updateAuthority: async () => ({ ok: true, version: "2" }),
     };
   }
 
@@ -884,6 +891,13 @@ describe("POST /api/commands kind=disposition — field validation", () => {
       }),
       disposition: async () => ({ ok: true, outcome: "backlog" as const }),
       lastAckAt: async () => null,
+      reject: async () => ({ ok: true, decisionId: "dec-fake" }),
+      invalidateAcceptance: async () => ({ ok: true, invalidationDecisionId: "inv-fake" }),
+      createCampaign: async () => ({ ok: true, campaignId: "cmp-fake" }),
+      assignCampaign: async () => ({ ok: true }),
+      setMainEffort: async () => ({ ok: true }),
+      setWorkItemRank: async () => ({ ok: true }),
+      updateAuthority: async () => ({ ok: true, version: "2" }),
     };
   }
 

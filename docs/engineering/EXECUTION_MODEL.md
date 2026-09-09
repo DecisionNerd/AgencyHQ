@@ -61,8 +61,19 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    (`POST /api/commands` with `kind: "approve"`, fields `contractId`,
    `contractVersion`, `attemptRevision`) writes an `approvals` row and
    re-runs acceptance via `evaluateAcceptanceForAttempt`; the command is
-   idempotent by `commandId`. `APPROVAL_VERSION_MISMATCH` leaves the item
-   `pending_human`. The `approve` command goes through the same
+   idempotent by `commandId`. `APPROVAL_VERSION_MISMATCH` inserts an
+   `approval_mismatch` decision; this outcome is **not** resolving, so the
+   `pending_human` decision stays open for a corrected approve. A pending
+   decision is open when no later decision of a resolving outcome (`approved`,
+   `rejected`, `accepted`, `invalidated`) exists that closes it: for
+   attempt-scoped decisions (attemptId non-null) the resolving decision must
+   share the same attemptId; for plan and review decisions written without an
+   attempt (attemptId null) the resolving decision must share the same work
+   item, kind, and contract version. `approval_mismatch` is not a resolving
+   outcome. The `openPendingDecisions` helper (`apps/coordinator/src/views/pending.ts`)
+   is the sole filter for operator-visible pending decisions and for the
+   work-item view's action buttons. Covered by `apps/coordinator/test/views.unit.test.ts`
+   (attempt-scoped and no-attempt cases). The `approve` command goes through the same
    post-acceptance path as `onAcceptFinal`: for a `merge` boundary it commits
    the approval decision, an `integrations` row, and a `dispatch_intents` row
    in one transaction and then triggers `integrate.merge`; the work item stays
@@ -122,6 +133,71 @@ the two compose. Anything Trigger already does is referenced, not reimplemented.
    `pending_human` decision); `scope_decision`, `block`, and `backlog` each
    record a `pending_human` or backlog decision without mutating the contract.
    Covered by `apps/coordinator/test/integration/flow.remediate.test.ts`.
+
+10. **Reject.** The `reject` command (`POST /api/commands` with `kind: "reject"`,
+    fields `workItemId`, `decisionId`, `reason`) is state-guarded: it returns
+    `{ ok: false, reason: "state_mismatch" }` when the target decision already
+    has a resolving outcome (covered by `apps/coordinator/test/integration/control-plane-rework.test.ts`,
+    U-1: `reject-after-approve returns state_mismatch`). When the guard passes,
+    it appends a new decision with outcome `"rejected"` and the supplied reason
+    for the same attempt (the pending row is kept as history — R-017), and sets
+    the work item lifecycle to `"halted"` in one transaction. `reason` is stored
+    in `decisions.reason` (migration 0005; nullable text). Both `reject` and
+    `invalidate_acceptance` require a non-empty trimmed reason; the API returns
+    400 `reason_required` for an empty or whitespace-only value (covered by
+    `apps/coordinator/test/api-control-plane.test.ts` U-7 tests), and the UI
+    keeps the confirm button disabled until a non-empty reason is typed — no
+    placeholder is substituted (`apps/web/e2e/reject.spec.ts` iv-c). The command
+    is idempotent by `commandId`. A rejected work item is not automatically
+    re-planned; a new plan requires an explicit operator command.
+
+11. **Invalidate acceptance.** The `invalidate_acceptance` command (`POST /api/commands`
+    with `kind: "invalidate_acceptance"`, fields `workItemId`, `attemptId`,
+    `reason`) verifies the attempt belongs to the work item and has a recorded
+    accept decision with outcome `approved` (human approval) or `accepted`
+    (coordinator acceptance) — both are matched by the query (`outcome IN
+    ('approved','accepted')`); a non-human-approved completion writes outcome
+    `accepted` (covered by `apps/coordinator/test/integration/control-plane-rework.test.ts`,
+    U-3: `invalidate_acceptance succeeds on coordinator-accepted decision`). When
+    the accept decision is found, in one transaction: inserts a new decision of
+    kind `"invalidate"` referencing the historical accept decision, with the
+    supplied reason stored in `decisions.reason` (migration 0005); sets the work
+    item lifecycle to `"reopened"`; appends a transition audit row. The historical
+    accept decision row is never modified (R-017). The contract row is never
+    modified (R-018). A new plan is permitted after reopening. The command is
+    idempotent by `commandId`.
+
+12. **Update authority.** The `update_authority` command (`PUT /api/projects/:id/authority`
+    or `POST /api/commands` with `kind: "update_authority"`) validates the
+    proposed authority with `AuthoritySchema`; the numeric version must be
+    strictly greater than the current project version (integer-major comparison
+    — the leading integer of each version string is compared). In one
+    transaction: acquires a row lock (`SELECT … FOR UPDATE` on the project row)
+    to prevent lost updates; applies a CAS update
+    (`UPDATE … WHERE authority_version = $current`) — a concurrent update from
+    the same base version returns `version_not_increasing` (the row lock
+    serializes writes so the second writer always reads the committed new version;
+    `stale_version` is a non-locking CAS fallback that is defined in the type but
+    not reachable in this code path and is not exercised by the T-9 test);
+    backfills the pre-update version into `authority_versions` attributed to actor
+    `backfill` at the project's `created_at` timestamp when the table has no
+    history for the project (first update; covered by T-13 in
+    `apps/coordinator/test/integration/control-plane-rework.test.ts`); appends a row
+    to `authority_versions` (idempotent on `(project_id, version)`); inserts a
+    decision of kind `"authority_update"` for the audit trail. Frozen
+    `step_contracts` rows are never modified — their bounds and digests are fixed
+    at freeze time and govern only the attempt for which they were frozen
+    (R-018). Future Lead proposals are governed by the new authority.
+
+13. **Campaign and rank commands.** `create_campaign` inserts a campaign and
+    returns its id. `assign_campaign` sets `campaign_id` on a work item.
+    `set_main_effort` sets `main_effort_work_item_id` on a campaign; the work
+    item must already belong to the campaign (`not_a_member` otherwise). `set_rank`
+    updates a work item's rank with optimistic CAS on the work item's `version`
+    column; returns `{ ok: false, reason: "stale_version" }` on mismatch. All
+    are idempotent by `commandId`.
+
+**Campaign-aware dispatch ordering.** The coordinator dispatches work items one at a time, per command (no batch scheduler). `selectDispatch` is not called by the coordinator. Campaign rank and main effort are implemented in the domain (`packages/domain/src/aggregates/campaign.ts`, `selectDispatch` in `packages/domain/src/dispatch/select.ts`) and tested by `packages/domain/test/dispatch.campaign.test.ts` (main effort first within a campaign, remaining members by rank/createdAt/id, items without a `campaignId` unaffected); they surface in the overview sort order and in the `main_effort_work_item_id` field. Batch scheduling that calls `selectDispatch` at dispatch time is Slice 6 scope (planned).
 
 Lead and human decisions happen between runs. No run waits on a human; a
 waiting self-hosted run holds its process or container and a concurrency slot.

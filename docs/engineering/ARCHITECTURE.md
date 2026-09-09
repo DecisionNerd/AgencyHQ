@@ -39,10 +39,76 @@ Arrows are commands and observations. Authority lives where the table in the
 
 ### Web control plane
 
-React/TypeScript. Renders coordinator state and submits typed commands. For
-live execution state it subscribes to Trigger runs by tag with Trigger's React
-hooks using scoped public access tokens. Contains no scheduling or acceptance
-logic. Runs in the same Node process as the coordinator.
+React/TypeScript. Hash-router with five routes: `#/` (overview — campaigns
+with main effort, projects, ranked work items with lifecycle/condition/boundary/
+pending-decision count), `#/decisions` (every open `pending_human` decision
+with obstacle, recommendation, impact, no-action consequence, and inline
+approve/reject actions), `#/work-items/:id` (five state cards — contract,
+execution, verification, acceptance, integration — plus an evidence panel and
+operator actions), `#/projects/:id/authority` (JSON authority editor with
+version history and confirm dialog), `#/return` (return-after-interruption
+view). Work-item actions (approve, reject, stop, invalidate, pause) each show
+a `ConfirmDialog` naming the action and its consequence, the project, the
+work item, the attempt (when there is one), and the contract version
+(`apps/web/src/control-plane-helpers.ts` `confirmMessage`, asserted by the
+approve, reject, and stop journeys). The authority editor's Save button shows
+a confirm naming the project, the proposed new authority version, and that
+frozen contracts are unaffected.
+Bearer-auth token stored in
+`localStorage["agencyhq.apiToken"]`; all `/api/*` calls include
+`Authorization: Bearer <token>`; a 401 response clears the token and shows a
+token-entry form. For live execution state it subscribes to Trigger runs by
+tag with Trigger's React hooks using scoped public access tokens. Contains no
+scheduling or acceptance logic. Runs in the same Node process as the
+coordinator.
+
+**Decisions view semantics.** A `pending_human` decision is *open* when no
+later decision of a resolving outcome (`approved`, `rejected`, `accepted`,
+`invalidated`) closes it. Two resolution modes (implemented in
+`apps/coordinator/src/views/pending.ts`, `isOpenPending`, `openPendingDecisions`):
+attempt-scoped decisions (attemptId non-null) are closed by a resolving decision
+with the same attemptId; plan and review decisions written without an attempt
+(attemptId null) are closed by a resolving decision with the same work item, kind,
+and contract version. `approval_mismatch` is not a resolving outcome, so an
+`APPROVAL_VERSION_MISMATCH` response does not close the pending decision — the
+entry stays visible for a corrected approve. After the operator approves or
+rejects, the coordinator appends a resolving decision; the decisions view
+re-filters and the entry disappears without deleting any row. The `reject` command
+is state-guarded like `approve`: rejecting a decision that already has a resolving
+outcome returns `state_mismatch`. `openPendingDecisions` is the sole source for
+the decisions view and for the work-item page's operator action buttons.
+
+**Decisions view fields.** Each entry exposes: `obstacle` (violation codes or
+decision kind); `recommendation` (the Lead proposal's `rationale` field when
+the plan observation carries one, otherwise `null` — no fallback text is
+generated); `impact` (work item, contract version, attempt); `noActionConsequence`
+(fixed text: `"stays pending; no dispatch"`); and available `actions`
+(`approve`/`reject` for accept decisions).
+
+### Coordinator API (Slice 5)
+
+All routes require `Authorization: Bearer <token>`.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/overview` | Campaigns with main effort, projects, ranked work items |
+| `GET` | `/api/decisions` | Open `pending_human` decisions (filtered by `isOpenPending`) |
+| `GET` | `/api/work-items/:id/evidence` | Full evidence for one work item |
+| `GET` | `/api/work-items/:id/view` | Single-item return view including integrations and manifest rows |
+| `GET` | `/api/projects/:id/authority` | Current authority and full `authority_versions` history |
+| `PUT` | `/api/projects/:id/authority` | Dispatches `update_authority` command |
+
+**Slice 5 commands** (`POST /api/commands`, idempotent by `commandId`):
+
+| `kind` | Effect |
+| --- | --- |
+| `reject` | Appends a new `rejected` decision for the same attempt (pending row kept as history — R-017); persists supplied reason in `decisions.reason`; work item lifecycle → `halted` |
+| `invalidate_acceptance` | Inserts new `invalidate` decision referencing historical accept; persists supplied reason in `decisions.reason`; work item → `reopened`; historical rows untouched (R-017) |
+| `create_campaign` | Creates a campaign |
+| `assign_campaign` | Sets `campaign_id` on a work item |
+| `set_main_effort` | Sets `main_effort_work_item_id` on a campaign; work item must belong to the campaign (`not_a_member` otherwise) |
+| `set_rank` | Optimistic CAS on work item `version`; returns `stale_version` on mismatch |
+| `update_authority` | Schema-validated; integer-major version must increase; `SELECT FOR UPDATE` row lock + CAS on `authority_version`; concurrent same-base update returns `version_not_increasing`; backfills initial version history on first update attributed to actor `backfill` at the project's `created_at`; appends to `authority_versions`; inserts `authority_update` decision; frozen contract bounds untouched (R-018) |
 
 ### Coordinator
 

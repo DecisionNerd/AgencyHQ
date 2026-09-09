@@ -38,7 +38,7 @@ The `BoundedRepairFlow` class drives the plan → admit → dispatch → verify 
 - **`retry_dispatch` command**: takes `intentId` in the request body (not `workItemId`); calls `flow.retryDispatch(intentId, commandId)` to re-trigger the already-recorded intent.
 - **`AGENCYHQ_INTEGRATE_RETRIES`**: maximum number of CAS retries for `integrate.merge` on `retry_cas` outcome (default 2). When exhausted, the attempt escalates to `integration_conflict` + `pending_human`.
 - **Stop command replay**: a repeated stop command with the same command id returns `replayed: true`.
-- **`approve` command**: handles human approval for `humanRequired` contracts. When `onAcceptFinal` detects that a contract requires human sign-off (`humanRequired: true`) and no `Approval` was supplied, it records a `pending_human` decision and leaves the work item active. The `approve` command (`POST /api/commands` with `kind: "approve"`) supplies the `Approval` (`contractId`, `contractVersion`, `attemptRevision`) and re-runs `evaluateAcceptance` via the shared `evaluateAcceptanceForAttempt` function. On match: delegates to `finalizeAcceptedAttempt` (shared with `onAcceptFinal`, R-006, R-015). For `merge` boundary: inserts an `approvals` row, records an `approved` decision, inserts an `integrations` row, and dispatches `integrate.merge` — all in ONE transaction before trigger (R-002); the work item stays active until `onIntegrateFinal` completes it. For `artifact` boundary: inserts an `approvals` row, records an `approved` decision, and sets `work_items.lifecycle = completed` in ONE transaction. On mismatch: records a `rejected` decision with reason `APPROVAL_VERSION_MISMATCH` and leaves the item `pending_human`. The command is idempotent by `commandId`; a repeated call returns the stored result with `replayed: true`. A replayed approve on a merge-boundary item that already dispatched `integrate.merge` produces no second intent.
+- **`approve` command**: handles human approval for `humanRequired` contracts. When `onAcceptFinal` detects that a contract requires human sign-off (`humanRequired: true`) and no `Approval` was supplied, it records a `pending_human` decision and leaves the work item active. The `approve` command (`POST /api/commands` with `kind: "approve"`) supplies the `Approval` (`contractId`, `contractVersion`, `attemptRevision`) and re-runs `evaluateAcceptance` via the shared `evaluateAcceptanceForAttempt` function. On match: delegates to `finalizeAcceptedAttempt` (shared with `onAcceptFinal`, R-006, R-015). For `merge` boundary: inserts an `approvals` row, records an `approved` decision, inserts an `integrations` row, and dispatches `integrate.merge` — all in ONE transaction before trigger (R-002); the work item stays active until `onIntegrateFinal` completes it. For `artifact` boundary: inserts an `approvals` row, records an `approved` decision, and sets `work_items.lifecycle = completed` in ONE transaction. On mismatch: inserts an `approval_mismatch` decision (this outcome is **not** resolving — the `pending_human` decision stays open for a corrected approve). A pending decision is open when no later decision of a resolving outcome (`approved`, `rejected`, `accepted`, `invalidated`) exists for the same attempt (attempt-scoped; implemented in `apps/coordinator/src/views/pending.ts` `isOpenPending`). The command is idempotent by `commandId`; a repeated call returns the stored result with `replayed: true`. A replayed approve on a merge-boundary item that already dispatched `integrate.merge` produces no second intent.
 - **`disposition` command**: records an operator decision on a finding. Accepts `findingId`, `disposition` (one of `remediate`, `scope_decision`, `block`, `backlog`), `reason`, and `actor`. For `remediate`: if budget remains, inserts a failure row for the old attempt, admits a new attempt, records a dispatch intent, records a `remediate` decision, and triggers the new worker — all committed before the trigger call (R-002); if budget is exhausted, records `pending_human` instead. For `scope_decision` and `block`: records `pending_human` and updates the finding. For `backlog`: records `backlog` and updates the finding. The command is idempotent by `commandId` (R-010). The contract row is never mutated by disposition (R-017).
 - **`create_work_item` with `manifest`**: the `create_work_item` command (`POST /api/commands` with `kind: "create_work_item"`) accepts an optional `manifest: { entries: [{ projectId, targetRef }] }` body field. When supplied the boundary must be `"merge"` and each entry's project must exist with `targetRef` in the project's `allowed_refs`. The command inserts `work_item_projects` rows for each entry (establishing the multi-repo manifest) before the work item is admitted. Single-repo `merge` boundary work items created without `manifest` receive an implicit single-entry manifest in `onLeadPlanOutput`.
 
@@ -49,6 +49,38 @@ Integration tests use `withTestSchema` (isolated Postgres schema per test) and `
 ```
 DATABASE_URL=postgres://agencyhq:agencyhq@127.0.0.1:5434/agencyhq_test pnpm --filter @agencyhq/coordinator test:integration
 ```
+
+## Control-plane API (slice 5)
+
+### Routes
+
+All routes require `Authorization: Bearer <token>`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/overview` | Campaigns with main effort, projects, work items ranked by `rank` with lifecycle/condition/boundary/pending decision count |
+| `GET` | `/api/decisions` | Every `pending_human` decision with obstacle, recommendation, impact, no-action consequence, and available actions |
+| `GET` | `/api/work-items/:id/evidence` | Artifacts, verification results, reviews, findings, decisions, approvals, integrations, manifest rows, attempts with run ids |
+| `GET` | `/api/projects/:id/authority` | Current authority version plus full history from `authority_versions` |
+| `PUT` | `/api/projects/:id/authority` | Body `{ commandId, authority, actor }` — dispatches `update_authority` command |
+
+### Commands (POST /api/commands)
+
+All commands are idempotent by `commandId` (R-010). Repeated delivery with the same id returns `replayed: true`.
+
+| `kind` | Required fields | Effect |
+|--------|-----------------|--------|
+| `reject` | `workItemId`, `decisionId`, `reason` | Appends a new `rejected` decision for the same attempt (pending row kept as history — R-017); persists reason in `decisions.reason`; work item lifecycle set to `halted` |
+| `invalidate_acceptance` | `workItemId`, `attemptId`, `reason` | Inserts new decision of kind `invalidate` referencing historical accept; persists reason in `decisions.reason`; work item lifecycle set to `reopened`; historical rows untouched (R-017) |
+| `create_campaign` | `name` | Creates a campaign; returns `campaignId` (`cmp-<commandId[:8]>`) |
+| `assign_campaign` | `workItemId`, `campaignId` | Sets `campaign_id` on the work item |
+| `set_main_effort` | `campaignId`, `workItemId` | Sets `main_effort_work_item_id` on the campaign; work item must belong to the campaign (`not_a_member` otherwise) |
+| `set_rank` | `workItemId`, `rank`, `expectedVersion` | Updates work item rank; returns `{ ok: false, reason: "stale_version" }` if current version does not match |
+| `update_authority` | `projectId`, `authority`, `actor` | Validated with `AuthoritySchema`; integer-major version must increase; `SELECT FOR UPDATE` row lock + CAS `UPDATE … WHERE authority_version = $current` (returns `stale_version` on concurrent update); backfills initial version to `authority_versions` on first update; inserts `authority_update` decision; frozen contract digests/bounds untouched (R-018) |
+
+### Schema note
+
+`campaigns`, `work_items.campaign_id`, and `authority_versions` are introduced by migration 0004; `decisions.reason` by migration 0005 (`ALTER TABLE decisions ADD COLUMN IF NOT EXISTS reason text`). Integration tests apply the DDL via `withControlPlaneSchema` in `apps/coordinator/test/helpers/control-plane-schema.ts` — never in `packages/db`.
 
 ## Network isolation
 
@@ -108,3 +140,7 @@ pnpm --filter @agencyhq/coordinator test:integration
 ## Trial
 
 The `BoundedRepairFlow` and the full coordinator pipeline were exercised against the real Trigger.dev stack on 2026-09-07 (Slice 3 trial items 5–7). Item 7 PASS: work item `89cfe999-9710-4388-8dd1-caf520d26d49` completed at artifact boundary with adversarial review and no Approval in ~150 s. Full record: [docs/engineering/trials/2026-09-slice3.md](../../docs/engineering/trials/2026-09-slice3.md).
+
+Slice 4 (2026-09-08): merge boundary with human approval live (item 8 PASS, fifth run); CAS base_moved (item 9 PASS); two-repo manifest with combined verification (item 10 PASS, seventh run). Full record: [docs/engineering/trials/2026-09-slice4.md](../../docs/engineering/trials/2026-09-slice4.md).
+
+Slice 5 (2026-09-08): approve via operator UI on the real stack — work item `8fafbd54`, merge boundary, `pending_human` at 174 s; operator clicked approve in `#/decisions`; `integrate.merge` dispatched in one transaction; remote `main` advanced from `b1f48d0` to `5cbff2c`; work item `completed/healthy`. One defect found by screenshot (single-item view omitted integration state; fixed in `6ab2f2f`). Rework commit `84cdb08` (open-pending rule, persisted reasons, membership guard, authority CAS). 17 Playwright browser journeys on the fake-runtime coordinator; CI green at `04c3893` per PR #12. Full record: [docs/engineering/trials/2026-09-slice5.md](../../docs/engineering/trials/2026-09-slice5.md).

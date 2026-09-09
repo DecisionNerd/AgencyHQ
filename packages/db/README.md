@@ -48,6 +48,17 @@ Migration `migrations/0003_manifest_integration.sql` adds revision manifest and 
 
 The migration also adds nullable `target_ref` and `manifest_digest` columns to `step_contracts`. Each `ALTER TABLE` is guarded by an `information_schema` check so the migration is idempotent.
 
+Migration `migrations/0004_campaigns.sql` adds campaign grouping and authority version tracking:
+
+| Table | Purpose |
+| --- | --- |
+| `campaigns` | Grouping of WorkItems across Projects with a declared main effort (`main_effort_work_item_id` nullable FK to `work_items`). |
+| `authority_versions` | Append-only log of delegated-authority schema versions per project: `(project_id, version)` primary key, `authority` jsonb, `actor`, `at`. |
+
+The migration also adds nullable `campaign_id` (FK to `campaigns`) to `work_items` with a `work_items_campaign_id_idx` index. `decisions.kind` is free text with no CHECK constraint; the values `authority_update`, `reject`, and `invalidate` are produced by the coordinator and insert without error. All `CREATE TABLE` and `ALTER TABLE` statements are guarded by `IF NOT EXISTS` / `DO $$ … IF NOT EXISTS` blocks so the migration is idempotent.
+
+Migration `migrations/0005_decision_reason.sql` adds a nullable `reason` text column to `decisions` (`ALTER TABLE decisions ADD COLUMN IF NOT EXISTS reason text`). The `reject` and `invalidate_acceptance` commands persist the operator-supplied reason here. Idempotent.
+
 Row schemas with inferred TypeScript types live in `src/rows.ts`. `mapRow` helpers parse jsonb columns (`authority`, `bounds`, `criteria`, `record`) through their contracts Zod schemas. Repository insert types (e.g. `FindingInsert`, `DecisionInsert`, `ReviewInsert`) require the columns marked NOT NULL in migration 0002 — `severity`, `kind`, `description` for findings; `kind`, `actor` for decisions; `reviewer_model`, `profile` for reviews; `class`, `phase`, `cause` for failures; `kind` for commands — as non-nullable fields; the coordinator always supplies them. Migration 0003 adds `WorkItemProjectRowSchema` / `WorkItemProjectRow` and `IntegrationRowSchema` / `IntegrationRow`.
 
 ## Fencing and idempotency
@@ -75,7 +86,9 @@ Each table has a typed repository module in `src/repos/`. Every function takes a
 | Module | Key functions |
 | --- | --- |
 | `repos/projects.ts` | `insertProject`, `getProject`, `listProjects` |
-| `repos/work-items.ts` | `insertWorkItem`, `getWorkItem`, `listWorkItemsByProject` |
+| `repos/campaigns.ts` | `insertCampaign`, `getCampaign`, `listCampaigns`, `setMainEffort` (guarded: work item must belong to campaign; null clears unconditionally), `assignWorkItemToCampaign` |
+| `repos/authority-versions.ts` | `insertAuthorityVersion` (idempotent on `(project_id, version)`; returns `{ status: "inserted" \| "existing", row }`), `listAuthorityVersions` |
+| `repos/work-items.ts` | `insertWorkItem`, `getWorkItem`, `listWorkItemsByProject`, `setWorkItemRank` (optimistic CAS on `version`; returns `"applied" \| "stale"`) |
 | `repos/step-contracts.ts` | `insertStepContract`, `getStepContract`, `listStepContractsByWorkItem`, `updateStepContractStatus` |
 | `repos/attempts.ts` | `insertAttempt`, `getAttempt`, `listAttemptsByContract`, `updateAttemptStatus` |
 | `repos/dispatch-intents.ts` | `insertDispatchIntent`, `getDispatchIntent`, `listOpenDispatchIntents`, `updateDispatchIntentStatus` |

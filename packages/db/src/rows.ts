@@ -50,6 +50,20 @@ export function mapProjectRow(row: ProjectRow) {
 }
 
 // ---------------------------------------------------------------------------
+// campaigns
+// ---------------------------------------------------------------------------
+
+export const CampaignRowSchema = z
+  .object({
+    id: z.string(),
+    name: z.string(),
+    main_effort_work_item_id: NullableText,
+  })
+  .merge(Timestamps);
+
+export type CampaignRow = z.infer<typeof CampaignRowSchema>;
+
+// ---------------------------------------------------------------------------
 // work_items
 // ---------------------------------------------------------------------------
 
@@ -65,6 +79,7 @@ export const WorkItemRowSchema = z
     condition: z.string(),
     main_effort: z.boolean(),
     version: z.number().int(),
+    campaign_id: NullableText.default(null),
   })
   .merge(Timestamps);
 
@@ -225,6 +240,10 @@ export const DecisionRowSchema = z
     causation_id: NullableText,
     command_id: NullableText,
     outcome: NullableText,
+    reason: z
+      .string()
+      .nullish()
+      .transform((v) => v ?? null),
     at: z.date(),
   })
   .merge(Timestamps);
@@ -368,3 +387,17 @@ export const IntegrationRowSchema = z
   .merge(Timestamps);
 
 export type IntegrationRow = z.infer<typeof IntegrationRowSchema>;
+
+// ---------------------------------------------------------------------------
+// authority_versions
+// ---------------------------------------------------------------------------
+
+export const AuthorityVersionRowSchema = z.object({
+  project_id: z.string(),
+  version: z.string(),
+  authority: z.unknown(),
+  actor: z.string(),
+  at: z.date(),
+});
+
+export type AuthorityVersionRow = z.infer<typeof AuthorityVersionRowSchema>;

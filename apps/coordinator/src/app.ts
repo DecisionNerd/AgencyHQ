@@ -6,9 +6,11 @@
  * Contains no scheduling or acceptance logic.
  */
 
+import { LeadPlanOutputSchema, TASK_IDS } from "@agencyhq/contracts";
 import {
   claimCommand,
   completeCommand,
+  getWorkItem,
   listAttemptsByContract,
   listDecisionsByWorkItem,
   listFindingsByAttempt,
@@ -24,6 +26,11 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { createBearerAuthMiddleware } from "./auth.ts";
 import type { CoordinatorConfig } from "./config.ts";
+import { buildAuthorityView } from "./views/authority-view.ts";
+import { buildDecisionsView } from "./views/decisions-view.ts";
+import { buildEvidenceView } from "./views/evidence-view.ts";
+import { buildOverviewView } from "./views/overview-view.ts";
+import { openPendingDecisions } from "./views/pending.ts";
 import {
   type AttemptLike,
   buildReturnView,
@@ -106,6 +113,42 @@ export type CommandsLike = {
     actor: string;
   }): Promise<unknown>;
   lastAckAt(client: PoolClientLike): Promise<string | null>;
+  // Control-plane commands (slice 5)
+  reject(input: {
+    commandId: string;
+    workItemId: string;
+    decisionId: string;
+    reason: string;
+  }): Promise<unknown>;
+  invalidateAcceptance(input: {
+    commandId: string;
+    workItemId: string;
+    attemptId: string;
+    reason: string;
+  }): Promise<unknown>;
+  createCampaign(input: { commandId: string; name: string }): Promise<unknown>;
+  assignCampaign(input: {
+    commandId: string;
+    workItemId: string;
+    campaignId: string;
+  }): Promise<unknown>;
+  setMainEffort(input: {
+    commandId: string;
+    campaignId: string;
+    workItemId: string;
+  }): Promise<unknown>;
+  setWorkItemRank(input: {
+    commandId: string;
+    workItemId: string;
+    rank: number;
+    expectedVersion: number;
+  }): Promise<unknown>;
+  updateAuthority(input: {
+    commandId: string;
+    projectId: string;
+    authority: unknown;
+    actor: string;
+  }): Promise<unknown>;
 };
 
 // ---------------------------------------------------------------------------
@@ -437,6 +480,172 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   // ------------------------------------------------------------------
+  // GET /api/work-items/:id/view
+  // Returns an Item-shaped payload for a single work item, built by
+  // running buildReturnView over a snapshot scoped to just this item.
+  // ------------------------------------------------------------------
+  app.get("/api/work-items/:id/view", async (c) => {
+    const id = c.req.param("id");
+    const client = await pool.connect();
+    try {
+      const pgClient = client as Parameters<typeof listStepContractsByWorkItem>[0];
+
+      const wiRow = await getWorkItem(pgClient, id);
+      if (!wiRow) {
+        return c.json({ error: "not found" }, 404);
+      }
+
+      const wi: WorkItemLike = {
+        id: wiRow.id,
+        intent: wiRow.intent,
+        rank: wiRow.rank,
+        mainEffort: wiRow.main_effort,
+        lifecycle: wiRow.lifecycle,
+        condition: wiRow.condition,
+        updatedAt: wiRow.updated_at.toISOString(),
+        boundary: wiRow.boundary as "artifact" | "merge" | "deploy",
+      };
+
+      const wiDecisions = await listDecisionsByWorkItem(pgClient, id);
+      const decisions: DecisionLike[] = wiDecisions.map((d) => ({
+        id: d.id,
+        workItemId: id,
+        kind: d.kind ?? "",
+        outcome: d.outcome ?? "",
+        at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
+        attemptId: d.attempt_id ?? null,
+        contractVersion: d.contract_version ?? null,
+      }));
+
+      const wiContracts = await listStepContractsByWorkItem(pgClient, id);
+      const contracts: ContractLike[] = wiContracts.map((c) => ({
+        id: c.id,
+        workItemId: id,
+        version: c.version,
+        status: c.status,
+        updatedAt: c.updated_at.toISOString(),
+      }));
+
+      const attempts: AttemptLike[] = [];
+      const results: ResultLike[] = [];
+      const reviews: ReviewLike[] = [];
+      const findings: FindingLike[] = [];
+
+      for (const contract of wiContracts) {
+        const contractAttempts = await listAttemptsByContract(pgClient, contract.id);
+        for (const a of contractAttempts) {
+          attempts.push({
+            id: a.id,
+            contractId: contract.id,
+            status: a.status,
+            checkpointCommit: a.checkpoint_commit,
+            updatedAt: a.updated_at.toISOString(),
+          });
+
+          const attemptResults = await listVerificationResultsByAttempt(pgClient, a.id);
+          for (const r of attemptResults) {
+            results.push({
+              id: r.id,
+              attemptId: a.id,
+              result: r.result,
+              updatedAt: r.updated_at.toISOString(),
+            });
+          }
+
+          const attemptReviews = await listReviewsByAttempt(pgClient, a.id);
+          for (const r of attemptReviews) {
+            reviews.push({
+              id: r.id,
+              attemptId: a.id,
+              updatedAt: r.updated_at.toISOString(),
+            });
+          }
+
+          const attemptFindings = await listFindingsByAttempt(pgClient, a.id);
+          for (const f of attemptFindings) {
+            const finding: FindingLike = {
+              id: f.id,
+              severity: f.severity ?? "",
+              kind: f.kind ?? "",
+            };
+            if (f.attempt_id !== null) finding.attemptId = f.attempt_id;
+            findings.push(finding);
+          }
+        }
+      }
+
+      // Load integration events and work_item_projects so that the Integration
+      // card and manifest progress are populated (mirrors defaultLoadSnapshot).
+      const integrations: import("./views/return-view.ts").IntegrationLike[] = [];
+      const workItemProjects: import("./views/return-view.ts").WorkItemProjectLike[] = [];
+      for (const a of attempts) {
+        const attemptIntegrations = await listIntegrationsByAttempt(pgClient, a.id);
+        for (const integ of attemptIntegrations) {
+          integrations.push({
+            id: integ.id,
+            attemptId: a.id,
+            targetRef: integ.target_ref,
+            outcome: integ.outcome ?? null,
+            resultingRevision: integ.resulting_revision ?? null,
+            at: integ.at instanceof Date ? integ.at.toISOString() : String(integ.at),
+          });
+        }
+      }
+      const wipRows = await listWorkItemProjects(pgClient, id);
+      for (const wip of wipRows) {
+        workItemProjects.push({
+          workItemId: id,
+          position: wip.position,
+          resultRevision: wip.result_revision ?? null,
+        });
+      }
+
+      const input: ReturnViewInput = {
+        now: new Date().toISOString(),
+        lastAckAt: null,
+        freshness: { lastPollAt: null },
+        freshnessStaleMs: config.freshnessStaleMs,
+        workItems: [wi],
+        contracts,
+        attempts,
+        decisions,
+        results,
+        reviews,
+        findings,
+        integrations,
+        workItemProjects,
+      };
+
+      const view = buildReturnView(input);
+
+      // The item appears in exactly one of these sections
+      const item =
+        view.changedSinceLastVisit.find((i) => i.workItemId === id) ??
+        view.continuing.find((i) => i.workItemId === id);
+
+      if (!item) {
+        return c.json({ error: "item not renderable" }, 500);
+      }
+
+      // U-4: expose open pending decisions so the web UI can hide Approve/Reject
+      // when no pending decision is open for this item.
+      const openPending = openPendingDecisions(decisions);
+      return c.json({
+        ...item,
+        openPendingDecisions: openPending.map((d) => ({
+          id: d.id,
+          kind: d.kind ?? null,
+          attemptId: d.attemptId ?? null,
+          contractVersion: d.contractVersion ?? null,
+          at: d.at,
+        })),
+      });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------
   // GET /api/work-items/:id/realtime-token
   // ------------------------------------------------------------------
   app.get("/api/work-items/:id/realtime-token", async (c) => {
@@ -446,6 +655,688 @@ export function createApp(deps: AppDeps): Hono {
       expiresIn: "15m",
     });
     return c.json({ token });
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/overview
+  // ------------------------------------------------------------------
+  app.get("/api/overview", async (c) => {
+    const client = await pool.connect();
+    try {
+      const pgClient = client as Parameters<typeof listProjects>[0];
+
+      // Load projects
+      const projects = await listProjects(pgClient);
+
+      // Load campaigns (migration 0004 table — direct SQL until merge packet lands)
+      const { rows: _campaignRows } = await client.query(
+        `SELECT id, name, main_effort_work_item_id FROM campaigns ORDER BY created_at`,
+      );
+      const campaignRows = _campaignRows as Array<{
+        id: string;
+        name: string;
+        main_effort_work_item_id: string | null;
+      }>;
+
+      // Load all work items and decisions
+      const allWorkItems: Array<{
+        id: string;
+        project_id: string;
+        intent: string;
+        rank: number;
+        main_effort: boolean;
+        lifecycle: string;
+        condition: string;
+        boundary: "artifact" | "merge" | "deploy";
+        campaign_id: string | null;
+      }> = [];
+      const allDecisions: Array<{
+        id: string;
+        work_item_id: string | null;
+        kind: string;
+        outcome: string | null;
+        attempt_id: string | null;
+        at: string;
+      }> = [];
+
+      for (const project of projects) {
+        const wiRows = await listWorkItemsByProject(pgClient, project.id);
+        for (const wi of wiRows) {
+          allWorkItems.push({
+            id: wi.id,
+            project_id: project.id,
+            intent: wi.intent,
+            rank: wi.rank,
+            main_effort: wi.main_effort,
+            lifecycle: wi.lifecycle,
+            condition: wi.condition,
+            boundary: wi.boundary,
+            campaign_id: null, // populated below if column exists
+          });
+
+          const decisions = await listDecisionsByWorkItem(pgClient, wi.id);
+          for (const d of decisions) {
+            allDecisions.push({
+              id: d.id,
+              work_item_id: d.work_item_id,
+              kind: d.kind,
+              outcome: d.outcome,
+              attempt_id: d.attempt_id ?? null,
+              at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
+            });
+          }
+        }
+      }
+
+      // Enrich campaign_id from work_items (migration 0004 column — direct SQL)
+      if (allWorkItems.length > 0) {
+        try {
+          const ids = allWorkItems.map((_, i) => `$${i + 1}`).join(", ");
+          const { rows: _campaignIdRows } = await client.query(
+            `SELECT id, campaign_id FROM work_items WHERE id IN (${ids})`,
+            allWorkItems.map((wi) => wi.id),
+          );
+          const campaignIdRows = _campaignIdRows as Array<{
+            id: string;
+            campaign_id: string | null;
+          }>;
+          const campaignIdMap = new Map<string, string | null>();
+          for (const row of campaignIdRows) {
+            campaignIdMap.set(row.id, row.campaign_id);
+          }
+          for (const wi of allWorkItems) {
+            wi.campaign_id = campaignIdMap.get(wi.id) ?? null;
+          }
+        } catch {
+          // campaign_id column may not exist yet — leave as null
+        }
+      }
+
+      const view = buildOverviewView({
+        campaigns: campaignRows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          mainEffortWorkItemId: r.main_effort_work_item_id,
+        })),
+        projects: projects.map((p) => ({ id: p.id })),
+        workItems: allWorkItems.map((wi) => ({
+          id: wi.id,
+          projectId: wi.project_id,
+          intent: wi.intent,
+          rank: wi.rank,
+          mainEffort: wi.main_effort,
+          lifecycle: wi.lifecycle,
+          condition: wi.condition,
+          boundary: wi.boundary,
+          campaignId: wi.campaign_id,
+        })),
+        decisions: allDecisions.map((d) => ({
+          id: d.id,
+          workItemId: d.work_item_id,
+          kind: d.kind,
+          outcome: d.outcome,
+          attemptId: d.attempt_id,
+          at: d.at,
+        })),
+      });
+
+      return c.json(view);
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/decisions
+  // ------------------------------------------------------------------
+  app.get("/api/decisions", async (c) => {
+    const client = await pool.connect();
+    try {
+      const pgClient = client as Parameters<typeof listProjects>[0];
+
+      const projects = await listProjects(pgClient);
+
+      // Collect all pending_human decisions across all projects' work items
+      const allDecisions: Array<{
+        id: string;
+        workItemId: string | null;
+        kind: string;
+        outcome: string | null;
+        at: string;
+        contractVersion: number | null;
+        attemptId: string | null;
+        rationale: string | null;
+      }> = [];
+      const allAttempts: Array<{
+        id: string;
+        contractId: string;
+        status: string;
+        artifactRevision: string | null;
+      }> = [];
+      const allContracts: Array<{
+        id: string;
+        workItemId: string;
+        version: number;
+        status: string;
+      }> = [];
+      const allFindings: Array<{
+        id: string;
+        attemptId: string | null;
+        kind: string;
+        severity: string;
+      }> = [];
+
+      // U-11: collect raw decisions per work item, then batch-load rationales
+      // in 2 queries (one for dispatch_intents, one for run_observations) rather
+      // than 2 queries per decision. The contracts/attempts/findings loop is
+      // unchanged — only the rationale loading is batched.
+      type RawDecisionEntry = {
+        id: string;
+        work_item_id: string | null;
+        kind: string | null;
+        outcome: string | null;
+        at: Date;
+        contract_version: number | null;
+        attempt_id: string | null;
+      };
+      const rawDecisionEntries: RawDecisionEntry[] = [];
+
+      for (const project of projects) {
+        const workItems = await listWorkItemsByProject(pgClient, project.id);
+        for (const wi of workItems) {
+          const decisions = await listDecisionsByWorkItem(pgClient, wi.id);
+          for (const d of decisions) {
+            rawDecisionEntries.push(d as RawDecisionEntry);
+          }
+
+          const contracts = await listStepContractsByWorkItem(pgClient, wi.id);
+          for (const c of contracts) {
+            allContracts.push({
+              id: c.id,
+              workItemId: wi.id,
+              version: c.version,
+              status: c.status,
+            });
+
+            const attempts = await listAttemptsByContract(pgClient, c.id);
+            for (const a of attempts) {
+              // Load the latest artifact revision for this attempt so the
+              // decisions view can expose contractId + attemptRevision for approve.
+              const { rows: _artRows } = await client.query(
+                "SELECT revision FROM artifacts WHERE attempt_id = $1 ORDER BY created_at DESC LIMIT 1",
+                [a.id],
+              );
+              const artifactRevision =
+                (_artRows[0] as { revision?: string } | undefined)?.revision ?? null;
+
+              allAttempts.push({
+                id: a.id,
+                contractId: c.id,
+                status: a.status,
+                artifactRevision,
+              });
+
+              const findings = await listFindingsByAttempt(pgClient, a.id);
+              for (const f of findings) {
+                allFindings.push({
+                  id: f.id,
+                  attemptId: f.attempt_id,
+                  kind: f.kind ?? "",
+                  severity: f.severity ?? "",
+                });
+              }
+            }
+          }
+        }
+      }
+
+      // U-11: batch-load rationales in 2 queries keyed by attempt, not 2 per decision.
+      const rationaleByAttempt = new Map<string, string | null>();
+      const uniqueAttemptIds = [
+        ...new Set(rawDecisionEntries.map((d) => d.attempt_id).filter(Boolean)),
+      ] as string[];
+      if (uniqueAttemptIds.length > 0) {
+        try {
+          const placeholders = uniqueAttemptIds.map((_, i) => `$${i + 2}`).join(", ");
+          const { rows: intentRowsRaw } = await client.query(
+            `SELECT DISTINCT ON (attempt_id) attempt_id, run_id FROM dispatch_intents
+             WHERE attempt_id IN (${placeholders}) AND task = $1
+             ORDER BY attempt_id, created_at DESC`,
+            [TASK_IDS.leadPlan, ...uniqueAttemptIds],
+          );
+          const intentRows = intentRowsRaw as Array<{ attempt_id: string; run_id: string | null }>;
+          const runIdByAttempt = new Map<string, string>();
+          for (const row of intentRows) {
+            if (row.run_id) runIdByAttempt.set(row.attempt_id, row.run_id);
+          }
+          const runIds = [...runIdByAttempt.values()];
+          if (runIds.length > 0) {
+            const runPhs = runIds.map((_, i) => `$${i + 1}`).join(", ");
+            const { rows: obsRowsRaw } = await client.query(
+              `SELECT DISTINCT ON (run_id) run_id, payload FROM run_observations
+               WHERE run_id IN (${runPhs}) AND stale = false
+               ORDER BY run_id, generation DESC`,
+              runIds,
+            );
+            const obsRows = obsRowsRaw as Array<{ run_id: string; payload: unknown }>;
+            for (const obsRow of obsRows) {
+              const planResult = LeadPlanOutputSchema.safeParse(
+                (obsRow.payload as { output?: unknown } | undefined)?.output,
+              );
+              if (planResult.success && planResult.data.kind === "proposal") {
+                for (const [attemptId, rid] of runIdByAttempt) {
+                  if (rid === obsRow.run_id) {
+                    rationaleByAttempt.set(attemptId, planResult.data.proposal.rationale);
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        } catch {
+          // Best-effort; rationale stays null on any error
+        }
+      }
+
+      // Build the allDecisions array with rationales from the batch result.
+      for (const d of rawDecisionEntries) {
+        allDecisions.push({
+          id: d.id,
+          workItemId: d.work_item_id,
+          kind: d.kind ?? "",
+          outcome: d.outcome,
+          at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
+          contractVersion: d.contract_version,
+          attemptId: d.attempt_id,
+          rationale: d.attempt_id ? (rationaleByAttempt.get(d.attempt_id) ?? null) : null,
+        });
+      }
+
+      const view = buildDecisionsView({
+        decisions: allDecisions,
+        attempts: allAttempts,
+        contracts: allContracts,
+        findings: allFindings,
+      });
+
+      return c.json(view);
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/work-items/:id/evidence
+  // ------------------------------------------------------------------
+  app.get("/api/work-items/:id/evidence", async (c) => {
+    const id = c.req.param("id");
+    const client = await pool.connect();
+    try {
+      const pgClient = client as Parameters<typeof listStepContractsByWorkItem>[0];
+
+      const contracts = await listStepContractsByWorkItem(pgClient, id);
+      const decisions = await listDecisionsByWorkItem(pgClient, id);
+
+      const allAttempts: Array<{
+        id: string;
+        contractId: string;
+        contractVersion: number | null;
+        status: string;
+        runId: string | null;
+        checkpointCommit: string | null;
+        commitSha: string | null;
+        updatedAt: string;
+      }> = [];
+      const allArtifacts: Array<{
+        id: string;
+        attemptId: string;
+        revision: string;
+        diffDigest: string;
+        updatedAt: string;
+      }> = [];
+      const allVerificationResults: Array<{
+        id: string;
+        attemptId: string;
+        stepContractId: string;
+        result: string;
+        updatedAt: string;
+      }> = [];
+      const allReviews: Array<{
+        id: string;
+        attemptId: string;
+        attemptRevision: string | null;
+        diffDigest: string | null;
+        updatedAt: string;
+      }> = [];
+      const allFindings: Array<{
+        id: string;
+        attemptId: string | null;
+        severity: string;
+        kind: string;
+        description: string;
+        evidence: string | null;
+        disposition: string | null;
+        updatedAt: string;
+      }> = [];
+      const allIntegrations: Array<{
+        id: string;
+        attemptId: string;
+        targetRef: string;
+        outcome: string | null;
+        resultingRevision: string | null;
+        at: string;
+      }> = [];
+
+      for (const contract of contracts) {
+        const attempts = await listAttemptsByContract(pgClient, contract.id);
+        for (const a of attempts) {
+          allAttempts.push({
+            id: a.id,
+            contractId: contract.id,
+            contractVersion: a.contract_version,
+            status: a.status,
+            runId: a.run_id ?? null,
+            checkpointCommit: a.checkpoint_commit ?? null,
+            commitSha: a.commit_sha ?? null,
+            updatedAt: a.updated_at.toISOString(),
+          });
+
+          const verResults = await listVerificationResultsByAttempt(pgClient, a.id);
+          for (const r of verResults) {
+            allVerificationResults.push({
+              id: r.id,
+              attemptId: a.id,
+              stepContractId: r.step_contract_id,
+              result: r.result,
+              updatedAt: r.updated_at.toISOString(),
+            });
+          }
+
+          const reviews = await listReviewsByAttempt(pgClient, a.id);
+          for (const r of reviews) {
+            allReviews.push({
+              id: r.id,
+              attemptId: a.id,
+              attemptRevision: r.attempt_revision ?? null,
+              diffDigest: r.diff_digest ?? null,
+              updatedAt: r.updated_at.toISOString(),
+            });
+          }
+
+          const findings = await listFindingsByAttempt(pgClient, a.id);
+          for (const f of findings) {
+            allFindings.push({
+              id: f.id,
+              attemptId: f.attempt_id ?? null,
+              severity: f.severity ?? "",
+              kind: f.kind ?? "",
+              description: f.description,
+              evidence: f.evidence ?? null,
+              disposition: f.disposition ?? null,
+              updatedAt: f.updated_at.toISOString(),
+            });
+          }
+
+          // Load integration events
+          const integrations = await listIntegrationsByAttempt(pgClient, a.id);
+          for (const integ of integrations) {
+            allIntegrations.push({
+              id: integ.id,
+              attemptId: a.id,
+              targetRef: integ.target_ref,
+              outcome: integ.outcome ?? null,
+              resultingRevision: integ.resulting_revision ?? null,
+              at: integ.at instanceof Date ? integ.at.toISOString() : String(integ.at),
+            });
+          }
+        }
+      }
+
+      // Load artifacts via direct SQL (listArtifactsByAttempt not yet exported from @agencyhq/db index)
+      type ArtifactRow = {
+        id: string;
+        attempt_id: string;
+        revision: string;
+        diff_digest: string;
+        updated_at: Date;
+      };
+      let artifacts: typeof allArtifacts = [];
+      if (allAttempts.length > 0) {
+        const attemptIds = allAttempts.map((_, i) => `$${i + 1}`).join(", ");
+        const { rows: _artifactRows } = await client.query(
+          `SELECT id, attempt_id, revision, diff_digest, updated_at FROM artifacts WHERE attempt_id IN (${attemptIds}) ORDER BY created_at`,
+          allAttempts.map((a) => a.id),
+        );
+        const artifactRows = _artifactRows as ArtifactRow[];
+        artifacts = artifactRows.map((r) => ({
+          id: r.id,
+          attemptId: r.attempt_id,
+          revision: r.revision,
+          diffDigest: r.diff_digest,
+          updatedAt: r.updated_at.toISOString(),
+        }));
+      }
+
+      // Load approvals for decisions
+      type ApprovalQueryRow = {
+        id: string;
+        decision_id: string;
+        contract_id: string | null;
+        contract_version: number | null;
+        attempt_revision: string | null;
+        human_actor: string | null;
+        at: Date | null;
+      };
+      const allApprovals: Array<{
+        id: string;
+        decisionId: string;
+        contractId: string | null;
+        contractVersion: number | null;
+        attemptRevision: string | null;
+        humanActor: string | null;
+        at: string | null;
+      }> = [];
+      for (const d of decisions) {
+        const { rows: _approvalRows } = await client.query(
+          `SELECT * FROM approvals WHERE decision_id = $1 ORDER BY created_at`,
+          [d.id],
+        );
+        const approvalRows = _approvalRows as ApprovalQueryRow[];
+        for (const r of approvalRows) {
+          allApprovals.push({
+            id: r.id,
+            decisionId: r.decision_id,
+            contractId: r.contract_id,
+            contractVersion: r.contract_version,
+            attemptRevision: r.attempt_revision,
+            humanActor: r.human_actor,
+            at: r.at ? r.at.toISOString() : null,
+          });
+        }
+      }
+
+      // Load manifest rows for this work item
+      const manifestRows = await listWorkItemProjects(pgClient, id);
+
+      const view = buildEvidenceView({
+        workItemId: id,
+        artifacts,
+        verificationResults: allVerificationResults,
+        reviews: allReviews,
+        findings: allFindings,
+        decisions: decisions.map((d) => ({
+          id: d.id,
+          kind: d.kind ?? "",
+          actor: d.actor ?? "",
+          outcome: d.outcome,
+          reason: d.reason ?? null,
+          contractVersion: d.contract_version,
+          attemptId: d.attempt_id,
+          at: d.at instanceof Date ? d.at.toISOString() : String(d.at),
+        })),
+        approvals: allApprovals,
+        integrations: allIntegrations,
+        manifestRows: manifestRows.map((r) => ({
+          workItemId: id,
+          position: r.position,
+          resultRevision: r.result_revision ?? null,
+        })),
+        attempts: allAttempts,
+      });
+
+      return c.json(view);
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/projects/:id/authority
+  // ------------------------------------------------------------------
+  app.get("/api/projects/:id/authority", async (c) => {
+    const id = c.req.param("id");
+    const client = await pool.connect();
+    try {
+      // Load project
+      type ProjectQueryRow = { id: string; authority: unknown; authority_version: string };
+      const { rows: _projectRows } = await client.query(
+        `SELECT id, authority, authority_version FROM projects WHERE id = $1`,
+        [id],
+      );
+      const projectRows = _projectRows as ProjectQueryRow[];
+
+      if (projectRows.length === 0) {
+        return c.json({ error: "project not found" }, 404);
+      }
+
+      const project = projectRows[0];
+      if (!project) {
+        return c.json({ error: "project not found" }, 404);
+      }
+
+      // Load authority history (migration 0004 table — direct SQL until merge packet lands)
+      type HistoryQueryRow = { version: string; authority: unknown; actor: string; at: Date };
+      let historyRows: HistoryQueryRow[] = [];
+      try {
+        const { rows: _historyRows } = await client.query(
+          `SELECT version, authority, actor, at FROM authority_versions WHERE project_id = $1 ORDER BY at`,
+          [id],
+        );
+        historyRows = _historyRows as HistoryQueryRow[];
+      } catch {
+        // Table may not exist yet — return empty history
+      }
+
+      // Parse authority via AuthoritySchema
+      const { AuthoritySchema } = await import("@agencyhq/contracts");
+      const currentAuthority = AuthoritySchema.parse(project.authority);
+
+      const view = buildAuthorityView({
+        projectId: id,
+        currentVersion: project.authority_version,
+        currentAuthority,
+        history: historyRows.map((r) => ({
+          version: r.version,
+          authority: AuthoritySchema.parse(r.authority),
+          actor: r.actor,
+          at: r.at instanceof Date ? r.at.toISOString() : String(r.at),
+        })),
+      });
+
+      return c.json(view);
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // PUT /api/projects/:id/authority
+  // ------------------------------------------------------------------
+  app.put("/api/projects/:id/authority", async (c) => {
+    const id = c.req.param("id");
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: "Invalid JSON body" }, 400);
+    }
+
+    const { commandId, authority, actor, expectedVersion } = body;
+
+    if (!commandId || typeof commandId !== "string") {
+      return c.json({ error: "commandId is required" }, 400);
+    }
+    if (!authority || typeof authority !== "object") {
+      return c.json({ error: "authority object is required" }, 400);
+    }
+    if (!actor || typeof actor !== "string") {
+      return c.json({ error: "actor is required" }, 400);
+    }
+
+    if (!commands) {
+      return c.json({ error: "update_authority not supported in this configuration" }, 400);
+    }
+
+    // U-2: if the client sends expectedVersion, inject the next version into the
+    // authority object so the client does not need to compute it.
+    const nextVersion = typeof expectedVersion === "number" ? expectedVersion + 1 : undefined;
+    const authorityToSubmit =
+      nextVersion !== undefined
+        ? { ...(authority as Record<string, unknown>), version: String(nextVersion) }
+        : authority;
+
+    // U-2: validate authority schema at the route level to return 422 with
+    // structured Zod errors rather than the generic validation_failed reason.
+    const { AuthoritySchema: AuthSchema } = await import("@agencyhq/contracts");
+    const parseResult = AuthSchema.safeParse(authorityToSubmit);
+    if (!parseResult.success) {
+      const errors = parseResult.error.issues.map((issue) => ({
+        path: issue.path.map(String),
+        message: issue.message,
+      }));
+      return c.json({ commandId, errors }, 422);
+    }
+
+    const resultRaw = await commands.updateAuthority({
+      commandId,
+      projectId: id,
+      authority: authorityToSubmit,
+      actor: actor as string,
+    });
+    const result = resultRaw as { ok: true; version: string } | { ok: false; reason: string };
+
+    if (result.ok) {
+      // Return version as number for the web client.
+      return c.json({ commandId, result: { ok: true, version: Number(result.version) } }, 200);
+    }
+
+    if (result.reason === "project_not_found") {
+      return c.json({ error: "project not found" }, 404);
+    }
+
+    if (result.reason === "version_not_increasing" || result.reason === "stale_version") {
+      // Look up the current version for the 409 response body.
+      const client = await pool.connect();
+      let currentVersion = 0;
+      try {
+        const { rows: pvRowsRaw } = await client.query(
+          "SELECT authority_version FROM projects WHERE id = $1",
+          [id],
+        );
+        const pvRows = pvRowsRaw as Array<{ authority_version: string }>;
+        currentVersion = pvRows[0] ? Number(pvRows[0].authority_version) : 0;
+      } finally {
+        client.release();
+      }
+      return c.json(
+        { commandId, result: { ok: false, reason: result.reason, currentVersion } },
+        409,
+      );
+    }
+
+    // Fallback: validation_failed should have been caught above by safeParse.
+    return c.json({ commandId, result }, 200);
   });
 
   // ------------------------------------------------------------------
@@ -473,6 +1364,12 @@ export function createApp(deps: AppDeps): Hono {
       if (!workItemId || typeof workItemId !== "string") {
         return c.json({ error: "workItemId required for plan" }, 400);
       }
+      // DISPATCH ORDERING NOTE: the coordinator dispatches work items one at a
+      // time on demand (per-command). If a batch scheduler is ever added, call
+      // selectDispatch({ workItems, activeAttempts, slots, uncertainRepositories,
+      // mainEffortByCampaign }) from @agencyhq/domain here to select the next
+      // item and respect campaign ordering (main-effort first within a campaign).
+      //
       // When real commands are wired, the flow manages its own claim/complete cycle.
       // When commands are absent (test/legacy mode), the app handles idempotency.
       if (commands) {
@@ -683,6 +1580,121 @@ export function createApp(deps: AppDeps): Hono {
           actor: dispositionActor,
         });
         return c.json({ commandId, replayed: false, result }, 200);
+      }
+
+      // Control-plane commands (slice 5)
+
+      if (kind === "reject") {
+        const workItemId = body.workItemId;
+        const decisionId = body.decisionId;
+        // U-7: trim before checking; whitespace-only reason → 400 reason_required
+        const reason = (typeof body.reason === "string" ? body.reason : "").trim();
+        if (!workItemId || typeof workItemId !== "string") {
+          return c.json({ error: "workItemId required for reject" }, 400);
+        }
+        if (!decisionId || typeof decisionId !== "string") {
+          return c.json({ error: "decisionId required for reject" }, 400);
+        }
+        // T-5 / U-7: reason is required; empty or whitespace-only reason → 400
+        if (!reason) {
+          return c.json({ ok: false, reason: "reason_required" }, 400);
+        }
+        const result = await commands.reject({ commandId, workItemId, decisionId, reason });
+        return c.json({ commandId, result }, 200);
+      }
+
+      if (kind === "invalidate_acceptance") {
+        const workItemId = body.workItemId;
+        const attemptId = body.attemptId;
+        // U-7: non-empty (trimmed) reason required; no server-side default.
+        const reason = (typeof body.reason === "string" ? body.reason : "").trim();
+        if (!workItemId || typeof workItemId !== "string") {
+          return c.json({ error: "workItemId required for invalidate_acceptance" }, 400);
+        }
+        if (!attemptId || typeof attemptId !== "string") {
+          return c.json({ error: "attemptId required for invalidate_acceptance" }, 400);
+        }
+        if (!reason) {
+          return c.json({ ok: false, reason: "reason_required" }, 400);
+        }
+        const result = await commands.invalidateAcceptance({
+          commandId,
+          workItemId,
+          attemptId,
+          reason,
+        });
+        return c.json({ commandId, result }, 200);
+      }
+
+      if (kind === "create_campaign") {
+        const name = body.name;
+        if (!name || typeof name !== "string") {
+          return c.json({ error: "name required for create_campaign" }, 400);
+        }
+        const result = await commands.createCampaign({ commandId, name });
+        return c.json({ commandId, result }, 200);
+      }
+
+      if (kind === "assign_campaign") {
+        const workItemId = body.workItemId;
+        const campaignId = body.campaignId;
+        if (!workItemId || typeof workItemId !== "string") {
+          return c.json({ error: "workItemId required for assign_campaign" }, 400);
+        }
+        if (!campaignId || typeof campaignId !== "string") {
+          return c.json({ error: "campaignId required for assign_campaign" }, 400);
+        }
+        const result = await commands.assignCampaign({ commandId, workItemId, campaignId });
+        return c.json({ commandId, result }, 200);
+      }
+
+      if (kind === "set_main_effort") {
+        const campaignId = body.campaignId;
+        const workItemId = body.workItemId;
+        if (!campaignId || typeof campaignId !== "string") {
+          return c.json({ error: "campaignId required for set_main_effort" }, 400);
+        }
+        if (!workItemId || typeof workItemId !== "string") {
+          return c.json({ error: "workItemId required for set_main_effort" }, 400);
+        }
+        const result = await commands.setMainEffort({ commandId, campaignId, workItemId });
+        return c.json({ commandId, result }, 200);
+      }
+
+      if (kind === "set_rank") {
+        const workItemId = body.workItemId;
+        const rank = body.rank;
+        const expectedVersion = body.expectedVersion;
+        if (!workItemId || typeof workItemId !== "string") {
+          return c.json({ error: "workItemId required for set_rank" }, 400);
+        }
+        if (typeof rank !== "number") {
+          return c.json({ error: "rank (number) required for set_rank" }, 400);
+        }
+        if (typeof expectedVersion !== "number") {
+          return c.json({ error: "expectedVersion (number) required for set_rank" }, 400);
+        }
+        const result = await commands.setWorkItemRank({
+          commandId,
+          workItemId,
+          rank,
+          expectedVersion,
+        });
+        return c.json({ commandId, result }, 200);
+      }
+
+      if (kind === "update_authority") {
+        const projectId = body.projectId;
+        const authority = body.authority;
+        const actor = typeof body.actor === "string" ? body.actor : "operator";
+        if (!projectId || typeof projectId !== "string") {
+          return c.json({ error: "projectId required for update_authority" }, 400);
+        }
+        if (!authority || typeof authority !== "object") {
+          return c.json({ error: "authority object required for update_authority" }, 400);
+        }
+        const result = await commands.updateAuthority({ commandId, projectId, authority, actor });
+        return c.json({ commandId, result }, 200);
       }
     } else {
       // Fallback when commands are not wired (legacy / test mode)

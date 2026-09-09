@@ -15,6 +15,7 @@
     "lint:fix": "biome check --write .",
     "test:unit": "pnpm -r --if-present test",
     "test:integration": "pnpm -r --if-present test:integration",
+    "test:browser": "pnpm --filter @agencyhq/web test:browser",
     "build": "pnpm -r --if-present build",
     "db:up": "docker compose -f infra/db/compose.yaml up -d",
     "db:down": "docker compose -f infra/db/compose.yaml down",

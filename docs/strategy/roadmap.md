@@ -95,12 +95,51 @@ on it.
   117 coordinator). Full record:
   [trials/2026-09-slice4.md](../engineering/trials/2026-09-slice4.md).
 
-## Slice 5 — control plane (current)
+## Slice 5 — control plane
 
 - Campaigns, cross-project rank, work overview, decisions view, evidence view,
-  and authority-schema editing; browser tests for primary flows.
+  authority-schema editing with versions, reject and invalidate-acceptance
+  commands, and Playwright browser tests for primary operator flows.
+- Outcome (2026-09-08): migration 0004 adds `campaigns` and `authority_versions`
+  tables and `work_items.campaign_id`. Campaign aggregate with `setMainEffort`
+  and `campaignRankOrder`; `create_campaign`, `assign_campaign`, `set_main_effort`,
+  `set_rank` commands wired in the coordinator API. Overview view (campaigns +
+  ranked work items), decisions view (open pending only — no later resolving
+  decision for the same attempt — or for the same work item, kind, and contract
+  version for plan/review decisions without an attempt), evidence view, authority
+  view with version history. `reject` command is state-guarded (returns
+  `state_mismatch` on a resolved decision) and transitions work item to `halted`;
+  `invalidate_acceptance` references the historical accept decision with outcome
+  `approved` (human approval) or `accepted` (coordinator acceptance), inserts a
+  new decision of kind `invalidate`, and transitions to `reopened` without touching
+  historical rows (R-017). `update_authority` validates with
+  `AuthoritySchema`, requires strictly increasing version, appends to
+  `authority_versions`, inserts an `authority_update` decision; frozen contract
+  bounds are never modified (R-018). `selectDispatch` is implemented and
+  domain-tested (`dispatch.campaign.test.ts`: main effort first within a
+  campaign, remaining members by rank/createdAt/id, items without `campaignId`
+  unaffected); the coordinator dispatches per command (no batch scheduler);
+  batch scheduling that calls `selectDispatch` is Slice 6 scope (planned).
+  Hash-router web app (`#/`, `#/decisions`, `#/work-items/:id`,
+  `#/projects/:id/authority`, `#/return`) with bearer-auth token prompt on 401;
+  work-item actions (approve, reject, stop, invalidate, pause) each show a confirm
+  dialog naming the project, work item, contract version, and consequence phrase. Playwright browser tests: 20 journeys on a
+  fake-runtime seeded coordinator (return after interruption; four state-card
+  source/timestamp checks; six work-item states; approve from decisions and
+  work-item pages; reject to halted; authority invalid/valid/parse-error flows;
+  stop to stopping and confirm dialog names contract version); CI job `browser`; browser
+  suite red at `be841ff`, fixed at `04c3893`, green in CI at `04c3893` per
+  PR #12; rework 2 CI green at runs 34282513541 and 34282515774. One live trial item: approve via the operator UI on the real stack
+  (merge boundary, `pending_human` at 174 s, approve clicked, `integrate.merge`
+  dispatched in one transaction, remote `main` advanced from `b1f48d0` to
+  `5cbff2c`, work item `completed/healthy`). One defect found by screenshot
+  (single work-item view missing integration and manifest rows; page had no
+  lifecycle/condition label); fixed in `6ab2f2f`. Rework commit `84cdb08`
+  (open-pending rule, persisted reasons, membership guard, authority CAS; see
+  trial record §Rework). 20 browser tests. Full record:
+  [trials/2026-09-slice5.md](../engineering/trials/2026-09-slice5.md).
 
-## Slice 6 — capacity
+## Slice 6 — capacity (current)
 
 - Multiple worker machines and concurrent attempts using Trigger queues and
   environment limits; ProviderCapacity observations with conservative stale

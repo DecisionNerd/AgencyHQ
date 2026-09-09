@@ -9,3 +9,5 @@ export { requiresApproval } from "./human-required.ts";
 export { enforceable, requiredBoundariesFor } from "./runtime.ts";
 export type { AuthorityViolation, ViolationCode } from "./subset.ts";
 export { bashPatternSubset, checkProposal, effectiveAuthority } from "./subset.ts";
+export type { AuthorityUpdateError } from "./update.ts";
+export { frozenContractsUnaffected, proposeAuthorityUpdate } from "./update.ts";

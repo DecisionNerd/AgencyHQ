@@ -608,7 +608,7 @@ test("flow.boundary (e): lead.plan payload for merge item carries integration re
       const fake = new FakeExecutionRuntime();
 
       // Script lead.plan — capture the payload
-      let capturedLeadPlanPayload: unknown = undefined;
+      let capturedLeadPlanPayload: unknown;
       fake.script(TASK_IDS.leadPlan, (payload) => {
         capturedLeadPlanPayload = payload;
         return {
