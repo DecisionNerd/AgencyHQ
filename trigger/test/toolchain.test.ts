@@ -3,7 +3,7 @@
  *
  * Tests verify that onBuildComplete records exactly one layer with the
  * expected pkgs, pinned version strings in the instructions, ENV lines,
- * and the three deploy env vars. No network calls, no file I/O.
+ * and the four deploy env vars. No network calls, no file I/O.
  */
 
 import assert from "node:assert/strict";
@@ -165,12 +165,24 @@ test("layer deploy.env contains AGENCYHQ_RUN_ROOT", () => {
   );
 });
 
-test("layer deploy.env contains exactly three keys (no secrets)", () => {
+test("layer deploy.env contains exactly four keys (no secrets)", () => {
   const { ctx, layers } = makeFakeContext();
   agencyhqToolchain().onBuildComplete?.(ctx, {} as never);
   const env = layers[0]?.deploy?.env ?? {};
   const keys = Object.keys(env);
-  assert.equal(keys.length, 3, `expected 3 deploy env keys, got: ${keys.join(", ")}`);
+  assert.equal(keys.length, 4, `expected 4 deploy env keys, got: ${keys.join(", ")}`);
+});
+
+test("layer deploy.env sets HOME to the writable home created in the image layer", () => {
+  const { ctx, layers } = makeFakeContext();
+  agencyhqToolchain().onBuildComplete?.(ctx, {} as never);
+  const env = layers[0]?.deploy?.env ?? {};
+  assert.equal(env["HOME"], "/home/node");
+  const instructions = layers[0]?.image?.instructions ?? [];
+  assert.ok(
+    instructions.some((i) => i.includes("mkdir -p /home/node") && i.includes("chown 1000:1000")),
+    "image layer should create /home/node owned by uid 1000",
+  );
 });
 
 test("agencyhqToolchain() can be called with no options", () => {

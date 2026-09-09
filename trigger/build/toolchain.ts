@@ -48,14 +48,18 @@ export interface AgencyhqToolchainOptions {
  * - Global npm installs: opencode-ai@OPENCODE_VERSION, pnpm@PNPM_VERSION
  *   (both binaries land in /usr/local/bin, which is on PATH for uid 1000)
  * - mkdir /home/node /tmp/agencyhq, chown to uid 1000 (node)
- * - ENV HOME=/home/node (Node child processes find a writable home)
- * - ENV AGENCYHQ_RUN_ROOT=/tmp/agencyhq
+ * - ENV HOME=/home/node and ENV AGENCYHQ_RUN_ROOT=/tmp/agencyhq for anything
+ *   that inherits the image environment (the task process does not, see below)
  *
  * Deploy-time environment (synced to the Trigger deployment, injected into
  * every task run at runtime — no secret values):
  * - AGENCYHQ_RUNTIME_PROFILE=container
  * - AGENCYHQ_COORDINATOR_INTERNAL_URL=http://app:8787
  * - AGENCYHQ_RUN_ROOT=/tmp/agencyhq
+ * - HOME=/home/node — the managed runner builds the task process environment
+ *   from the deployment's env vars, not from the image ENV (observed
+ *   2026-09-09: `runtime.probe` saw no HOME key although the image sets it),
+ *   so HOME must travel as a deploy env var for opencode, pnpm and git.
  */
 export function agencyhqToolchain(_opts?: AgencyhqToolchainOptions): BuildExtension {
   return {
@@ -109,6 +113,9 @@ export function agencyhqToolchain(_opts?: AgencyhqToolchainOptions): BuildExtens
             // agencyhq Docker network (supervisor injects DOCKER_RUNNER_NETWORKS).
             AGENCYHQ_COORDINATOR_INTERNAL_URL: "http://app:8787",
             AGENCYHQ_RUN_ROOT: "/tmp/agencyhq",
+            // The runner does not pass the image ENV to the task process
+            // (L1, 2026-09-09); the writable home is created in the image layer.
+            HOME: "/home/node",
           },
         },
       });
