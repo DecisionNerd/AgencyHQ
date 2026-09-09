@@ -37,6 +37,8 @@ export const ProjectRowSchema = z
     profile_catalog: z.unknown().nullable(),
     authority: z.unknown(),
     authority_version: z.string(),
+    /** Added in 0008_container_runtime; defaults to 'host_clone'. */
+    source_mode: z.enum(["host_clone", "mirror"]).default("host_clone"),
   })
   .merge(Timestamps);
 
@@ -418,3 +420,75 @@ export const ProviderCapacityRowSchema = z.object({
 });
 
 export type ProviderCapacityRow = z.infer<typeof ProviderCapacityRowSchema>;
+
+// ---------------------------------------------------------------------------
+// leases (0008)
+// ---------------------------------------------------------------------------
+
+export const LeaseRowSchema = z.object({
+  id: z.string(),
+  attempt_id: z.string(),
+  generation: z.number().int(),
+  run_id: z.string(),
+  purpose: z.enum(["provider", "git-read", "integrate", "upload"]),
+  nonce_hash: z.string(),
+  issued_at: z.date(),
+  expires_at: z.date(),
+  used_at: z.date().nullable(),
+  revoked_at: z.date().nullable(),
+});
+
+export type LeaseRow = z.infer<typeof LeaseRowSchema>;
+
+// ---------------------------------------------------------------------------
+// attempt_artifacts (0008)
+// ---------------------------------------------------------------------------
+
+export const AttemptArtifactRowSchema = z.object({
+  id: z.string(),
+  attempt_id: z.string(),
+  generation: z.number().int(),
+  kind: z.enum(["attempt", "checkpoint"]),
+  commit_id: z.string(),
+  diff_digest: z.string(),
+  changed_paths: z.unknown(),
+  quarantine_patch: z.string().nullable(),
+  bundle_sha256: z.string(),
+  // bigint columns arrive as strings from pg
+  bundle_bytes: z.coerce.number().int(),
+  verified: z.boolean(),
+  received_at: z.date(),
+});
+
+export type AttemptArtifactRow = z.infer<typeof AttemptArtifactRowSchema>;
+
+// ---------------------------------------------------------------------------
+// attempt_stop_evidence (0008)
+// ---------------------------------------------------------------------------
+
+export const AttemptStopEvidenceRowSchema = z.object({
+  id: z.string(),
+  attempt_id: z.string(),
+  generation: z.number().int(),
+  steps: z.unknown(),
+  received_at: z.date(),
+});
+
+export type AttemptStopEvidenceRow = z.infer<typeof AttemptStopEvidenceRowSchema>;
+
+// ---------------------------------------------------------------------------
+// project_credentials (0008)
+// ---------------------------------------------------------------------------
+
+export const ProjectCredentialRowSchema = z.object({
+  project_id: z.string(),
+  purpose: z.enum(["git-read", "integrate"]),
+  ciphertext: z.instanceof(Buffer),
+  iv: z.instanceof(Buffer),
+  tag: z.instanceof(Buffer),
+  key_version: z.number().int(),
+  created_at: z.date(),
+  updated_at: z.date(),
+});
+
+export type ProjectCredentialRow = z.infer<typeof ProjectCredentialRowSchema>;

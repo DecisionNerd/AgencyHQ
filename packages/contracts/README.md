@@ -14,6 +14,25 @@ Package name: `@agencyhq/contracts`. Scripts: `typecheck` runs `tsc --noEmit`; `
 
 The following Zod schemas are exported from this package:
 
+### `source.ts`
+
+- `SourceRefSchema` / `SourceRef` — `{ projectId, revision (40-hex git SHA), bundlePath }`. Portable source reference for container execution: `bundlePath` must be a relative or internal path (rejected if it contains a URL scheme `://` or userinfo `@`). Replaces host filesystem paths in v2 task payloads.
+
+### `artifact.ts`
+
+- `ArtifactRefSchema` / `ArtifactRef` — `{ attemptId, generation (int ≥ 0), revision (40-hex) }`. Content-addressed pointer to a stored artifact bundle.
+- `ArtifactUploadMetaSchema` / `ArtifactUploadMeta` — `{ attemptId, generation, kind ("attempt"|"checkpoint"), commitId, diffDigest (sha256:…), changedPaths, quarantinePatch?, bundleSha256 (64-hex), bundleBytes (int ≥ 0) }`. Metadata a worker submits when uploading an artifact bundle.
+- `StopEvidenceUploadSchema` / `StopEvidenceUpload` — `{ attemptId, generation, steps: [{at (ISO), step (enum), detail? (≤2000 chars, no newlines)}] }`. Structured stop evidence submitted by a worker before exit.
+
+### `lease.ts`
+
+- `LeasePurposeSchema` / `LeasePurpose` — `"provider" | "git-read" | "integrate" | "upload"`. The four credential lease purposes.
+- `LeaseRequestSchema` / `LeaseRequest` — `{ runId, attemptId, generation, purpose, nonce (≥32 chars) }`. Request from a worker container for a time-bounded credential grant.
+- `LeaseGrantSchema` / `LeaseGrant` — `{ leaseId, purpose, expiresAt (ISO), material: LeaseMaterial }`. Successful grant with purpose-specific credentials.
+- `LeaseMaterial` — Discriminated union on `purpose`: `provider` carries `authJson`; `git-read`/`integrate` carry `remote` (HTTPS URL, no userinfo), `tokenRef`, and `askpassToken`; `upload` carries `token`.
+- `redactLeaseGrant(grant)` — Returns a copy with all secret material values replaced by `"<redacted>"` (remote URLs are preserved). Safe for logs and error messages.
+- `LeaseRefusalSchema` / `LeaseRefusal` — `{ purpose, reason }` where reason is one of: `login_required`, `expired`, `stale_generation`, `unknown_run`, `unknown_attempt`, `revoked`, `unavailable`.
+
 ### `authority.ts`
 
 - `ChangeClassSchema` / `ChangeClass` — `"editorial" | "behavior" | "shared_interface"`. Change class categorises the nature of a diff for review-depth decisions.
@@ -76,6 +95,27 @@ Supporting schemas:
 `WorkerAttemptOutputSchema.opencode.denials` is an array of `{ tool: string; pattern: z.string().nullable().optional(); message: string }`. The `pattern` field is nullable (the runtime serializes an absent value as `null` on a tool denial without a command).
 
 `LeadReviewPayloadSchema` contains no session id or transcript fields (ADR-0006 independence invariant, asserted in tests).
+
+### Versioned payload schemas (P18.1 — portable execution)
+
+Every task exports three schema variants and a type guard:
+
+| Task | v1 (primary) | v2 (strict, portable) | union | guard |
+| --- | --- | --- | --- | --- |
+| `worker.attempt` | `WorkerAttemptPayloadSchema` / `WorkerAttemptPayloadV1Schema` | `WorkerAttemptPayloadV2Schema` | `WorkerAttemptPayloadAnySchema` | `isV2Payload` |
+| `lead.plan` | `LeadPlanPayloadSchema` / `LeadPlanPayloadV1Schema` | `LeadPlanPayloadV2Schema` | `LeadPlanPayloadAnySchema` | `isV2Payload` |
+| `verify.run` | `VerifyRunPayloadSchema` / `VerifyRunPayloadV1Schema` | `VerifyRunPayloadV2Schema` | `VerifyRunPayloadAnySchema` | `isV2Payload` |
+| `lead.review` | `LeadReviewPayloadSchema` / `LeadReviewPayloadV1Schema` | `LeadReviewPayloadV2Schema` | `LeadReviewPayloadAnySchema` | `isV2Payload` |
+| `lead.accept` | `LeadAcceptPayloadSchema` / `LeadAcceptPayloadV1Schema` | `LeadAcceptPayloadV2Schema` | `LeadAcceptPayloadAnySchema` | `isV2Payload` |
+| `integrate.merge` | `IntegrateMergePayloadSchema` / `IntegrateMergePayloadV1Schema` | `IntegrateMergePayloadV2Schema` | `IntegrateMergePayloadAnySchema` | `isV2Payload` |
+
+**v1** is the current primary schema (trigger-compatible). `payloadVersion: z.literal(1).optional()` is the only addition; all existing field names are unchanged. trigger/ importers that access `.repoPath`, `.worktreeBase`, etc. continue to work without modification.
+
+**v2** is `.strict()` and uses `source: SourceRef` instead of host-path fields (`repoPath`, `worktreeBase`, `patchPath`). Presence of any host-path field is rejected. `payloadVersion: z.literal(2)` is required.
+
+**AnySchema** is `z.union([v1, v2])`. Use it wherever both payload formats must be accepted. `isV2Payload(p)` narrows to the v2 type.
+
+Later packets (P18.2, P18.3) switch coordinator and trigger importers to the `Any`/`V2` forms. Until then, all existing code continues to use the v1 primary schemas.
 
 ### JSON Schema export
 

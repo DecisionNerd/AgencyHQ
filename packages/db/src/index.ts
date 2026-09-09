@@ -1,6 +1,9 @@
 export const PACKAGE_NAME = "@agencyhq/db";
 
 export { createPool, withSchema, withTransaction } from "./client.ts";
+export type { EncryptedRow } from "./crypto.ts";
+// Crypto helpers for secret storage (0008).
+export { decryptSecret, encryptSecret } from "./crypto.ts";
 // Repositories, fencing, and the decision-then-dispatch unit of work (wave 2.3)
 export * from "./fencing.ts";
 export type { MigrateOptions, MigrateResult } from "./migrate.ts";

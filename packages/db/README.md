@@ -66,6 +66,16 @@ Migration `migrations/0006_capacity_metrics.sql` adds the `provider_capacity` ta
 | `provider_capacity` | Adapter- or operator-sourced capacity observations per `(provider, model, observed_at)`. Primary key `(provider, model, observed_at)`. Columns: `status` (`ok`\|`limited`\|`down`), `valid_until`, `source` (`adapter`\|`operator`), nullable `run_id`. Index on `(provider, model, valid_until desc)`. Stale handling is computed by the domain; this table stores every observation. |
 | `lead_metrics` (view) | Per-project quality metrics aggregated from the full ledger. See **Lead metrics** below for precise definitions. |
 
+Migration `migrations/0008_container_runtime.sql` adds container execution and credential tables (P18.1):
+
+| Object | Purpose |
+| --- | --- |
+| `projects.source_mode` | Nullable column (`host_clone`\|`mirror`, default `host_clone`) recording whether this project's source is fetched via host clone or coordinator-managed mirror. |
+| `leases` | Time-bounded credential grants issued to worker containers. Primary key `id`; unique on `(attempt_id, generation, purpose, nonce_hash)`. Columns: `purpose` (enum), `run_id`, `attempt_id`, `generation`, `expires_at`, `revoked_at` (nullable), `used_at` (nullable), `material_encrypted` (bytea), `material_iv` (bytea), `material_tag` (bytea). |
+| `attempt_artifacts` | Coordinator-persisted artifact bundles from worker containers. Unique on `(attempt_id, generation, kind, commit_id)`. Tracks `bundle_sha256`, `bundle_bytes`, `verified_at`. |
+| `attempt_stop_evidence` | Structured stop evidence per `(attempt_id, generation)`, unique. Stores `steps` as jsonb and `submitted_at`. |
+| `project_credentials` | Encrypted project-level credentials keyed by `(project_id, purpose)`. Stores `key_version`, ciphertext, IV, and tag for AES-256-GCM. |
+
 Row schemas with inferred TypeScript types live in `src/rows.ts`. `mapRow` helpers parse jsonb columns (`authority`, `bounds`, `criteria`, `record`) through their contracts Zod schemas. Repository insert types (e.g. `FindingInsert`, `DecisionInsert`, `ReviewInsert`) require the columns marked NOT NULL in migration 0002 — `severity`, `kind`, `description` for findings; `kind`, `actor` for decisions; `reviewer_model`, `profile` for reviews; `class`, `phase`, `cause` for failures; `kind` for commands — as non-nullable fields; the coordinator always supplies them. Migration 0003 adds `WorkItemProjectRowSchema` / `WorkItemProjectRow` and `IntegrationRowSchema` / `IntegrationRow`.
 
 ## Fencing and idempotency
@@ -111,6 +121,16 @@ Each table has a typed repository module in `src/repos/`. Every function takes a
 | `repos/integrations.ts` | `insertIntegration` (idempotent on `(attempt_id, target_ref, expected_base_revision)`; returns `{ status: "inserted" | "existing", row }`), `finalizeIntegration` (guarded: only writes when `outcome IS NULL`; returns `"applied" | "already_set"`), `getIntegrationByAttempt`, `listIntegrationsByAttempt` |
 | `repos/provider-capacity.ts` | `recordCapacity` (idempotent on PK; returns `{ result: "inserted" | "existing", row }`), `latestCapacity` (most recent by `observed_at`), `listCurrentCapacity` (one row per `(provider, model)`, most recent) |
 | `repos/metrics.ts` | `leadMetrics(client, { since? })` — per-project `ProjectMetricsRow[]` (see **Lead metrics** below) |
+| `repos/leases.ts` | `issueLease` (insert), `findLeasesByAttemptGeneration`, `markLeaseUsed`, `revokeLeasesBelowGeneration(attemptId, generation) → count`, `revokeExpiredLeases(before?) → count` |
+| `repos/attempt-artifacts.ts` | `insertAttemptArtifact` (returns `{ outcome: "inserted", row } \| { outcome: "duplicate" }` via ON CONFLICT DO NOTHING), `listArtifactsForAttempt`, `markArtifactVerified` |
+| `repos/attempt-stop-evidence.ts` | `upsertAttemptStopEvidence` (idempotent by `(attempt_id, generation)` via ON CONFLICT UPDATE), `listStopEvidenceForAttempt` |
+| `repos/project-credentials.ts` | `putProjectCredential` (upsert), `getProjectCredential`, `deleteProjectCredential → boolean` |
+
+`repos/projects.ts` exports `setProjectSourceMode(client, projectId, mode)` → `row | null` to switch a project's `source_mode` column between `"host_clone"` and `"mirror"`.
+
+## Encryption (`src/crypto.ts`)
+
+`encryptSecret(plaintext, hexKey)` → `{ ciphertext: Buffer, iv: Buffer, tag: Buffer }` — AES-256-GCM with a 12-byte random IV. `decryptSecret({ ciphertext, iv, tag }, hexKey)` → `string`; throws `"authentication failed"` on tamper or wrong key (no secret material appears in the error). `parseKey(hexKey)` validates exactly 64 hex characters (32 bytes); throws with length info but never key value. The 64-hex key string is read from an environment variable; it never appears in logs, errors, or test snapshots.
 
 Every `updateXStatus(client, id, from, to, audit)` applies `UPDATE … WHERE id=$1 AND status=$2`. Zero rows updated returns `{ ok: false, reason: "state_mismatch" }` and writes no audit row. On success it appends a `transitions` row with `actor`, `causation_id`, and `command_id`.
 

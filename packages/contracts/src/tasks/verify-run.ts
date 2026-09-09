@@ -1,10 +1,16 @@
 import { z } from "zod";
 
 import { RevisionManifestSchema } from "../manifest.ts";
+import { SourceRefSchema } from "../source.ts";
 import { DigestStringSchema } from "../step-contract.ts";
 import { VerificationResultSchema } from "../verification-result.ts";
 
+/**
+ * Payload for the verify.run task — v1.
+ * payloadVersion 1 is the default when the field is absent.
+ */
 export const VerifyRunPayloadSchema = z.object({
+  payloadVersion: z.literal(1).optional(),
   attemptId: z.string().min(1),
   generation: z.number().int().min(0),
   contractId: z.string().min(1),
@@ -36,6 +42,57 @@ export const VerifyRunPayloadSchema = z.object({
   manifest: RevisionManifestSchema.optional(),
 });
 export type VerifyRunPayload = z.infer<typeof VerifyRunPayloadSchema>;
+/** Alias for the v1 schema. */
+export const VerifyRunPayloadV1Schema = VerifyRunPayloadSchema;
+export type VerifyRunPayloadV1 = VerifyRunPayload;
+
+/**
+ * Payload for the verify.run task — v2 (portable execution).
+ *
+ * Host filesystem paths are replaced by SourceRef. Strict parsing rejects
+ * legacy host path fields.
+ */
+export const VerifyRunPayloadV2Schema = z
+  .object({
+    payloadVersion: z.literal(2),
+    attemptId: z.string().min(1),
+    generation: z.number().int().min(0),
+    contractId: z.string().min(1),
+    profileId: z.string().min(1),
+    profileDigest: DigestStringSchema,
+    criteriaDigest: DigestStringSchema,
+    /** Source reference (replaces repoPath + worktreeBase). */
+    source: SourceRefSchema,
+    baseRevision: z.string().min(1),
+    attemptRevision: z.string().min(1),
+    diffDigest: DigestStringSchema,
+    protectedPaths: z.array(z.string().min(1)).optional(),
+    checks: z.array(
+      z.object({
+        id: z.string().min(1),
+        version: z.string().min(1),
+        command: z.array(z.string().min(1)),
+        timeoutSeconds: z.number().int().min(1),
+      }),
+    ),
+    manifest: RevisionManifestSchema.optional(),
+  })
+  .strict();
+export type VerifyRunPayloadV2 = z.infer<typeof VerifyRunPayloadV2Schema>;
+
+/**
+ * Union of v1 and v2. Use where both formats must be accepted.
+ */
+export const VerifyRunPayloadAnySchema = z.union([
+  VerifyRunPayloadSchema,
+  VerifyRunPayloadV2Schema,
+]);
+export type VerifyRunPayloadAny = z.infer<typeof VerifyRunPayloadAnySchema>;
+
+/** Type guard: returns true iff the payload is a v2 VerifyRunPayload. */
+export function isV2Payload(p: VerifyRunPayloadAny): p is VerifyRunPayloadV2 {
+  return p.payloadVersion === 2;
+}
 
 export const VerifyRunIntegritySchema = z.object({
   tamperedPaths: z.array(z.string()),
