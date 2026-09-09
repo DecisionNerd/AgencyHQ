@@ -134,6 +134,62 @@ function resolveTriggerBin(workspaceRoot: string): string {
   return "trigger"; // fallback to PATH
 }
 
+/** Name of the buildx builder the Trigger CLI uses by default (`--builder`). */
+const BUILDER_NAME = "trigger";
+
+function docker(args: string[], dockerConfigDir: string): { status: number | null; out: string } {
+  const r = spawnSync("docker", args, {
+    encoding: "utf-8",
+    env: { ...process.env, DOCKER_CONFIG: dockerConfigDir },
+  });
+  return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+}
+
+/**
+ * Prepare the buildx builder the CLI will use.
+ *
+ * `trigger deploy --local-build` creates a `docker-container` builder named
+ * `trigger` when none exists (deploy/buildImage.js, 4.5.16). The Containerfile
+ * it builds runs the task indexer as a RUN step, and that step must reach the
+ * webapp at the advertised API origin (`http://webapp:3000`). A builder on the
+ * daemon's host network resolves no Docker service names (observed 2026-09-09:
+ * "Failed to fetch environment variables: Connection error." at Containerfile
+ * line 75), so the builder is created here, attached to the Docker network the
+ * webapp is on; RUN steps then share that network and its embedded DNS.
+ *
+ * The Docker CLI writes buildx state under $DOCKER_CONFIG (default
+ * $HOME/.docker); HOME is /app in the image, which the runtime user cannot
+ * write to, so the state lives under the writable state directory.
+ */
+export function ensureBuilder(dockerConfigDir: string, network: string): void {
+  const wanted = `network="${network}"`;
+  const inspect = docker(["buildx", "inspect", BUILDER_NAME], dockerConfigDir);
+  if (inspect.status === 0 && inspect.out.includes(wanted)) {
+    log(`buildx builder '${BUILDER_NAME}' present on network ${network}`);
+    return;
+  }
+  if (inspect.status === 0) {
+    log(`buildx builder '${BUILDER_NAME}' exists with a different network; recreating`);
+    docker(["buildx", "rm", "--force", BUILDER_NAME], dockerConfigDir);
+  }
+  const create = docker(
+    [
+      "buildx",
+      "create",
+      "--name",
+      BUILDER_NAME,
+      "--driver",
+      "docker-container",
+      `--driver-opt=network=${network}`,
+    ],
+    dockerConfigDir,
+  );
+  if (create.status !== 0) {
+    throw new Error(`failed to create buildx builder '${BUILDER_NAME}': ${create.out.trim()}`);
+  }
+  log(`buildx builder '${BUILDER_NAME}' created on network ${network}`);
+}
+
 export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> {
   const { workspaceRoot, stateDir, accessToken, webappIpUrl, projectRef, platform } = opts;
   const triggerDir = join(workspaceRoot, "trigger");
@@ -152,6 +208,10 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
     return { ...existing, skipped: true };
   }
 
+  const dockerConfigDir = process.env["DOCKER_CONFIG"] ?? join(stateDir, "docker");
+  mkdirSync(dockerConfigDir, { recursive: true });
+  ensureBuilder(dockerConfigDir, process.env["AGENCYHQ_BUILD_NETWORK"] ?? "webapp");
+
   log("running trigger deploy --local-build");
 
   const args = [
@@ -162,20 +222,17 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
     "--external-id",
     externalId,
     "--skip-update-check",
-    // Observed 2026-09-09 on Docker Desktop: a `--network host` image build reaches
-    // the webapp's container IP (advertised as API_ORIGIN) while a default-network
-    // build reaches neither the service name nor the IP.
-    "--network",
-    "host",
+    // No --network flag: the CLI would then require a builder created with
+    // `network=<mode>` and recreate ours. The builder prepared by ensureBuilder()
+    // sits on the webapp Docker network instead (see there).
   ];
 
   /**
-   * NOTE (open question): The Trigger.dev docs (read 2026-09-09) do not list a
-   * --push or --network flag for `trigger deploy`. The plan references both but
-   * they could not be confirmed from the v4.5.16 docs. The --local-build flag
-   * handles the local build; registry push behaviour is internal to the CLI.
-   * If --network is required for RUN steps to reach the webapp, the operator
-   * must configure TRIGGER_DEPLOY_ARGS or use the socat fallback.
+   * Flags confirmed from the trigger.dev 4.5.16 CLI source (commands/deploy.js,
+   * read 2026-09-09): `--local-build`, hidden `--builder <name>`, hidden
+   * `--network <default|none|host>`, hidden `--push/--no-push`. An image tagged
+   * for a localhost registry is loaded into the daemon (`--output type=docker`)
+   * and not pushed unless `--push` is given (deploy/buildImage.js shouldPush).
    *
    * Extra flags can be injected via TRIGGER_DEPLOY_ARGS env var (space-separated).
    */
@@ -183,12 +240,6 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
   if (extraArgs) {
     args.push(...extraArgs.split(/\s+/).filter(Boolean));
   }
-
-  // The Docker CLI writes buildx state under $DOCKER_CONFIG (default $HOME/.docker);
-  // HOME is /app in the image, which the runtime user cannot write to, so the CLI
-  // config lives under the writable state directory unless the operator set one.
-  const dockerConfigDir = process.env["DOCKER_CONFIG"] ?? join(stateDir, "docker");
-  mkdirSync(dockerConfigDir, { recursive: true });
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
