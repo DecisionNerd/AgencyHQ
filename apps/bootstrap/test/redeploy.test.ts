@@ -75,12 +75,12 @@ describe("StateManager.reopen", () => {
 
       sm.reopen(state, ["deploy", "verify_deployment", "done", "login"]);
 
-      assert.equal(state.phases["deploy"]?.status, "pending");
-      assert.equal(state.phases["deploy"]?.deploymentVersion, undefined);
-      assert.equal(state.phases["verify_deployment"]?.status, "pending");
-      assert.equal(state.phases["done"]?.status, "pending");
-      assert.equal(state.phases["login"]?.status, "running", "non-done phases are left alone");
-      assert.equal(state.phases["credentials"]?.status, "done", "phases not listed stay done");
+      assert.equal(state.phases.deploy?.status, "pending");
+      assert.equal(state.phases.deploy?.deploymentVersion, undefined);
+      assert.equal(state.phases.verify_deployment?.status, "pending");
+      assert.equal(state.phases.done?.status, "pending");
+      assert.equal(state.phases.login?.status, "running", "non-done phases are left alone");
+      assert.equal(state.phases.credentials?.status, "done", "phases not listed stay done");
 
       const reloaded = sm.load();
       assert.ok(!sm.isDone(reloaded, "deploy"));

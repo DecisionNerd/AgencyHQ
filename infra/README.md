@@ -30,7 +30,7 @@ networks.
 | `opencode` | `opencode` | `agencyhq` | `opencode-data`, `opencode-config` | `sleep infinity`; `docker compose exec opencode opencode auth login`. |
 | `bootstrap` | `tools` | `agencyhq`, `webapp`, `supervisor`, `docker-proxy-build` | `secrets:ro`, `agencyhq-state` | One-shot (restart on-failure): bootstraps Trigger project; deploys task image. |
 | `docker-proxy-build` | `tecnativa/docker-socket-proxy:v0.5.0` | `docker-proxy-build` | `/var/run/docker.sock:ro` | Socket proxy for the bootstrap's image build: allows build, image, container, exec, volume and network endpoints so the Trigger CLI's buildx docker-container builder can run (the daemon's docker driver cannot be used behind the proxy; L1 2026-09-09). |
-| `webapp` | `ghcr.io/triggerdotdev/trigger.dev:v4.5.16` | `webapp`, `supervisor`, `agencyhq` | `shared`, `secrets:ro`, `agencyhq-state:ro` | Trigger.dev webapp (port 8030). |
+| `webapp` | `ghcr.io/triggerdotdev/trigger.dev:v4.5.16` | `webapp`, `supervisor`, `agencyhq` | `shared`, `secrets:ro` | Trigger.dev webapp (port 8030). |
 | `postgres` | `postgres:14` | `webapp` | `postgres` | Trigger's own database. |
 | `redis` | `redis:7` | `webapp` | `redis` | Trigger's job queue and cache. |
 | `electric` | `electricsql/electric:1.2.4` | `webapp` | — | Postgres CDC for the Trigger dashboard. |
@@ -50,7 +50,7 @@ networks.
 | `webapp` | All Trigger services + `app`, `bootstrap`, runner task containers | Trigger API, registry, object store, realtime streams. |
 | `supervisor` | `webapp`, `supervisor` (Trigger worker stack container) | Trigger worker stack container internal routing. |
 | `docker-proxy` | `supervisor` (Trigger worker stack container), `docker-proxy` | Socket proxy for the Trigger worker stack container. |
-| `docker-proxy-build` | `bootstrap`, `docker-proxy-build` | Build-only socket proxy for the deployer phase. |
+| `docker-proxy-build` | `bootstrap`, `docker-proxy-build` | Socket proxy for the bootstrap's image build (allows build, image, container, exec, volume and network endpoints; see L1 deviation note in ADR-0008). |
 
 ## Published ports (container profile)
 
@@ -61,7 +61,7 @@ All ports are bound to `127.0.0.1` (loopback only) by default.
 | `8787` | `app` | AgencyHQ coordinator API + web UI. |
 | `8030` | `webapp` | Trigger.dev dashboard (debug; operator flow does not require it). |
 | `5001` | `registry` | Local task image registry. |
-| `5435` | `agencyhq-postgres` | (optional, not published by default) AgencyHQ postgres. |
+| `5435` | `agencyhq-postgres` | AgencyHQ postgres (published by default on 127.0.0.1). |
 | `5433` | `postgres` | (optional) Trigger postgres. |
 
 ## Provider setup
@@ -72,9 +72,7 @@ After `docker compose up -d`:
 docker compose exec opencode opencode auth login
 ```
 
-This starts the interactive OpenCode login flow. The qualified default is the
-OpenCode Zen API key (`opencode/big-pickle`, zero spend). See ADR-0008 for
-the list of qualified providers and unsupported combinations.
+This starts the interactive OpenCode login flow. The intended default provider is the OpenCode Zen API key (`opencode/big-pickle`, zero spend); it has not yet been exercised in any qualification trial. Provider qualification (C3/L4) is tracked in issue #17.
 
 ## Secret management
 

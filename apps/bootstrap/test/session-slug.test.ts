@@ -174,9 +174,9 @@ describe("identifier state round-trip", () => {
       });
 
       const reloaded = sm.load();
-      assert.equal(reloaded.phases["org_project"]?.orgSlug, "agencyhq-f0be");
-      assert.equal(reloaded.phases["org_project"]?.projectSlug, "agencyhq-MvNP");
-      assert.equal(reloaded.phases["org_project"]?.projectRef, "proj_fakeRefABC123");
+      assert.equal(reloaded.phases.org_project?.orgSlug, "agencyhq-f0be");
+      assert.equal(reloaded.phases.org_project?.projectSlug, "agencyhq-MvNP");
+      assert.equal(reloaded.phases.org_project?.projectRef, "proj_fakeRefABC123");
     } finally {
       rmSync(sd, { recursive: true, force: true });
       rmSync(sc, { recursive: true, force: true });
@@ -309,7 +309,7 @@ describe("session persistence — jar loaded from file is used for validity chec
     // Build a server that returns 200 only when the session cookie is present.
     const server = createServer((req, res) => {
       const pathname = (req.url ?? "/").split("?")[0] ?? "/";
-      const cookie = req.headers["cookie"] ?? "";
+      const cookie = req.headers.cookie ?? "";
       if (pathname === "/" && cookie.includes("__session=persisted42")) {
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end("<html>Dashboard</html>");

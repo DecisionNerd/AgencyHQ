@@ -105,6 +105,12 @@ export type ImageSmokeDeps = {
    * Injected for testability; production uses the real runCheck.
    */
   runCheckFn: typeof runCheck;
+  /**
+   * Called with the clone directory path immediately after it is computed and
+   * before any checks run. Allows the caller to record the path for cleanup
+   * even when subsequent operations throw.
+   */
+  onCloneDir?: (dir: string) => void;
 };
 
 /**
@@ -120,6 +126,10 @@ export async function runImageSmoke(
 ): Promise<ImageSmokeOutput> {
   const runRoot = process.env.AGENCYHQ_RUN_ROOT ?? "/tmp/agencyhq";
   const cloneDir = join(runRoot, `smoke-${Date.now()}`);
+
+  // Notify caller of the clone directory before any operations so cleanup
+  // can happen even if clone or a check throws.
+  deps.onCloneDir?.(cloneDir);
 
   // Validate the profile before cloning to fail fast on a bad profileId.
   const profile = resolveProfile(payload.profileId);
@@ -180,8 +190,11 @@ export const imageSmoke = task({
       result = await runImageSmoke(payload, {
         clone: gitCloneAtRevision,
         runCheckFn: runCheck,
+        // Capture the clone dir before checks run so cleanup happens even on failure.
+        onCloneDir: (dir) => {
+          cloneDir = dir;
+        },
       });
-      cloneDir = result.cloneDir;
       return result;
     } finally {
       // Best-effort cleanup of the clone directory.

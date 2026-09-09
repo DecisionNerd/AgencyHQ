@@ -30,8 +30,6 @@ export interface DeployOptions {
   projectRef: string;
   /** Target platform (e.g. linux/arm64). Written to deployment.json. */
   platform: string;
-  /** Registry URL for the task image push (e.g. http://registry:5000/v2/). */
-  registryUrl?: string;
 }
 
 export interface DeploymentRecord {
@@ -39,8 +37,6 @@ export interface DeploymentRecord {
   version?: string;
   /** Image reference (enriched after verify phase). */
   imageRef?: string;
-  /** Digest from the registry (enriched after verify phase). */
-  digest?: string;
   /** External ID: sha256 fingerprint of trigger/ tree + lockfile. */
   externalId: string;
   /** Resolved webapp IP URL used at deploy time. */
@@ -107,7 +103,7 @@ function readDeploymentRecord(stateDir: string): DeploymentRecord | null {
 
 function writeDeploymentRecord(stateDir: string, record: DeploymentRecord): void {
   mkdirSync(stateDir, { recursive: true });
-  writeFileSync(join(stateDir, "deployment.json"), JSON.stringify(record, null, 2) + "\n", "utf-8");
+  writeFileSync(join(stateDir, "deployment.json"), `${JSON.stringify(record, null, 2)}\n`, "utf-8");
 }
 
 function log(msg: string): void {
@@ -284,9 +280,9 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
     return { ...existing, skipped: true };
   }
 
-  const dockerConfigDir = process.env["DOCKER_CONFIG"] ?? join(stateDir, "docker");
+  const dockerConfigDir = process.env.DOCKER_CONFIG ?? join(stateDir, "docker");
   mkdirSync(dockerConfigDir, { recursive: true });
-  ensureBuilder(dockerConfigDir, process.env["AGENCYHQ_BUILD_NETWORK"] ?? "webapp");
+  ensureBuilder(dockerConfigDir, process.env.AGENCYHQ_BUILD_NETWORK ?? "webapp");
 
   log("running trigger deploy --local-build");
 
@@ -312,7 +308,7 @@ export async function runDeploy(opts: DeployOptions): Promise<DeploymentRecord> 
    *
    * Extra flags can be injected via TRIGGER_DEPLOY_ARGS env var (space-separated).
    */
-  const extraArgs = process.env["TRIGGER_DEPLOY_ARGS"];
+  const extraArgs = process.env.TRIGGER_DEPLOY_ARGS;
   if (extraArgs) {
     args.push(...extraArgs.split(/\s+/).filter(Boolean));
   }
@@ -390,22 +386,6 @@ export function enrichDeployment(
     writeDeploymentRecord(stateDir, enriched);
   } catch {
     // Enrichment failure is non-fatal; the coordinator will re-probe the API.
-  }
-}
-
-/**
- * Try to read the image digest from the local registry API.
- * Returns null when the registry is unreachable or the image is not found.
- * Never throws — this is best-effort enrichment.
- */
-export async function fetchImageDigest(registryUrl: string, name: string): Promise<string | null> {
-  try {
-    const r = await fetch(`${registryUrl}${name}/manifests/latest`, {
-      headers: { Accept: "application/vnd.docker.distribution.manifest.v2+json" },
-    });
-    return r.headers.get("Docker-Content-Digest");
-  } catch {
-    return null;
   }
 }
 

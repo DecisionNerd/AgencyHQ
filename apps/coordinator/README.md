@@ -124,7 +124,7 @@ formats are supported:
 
 ### AGENCYHQ_STATE_DIR
 
-Set to the mount point of the `agencyhq-state` volume (e.g. `/run/agencyhq/state`).
+Set to the mount point of the `agencyhq-state` volume (e.g. `/var/agencyhq/state`).
 The coordinator reads two files from this directory on every readiness poll:
 
 - `bootstrap.json` — written by the bootstrap container as it progresses
@@ -160,7 +160,7 @@ The route is bearer-authenticated (same rule as all other `/api/*` routes).
     "trigger": "ok | down | unconfigured"
   },
   "bootstrap": {
-    "phase": "wait | smtp | org | project | credentials | deploy | verify | done",
+    "phase": "wait_services | login | org_project | credentials | deploy | verify_deployment | done",
     "status": "running | done | failed",
     "error": "error_category",
     "at": "2026-09-08T12:00:00.000Z"
@@ -188,7 +188,7 @@ No secret values appear in the response.
 |-------|-----------|
 | bootstrap.json absent | `Bootstrap not started; run \`docker compose up -d\`` |
 | bootstrap running | `Bootstrap is running: phase deploy` |
-| bootstrap failed | `Bootstrap failed at credentials: pat_creation_failed; run \`docker compose logs bootstrap\`` |
+| bootstrap failed | `Bootstrap failed at credentials: pat_create_failed; run \`docker compose logs bootstrap\`` |
 | bootstrap backing off | `Bootstrap is backing off until 2026-09-09T14:00:00Z (login_rate_limited)` — reported for any retried failure; `nextRetryAt` is read from `bootstrap.json` |
 | ready for login | `Ready for provider login: run \`docker compose exec opencode opencode auth login\`` |
 

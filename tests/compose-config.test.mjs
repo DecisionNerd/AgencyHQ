@@ -22,7 +22,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -355,15 +355,6 @@ test("only the two Docker socket files are host bind mounts (read-only)", () => 
   // Clickhouse config XML files are host bind mounts in the upstream config;
   // we allow read-only mounts from infra/clickhouse/ because they are
   // project config files (not host state or secrets).
-  const allowedPrefixes = [
-    // Docker socket proxies (expected: docker-proxy and docker-proxy-build)
-    "/var/run/docker.sock",
-    "/run/docker.sock",
-    // Clickhouse read-only config from the infra directory
-    "/Users/",      // absolute path to repo on this host — infra/clickhouse/*.xml
-    // Allow relative paths that the compose tool expands from the project root
-  ];
-
   const violations = [];
   for (const source of binds) {
     // Allow the two docker sockets
@@ -450,58 +441,97 @@ test("bootstrap command file apps/bootstrap/src/cli.ts exists in the repo", () =
 test("agencyhq-postgres is not attached to the agencyhq network", () => {
   // The domain ledger is on agencyhq-internal only; runners on the agencyhq
   // network must not be able to reach it directly.
-  const serviceNetworks = extractServiceNetworks(configYaml);
-
-  // Find agencyhq-postgres networks by looking at the rendered config directly.
-  // The simple regex approach above may miss the indented YAML; use string search.
+  //
+  // In `docker compose config` output, services are at 2-space indent under
+  // `services:`. Properties of a service are at 4-space indent, and network
+  // entries within the `networks:` block are at 6-space indent.
   const lines = configYaml.split("\n");
   let inService = false;
   let inNetworks = false;
-  let networksForService = [];
-  const agencyhqNetworks = [];
+  const agencyhqPostgresNetworks = [];
 
   for (const line of lines) {
-    if (/^    agencyhq-postgres:$/.test(line)) {
+    // Service starts at exactly "  agencyhq-postgres:" (2-space indent)
+    if (/^  agencyhq-postgres:$/.test(line)) {
       inService = true;
       inNetworks = false;
-      networksForService = [];
       continue;
     }
-    if (inService && /^    \S/.test(line)) {
-      // Another service started
-      inService = false;
-      inNetworks = false;
-    }
-    if (inService && /^\s+networks:/.test(line)) {
-      inNetworks = true;
-      continue;
-    }
-    if (inService && inNetworks && /^\s+(\S+):/.test(line)) {
-      const m = line.match(/^\s+(\S+):/);
-      if (m) agencyhqNetworks.push(m[1]);
-    }
-    if (inNetworks && /^\s{8}\S+:\s*$/.test(line) && !/network/.test(line)) {
-      inNetworks = false;
+    if (inService) {
+      // Another top-level key (0-space) or another service (2-space) ends this block
+      if (/^[a-z]/.test(line) || /^  [a-z]/.test(line)) {
+        inService = false;
+        inNetworks = false;
+        break;
+      }
+      // networks: key within the service (4-space indent)
+      if (/^    networks:/.test(line)) {
+        inNetworks = true;
+        continue;
+      }
+      if (inNetworks) {
+        // Network name entries at 6-space indent: "      agencyhq-internal:"
+        const m = line.match(/^      ([^:\s]+):/);
+        if (m) {
+          agencyhqPostgresNetworks.push(m[1]);
+        } else if (/^    [a-z]/.test(line)) {
+          // Another 4-space property ends the networks block
+          inNetworks = false;
+        }
+      }
     }
   }
 
-  // The rendered config has the actual network names. Check that "agencyhq"
-  // does not appear in the section for agencyhq-postgres.
-  const agencyhqPostgresSection = configYaml.match(
-    /agencyhq-postgres:([\s\S]*?)(?=\n    \w|\n\w|$)/,
+  assert.ok(
+    agencyhqPostgresNetworks.length > 0,
+    "agencyhq-postgres networks block could not be parsed from rendered config (indentation may have changed)",
   );
-  if (agencyhqPostgresSection) {
-    const section = agencyhqPostgresSection[1];
-    // Extract the networks block
-    const networksBlock = section.match(/networks:([\s\S]*?)(?=\n\s{8}\w|$)/);
-    if (networksBlock) {
-      const networkNames = networksBlock[1].match(/^\s+(\S+):/gm) ?? [];
-      const hasAgencyHQ = networkNames.some((n) => n.trim().startsWith("agencyhq:"));
-      assert.equal(
-        hasAgencyHQ,
-        false,
-        "agencyhq-postgres must not be attached to the agencyhq network (ledger isolation)",
-      );
-    }
-  }
+  assert.ok(
+    !agencyhqPostgresNetworks.includes("agencyhq"),
+    `agencyhq-postgres must not be attached to the agencyhq network (ledger isolation); found networks: ${agencyhqPostgresNetworks.join(", ")}`,
+  );
+});
+
+// ── CR6: compose.override.example.yaml list keys use !override ───────────────
+test("compose.override.example.yaml list keys use !override (not !reset)", () => {
+  const src = readFileSync(resolve(root, "compose.override.example.yaml"), "utf-8");
+  assert.ok(
+    !src.includes("!reset"),
+    "compose.override.example.yaml must not use !reset (use !override to replace a list)",
+  );
+  assert.ok(
+    src.includes("!override"),
+    "compose.override.example.yaml must use !override for replacement lists (ports, platforms)",
+  );
+});
+
+// ── CR7: electric command uses escaped shell substitution ────────────────────
+test("electric command contains $(cat .../trigger-db-password) in rendered config", () => {
+  // trigger-overrides.yaml uses $$(cat ...) so Docker Compose interpolation does
+  // not expand it as a variable; `$(cat ...)` appears as a substring in the
+  // rendered config (docker compose config preserves `$$` as `$$`, which at
+  // container runtime becomes `$`, letting the shell run the subshell command).
+  const electricSection = configYaml.match(
+    /\n  electric:([\s\S]*?)(?=\n  [a-z]|\nnetworks:|\nvolumes:|$)/,
+  );
+  assert.ok(electricSection !== null, "electric service not found in rendered compose config");
+  assert.ok(
+    electricSection[1].includes("$(cat /run/agencyhq/secrets/trigger-db-password)"),
+    "electric command must contain $(cat /run/agencyhq/secrets/trigger-db-password) in rendered config",
+  );
+});
+
+// ── E-16: webapp API_ORIGIN default is http://webapp:3000 ────────────────────
+test("webapp API_ORIGIN is http://webapp:3000 in the rendered container profile", () => {
+  // The override layer pins the value: Compose `include` interpolates the vendored
+  // file with infra/trigger/.env (host profile), whose API_ORIGIN would otherwise
+  // leak into the container profile and break in-stack deploys (E-16).
+  const webappSection = configYaml.match(
+    /\n  webapp:([\s\S]*?)(?=\n  [a-z]|\nnetworks:|\nvolumes:|$)/,
+  );
+  if (!webappSection) return;
+  assert.ok(
+    webappSection[1].includes("API_ORIGIN: http://webapp:3000"),
+    "webapp API_ORIGIN must be http://webapp:3000 in the rendered container profile (pinned in infra/agencyhq/trigger-overrides.yaml)",
+  );
 });

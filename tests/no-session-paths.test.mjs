@@ -8,8 +8,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 // Container homes such as /home/node or /home/opencode are legitimate; a macOS
-// user home or an agent scratchpad is not.
-const FORBIDDEN = [/\/private\/tmp\/claude-/, /\/tmp\/claude-/, /\/Users\/[A-Za-z0-9_.-]+\//];
+// user home, a CI runner home, or an agent scratchpad is not.
+// Deny non-container home directories (CI runner home and author home).
+// Container homes (/home/node, /home/opencode, etc.) are legitimate and allowed.
+const FORBIDDEN = [
+  /\/private\/tmp\/claude-/,
+  /\/tmp\/claude-/,
+  /\/Users\/[A-Za-z0-9_.-]+\//,
+  /\/home\/runner\//,
+  /\/home\/davidspencer\//,
+];
 const ALLOW = [/^\.claude\/plans\//];
 
 test("no tracked file embeds a session or home-directory path", () => {

@@ -4,7 +4,7 @@
 - Date: 2026-09-08
 - Decider: Project owner
 - Supersedes: ADR-0005's host-first deployment choice and API-key-only container restriction; ADR-0007's host-only worktree and provider-auth placement. Their authority, acceptance, and worker-effect rules remain in force.
-- Implementation status: Packaging, bootstrap and task image implemented on branch epic-14 (issues #15, #16); L1 live evidence 2026-09-09 in docs/engineering/trials/2026-09-compose.md (C1 and C2 partial on one linux/arm64 host). Provider login, portable artifacts, capacity and the operator journey (#17–#20) not started; not qualified. The host profile remains the runnable fallback.
+- Implementation status: Packaging, bootstrap and task image implemented on branch epic-14 (issues #15, #16); L1 live evidence 2026-09-09 in docs/engineering/trials/2026-09-compose.md (C1 and C2 partial on one linux/arm64 host). Provider login, portable artifacts, capacity and the operator journey (#17–#20) not started; not qualified. The host profile remains the runnable fallback. Deviation recorded in the L1 trial: the one-shot bootstrap also holds container/exec/volume/network socket access through `docker-proxy-build` while it builds the task image (record §Deviations).
 - Requirements: R-003, R-012, R-013, R-016, R-021 through R-025.
 
 ## Context

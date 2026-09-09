@@ -21,7 +21,7 @@ Each phase is idempotent and resumable: restarting the container picks up from t
 | Variable | Default | Description |
 | --- | --- | --- |
 | `AGENCYHQ_STATE_DIR` | `/var/agencyhq/state` | Directory for `bootstrap.json` and `deployment.json`. |
-| `AGENCYHQ_SECRETS_DIR` | `AGENCYHQ_STATE_DIR` | Directory for 0600 secret files (`trigger-prod-key`, `trigger-pat`). Defaults to the same path as `AGENCYHQ_STATE_DIR`. |
+| `AGENCYHQ_SECRETS_DIR` | `AGENCYHQ_STATE_DIR` | Directory for 0600 secret files (`trigger-prod.key`, `trigger-pat.key`). Defaults to the same path as `AGENCYHQ_STATE_DIR`. |
 | `DOCKER_CONFIG` | `<AGENCYHQ_STATE_DIR>/docker` | Docker CLI configuration directory; buildx state is written here. Set so the CLI does not write to the root-owned `/app`. |
 | `AGENCYHQ_BUILD_NETWORK` | `webapp` | Docker network on which the `trigger` buildx builder is created. The builder pins Docker's embedded DNS 127.0.0.11 so the indexer RUN step can reach the webapp by service name. |
 | `TRIGGER_WEBAPP_URL` | `http://webapp:3000` | Internal URL of the Trigger.dev webapp container. |
@@ -50,7 +50,7 @@ bootstrap dashboard-link   # Request a fresh magic link and print it to stdout o
 | Phase | Error category | Meaning |
 | --- | --- | --- |
 | `wait_services` | `services_unavailable` | Webapp did not respond within the timeout. |
-| `login` | `login_rate_limited` | The webapp rejected the magic-link request because the per-address limit (30/hour, observed 2026-09-09) is exhausted. The bootstrap backs off until the reset time (up to 15 minutes) before exiting, so `restart: on-failure` does not hot-loop. The `nextRetryAt` field in `bootstrap.json` carries the ISO timestamp of the next attempt. |
+| `login` | `login_rate_limited` | The webapp rejected the magic-link request because the per-address limit (30 per address per day, observed 2026-09-09) is exhausted. The bootstrap backs off until the reset time (up to 15 minutes) before exiting, so `restart: on-failure` does not hot-loop. The `nextRetryAt` field in `bootstrap.json` carries the ISO timestamp of the next attempt. |
 | `login` | `magic_link_timeout` | SMTP sink timed out; no magic-link email received. |
 | `login` | `login_failed` | Following the magic link returned a non-200 response. |
 | `login` | `login_required` | Session could not be re-established after a container restart (magic link not received within timeout). Rerun after 60 s or use `dashboard-link`. |
@@ -87,7 +87,7 @@ Trigger.dev v4.5.16 rate-limits `POST /login/magic` per email address. The obser
 The bootstrap detects this in three ways (checked in order):
 1. `x-ratelimit-remaining: 0` header on the initial response hop.
 2. `retry-after` header (RFC 7231 seconds) on the initial response hop.
-3. The final URL after redirect-following is `/login` (link not sent).
+3. A 302 redirect to `/login` on a sent request indicates the link was sent but login was rejected (defect 17: this is not a rate-limit signal; rate limiting uses a 429 or specific headers).
 
 The reset time is parsed from `x-ratelimit-reset` (epoch-seconds or epoch-ms, auto-detected by magnitude) or `retry-after` (seconds from now).
 

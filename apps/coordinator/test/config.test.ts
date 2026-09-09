@@ -130,6 +130,40 @@ describe("readSecretFile", () => {
     const val = readSecretFile("EMPTY_SECRET", tmpDir);
     assert.equal(val, undefined);
   });
+
+  // CR5 — key-matching and quote-stripping
+  it("strips single quotes from NAME='value' format (secrets-init format)", () => {
+    writeFileSync(join(tmpDir, "QUOTED_KEY.env"), "QUOTED_KEY='mypassword'\n");
+    const val = readSecretFile("QUOTED_KEY", tmpDir);
+    assert.equal(val, "mypassword");
+  });
+
+  it("does not match a different key in the env file", () => {
+    writeFileSync(join(tmpDir, "OTHER.env"), "OTHER_KEY=should-not-match\n");
+    const val = readSecretFile("OTHER", tmpDir);
+    assert.equal(val, undefined);
+  });
+
+  it("bare =value line without a key name does not satisfy the lookup", () => {
+    writeFileSync(join(tmpDir, "BARE.env"), "=barevalue\n");
+    const val = readSecretFile("BARE", tmpDir);
+    assert.equal(val, undefined);
+  });
+
+  it("returns the correct key when env file contains multiple keys", () => {
+    writeFileSync(
+      join(tmpDir, "MULTI.env"),
+      "WRONG_KEY='notthis'\nMULTI='correctvalue'\nANOTHER='nope'\n",
+    );
+    const val = readSecretFile("MULTI", tmpDir);
+    assert.equal(val, "correctvalue");
+  });
+
+  it("returns undefined when env file contains only other keys", () => {
+    writeFileSync(join(tmpDir, "ABSENT.env"), "PRESENT_KEY='something'\n");
+    const val = readSecretFile("ABSENT", tmpDir);
+    assert.equal(val, undefined);
+  });
 });
 
 // ---------------------------------------------------------------------------

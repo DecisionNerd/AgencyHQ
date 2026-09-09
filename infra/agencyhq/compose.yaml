@@ -9,8 +9,8 @@
 #   agencyhq-postgres — AgencyHQ domain ledger (postgres:17.6; separate from Trigger's postgres:14)
 #   opencode        — OpenCode AI provider login service (sleep infinity)
 #   bootstrap       — one-shot: bootstraps Trigger project, deploys task image (restart on-failure)
-#   docker-proxy-build — tecnativa/docker-socket-proxy limited to build operations only;
-#                        reachable only by the bootstrap container
+#   docker-proxy-build — tecnativa/docker-socket-proxy for the bootstrap image build;
+#                        reachable only by the bootstrap container (see §Deviations in trial record)
 #
 # Networks (defined here; referenced by Trigger files via `external: true` naming):
 #   agencyhq          — connects app, opencode, bootstrap, and runner task containers
@@ -173,8 +173,9 @@ services:
   # Usage: docker compose exec opencode opencode auth login
   #
   # The container sleeps indefinitely and is restarted if it exits unexpectedly.
-  # Task runner containers receive provider credentials via the coordinator's
-  # lease broker (ADR-0008 §"Credential delivery").
+  # Provider credentials will be delivered to task runner containers via a
+  # coordinator lease (issue #17, not yet implemented); currently runner
+  # containers have no provider credentials.
   opencode:
     build:
       context: ../..
@@ -248,9 +249,8 @@ services:
       - "run"
 
   # ── docker-proxy-build ──────────────────────────────────────────────────────
-  # Restricted Docker socket proxy for the bootstrap (deployer) phase.
-  # Grants only the operations needed to build and push images:
-  #   BUILD=1  SESSION=1  GRPC=1  IMAGES=1  POST=1  INFO=1  VERSION=1
+  # Docker socket proxy for the bootstrap (deployer) phase.
+  # Proxy scope widened (build, container, exec, volume, network) for Trigger CLI buildx; see docs/engineering/trials/2026-09-compose.md §Deviations.
   # Only the bootstrap container is on the docker-proxy-build network.
   docker-proxy-build:
     image: tecnativa/docker-socket-proxy:${DOCKER_PROXY_BUILD_IMAGE_TAG:-v0.5.0}

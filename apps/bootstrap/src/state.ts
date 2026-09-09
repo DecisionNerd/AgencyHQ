@@ -6,7 +6,14 @@
  * No secrets or one-time URLs are stored in the JSON; those go to AGENCYHQ_SECRETS_DIR
  * as separate 0600 files.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 export type Phase =
@@ -93,7 +100,25 @@ export class StateManager {
   load(): BootstrapState {
     if (existsSync(this.statePath)) {
       const raw = readFileSync(this.statePath, "utf-8");
-      return JSON.parse(raw) as BootstrapState;
+      try {
+        return JSON.parse(raw) as BootstrapState;
+      } catch {
+        // Main file is corrupt — try the backup.
+        const bakPath = `${this.statePath}.bak`;
+        if (existsSync(bakPath)) {
+          const bakRaw = readFileSync(bakPath, "utf-8");
+          try {
+            console.warn("[bootstrap:state] bootstrap.json is corrupt; falling back to .bak");
+            return JSON.parse(bakRaw) as BootstrapState;
+          } catch {
+            // Backup also corrupt — start fresh.
+          }
+        }
+        console.warn(
+          "[bootstrap:state] bootstrap.json is corrupt and no valid .bak exists; starting from empty state",
+        );
+        return emptyState();
+      }
     }
     return emptyState();
   }
@@ -101,7 +126,13 @@ export class StateManager {
   save(state: BootstrapState): void {
     mkdirSync(this.stateDir, { recursive: true });
     state.updatedAt = new Date().toISOString();
-    writeFileSync(this.statePath, JSON.stringify(state, null, 2) + "\n", "utf-8");
+    const tmpPath = `${this.statePath}.tmp`;
+    writeFileSync(tmpPath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+    // Back up the current file before replacing it.
+    if (existsSync(this.statePath)) {
+      copyFileSync(this.statePath, `${this.statePath}.bak`);
+    }
+    renameSync(tmpPath, this.statePath);
   }
 
   /** Returns the phase state (defaulting to pending) without mutating. */

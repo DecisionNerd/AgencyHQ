@@ -500,3 +500,52 @@ test("runImageSmoke: timedOut check is reflected in result", async () => {
     "all results should not pass",
   );
 });
+
+// ---------------------------------------------------------------------------
+// CR12: onCloneDir callback — cleanup even on failure
+// ---------------------------------------------------------------------------
+
+test("runImageSmoke: onCloneDir is called before checks run, even when clone throws", async () => {
+  const payload: ImageSmokePayload = {
+    fixtureRemote: "https://github.com/example/repo",
+    fixtureRevision: "main",
+    profileId: "fixture-node-v1",
+  };
+
+  let capturedDir: string | undefined;
+  const deps: ImageSmokeDeps = {
+    clone: async () => {
+      throw new Error("network failure");
+    },
+    runCheckFn: async () => passedCheckResult(),
+    onCloneDir: (dir) => {
+      capturedDir = dir;
+    },
+  };
+
+  await assert.rejects(() => runImageSmoke(payload, deps), /network failure/);
+  assert.ok(capturedDir !== undefined, "onCloneDir should be called before clone throws");
+  assert.ok(capturedDir?.includes("smoke-"), "cloneDir should follow smoke-<ts> pattern");
+});
+
+test("runImageSmoke: onCloneDir is called before checks run, even when a check throws", async () => {
+  const payload: ImageSmokePayload = {
+    fixtureRemote: "https://github.com/example/repo",
+    fixtureRevision: "main",
+    profileId: "fixture-node-v1",
+  };
+
+  let capturedDir: string | undefined;
+  const deps: ImageSmokeDeps = {
+    clone: async () => {},
+    runCheckFn: async () => {
+      throw new Error("check runtime failure");
+    },
+    onCloneDir: (dir) => {
+      capturedDir = dir;
+    },
+  };
+
+  await assert.rejects(() => runImageSmoke(payload, deps), /check runtime failure/);
+  assert.ok(capturedDir !== undefined, "onCloneDir should be called before checks throw");
+});

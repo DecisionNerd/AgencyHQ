@@ -102,7 +102,7 @@ async function doFetch(
 
   for (;;) {
     const reqHeaders: Record<string, string> = { ...extraHeaders };
-    if (jar.size > 0) reqHeaders["Cookie"] = cookieHeader(jar);
+    if (jar.size > 0) reqHeaders.Cookie = cookieHeader(jar);
     const needsBody = currentMethod !== "GET" && currentMethod !== "HEAD";
     if (needsBody && currentBody) {
       reqHeaders["Content-Type"] = "application/x-www-form-urlencoded";
@@ -538,24 +538,6 @@ export async function mintPAT(
   if (!pat) throw new Error("could not find PAT (tr_pat_...) in token creation response");
   log("PAT created");
   return pat;
-}
-
-/**
- * Request a fresh magic link and return the raw URL (for dashboard-link command).
- * The caller prints this to stdout only.
- */
-export async function requestFreshMagicLinkUrl(webappUrl: string, email: string): Promise<string> {
-  const jar: CookieJar = new Map();
-  const result = await requestMagicLink(webappUrl, email, jar);
-  if (result.kind !== "sent") {
-    throw new Error(`magic link request failed: ${result.kind}`);
-  }
-  // The URL is in the SMTP sink in normal flow; for dashboard-link we can't
-  // capture it here without an SMTP sink. Return a note for the caller.
-  throw new Error(
-    "dashboard-link requires the SMTP sink to capture the URL; " +
-      "the bootstrap SMTP sink (port 2525) must be running to intercept the email.",
-  );
 }
 
 /**

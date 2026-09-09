@@ -5,6 +5,10 @@
 #
 # This file documents all user-configurable knobs. No secrets go here.
 # All items are commented out; uncomment and edit as needed.
+#
+# List replacement note: use `!override` when replacing a list such as `ports` or
+# `build.platforms`. The other merge tag drops the base list without applying the
+# replacement; `!override` replaces the base list with the new value.
 
 # ── Platform ──────────────────────────────────────────────────────────────────
 # The default platform is linux/arm64 (this host). Change to linux/amd64 when
@@ -13,19 +17,19 @@
 # services:
 #   app:
 #     build:
-#       platforms:
+#       platforms: !override
 #         - linux/amd64
 #   opencode:
 #     build:
-#       platforms:
+#       platforms: !override
 #         - linux/amd64
 #   secrets-init:
 #     build:
-#       platforms:
+#       platforms: !override
 #         - linux/amd64
 #   bootstrap:
 #     build:
-#       platforms:
+#       platforms: !override
 #         - linux/amd64
 
 # ── Published ports ───────────────────────────────────────────────────────────
@@ -33,13 +37,13 @@
 # a port accessible from another host on your network.
 # services:
 #   app:
-#     ports:
+#     ports: !override
 #       - "0.0.0.0:8787:8787"
 #   webapp:
-#     ports:
+#     ports: !override
 #       - "0.0.0.0:8030:3000"
 #   registry:
-#     ports:
+#     ports: !override
 #       - "0.0.0.0:5001:5000"
 
 # ── Model IDs ─────────────────────────────────────────────────────────────────
@@ -66,12 +70,12 @@
 # The Trigger dashboard is published on 127.0.0.1:8030 by default.
 # services:
 #   webapp:
-#     ports:
+#     ports: !override
 #       - "127.0.0.1:8031:3000"
 
 # ── Postgres debug access ─────────────────────────────────────────────────────
 # Publish the AgencyHQ postgres on a host port for inspection with psql.
 # services:
 #   agencyhq-postgres:
-#     ports:
+#     ports: !override
 #       - "127.0.0.1:5435:5432"

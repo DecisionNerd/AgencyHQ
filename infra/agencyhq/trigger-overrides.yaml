@@ -21,6 +21,13 @@ services:
     depends_on:
       secrets-init:
         condition: service_completed_successfully
+    environment:
+      # Pinned for the container profile: Compose `include` interpolates the
+      # vendored file with infra/trigger/.env (the host profile's env file), so a
+      # host-profile API_ORIGIN=http://localhost:8030 would otherwise leak into
+      # the stack and break in-stack deploys (L1 trial, E-16). The CLI and runner
+      # processes take their API URL from this value.
+      API_ORIGIN: http://webapp:3000
   electric:
     depends_on:
       secrets-init:
@@ -30,5 +37,5 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
-        export DATABASE_URL="postgresql://postgres:$(cat /run/agencyhq/secrets/trigger-db-password)@postgres:5432/main?schema=public&sslmode=disable";
+        export DATABASE_URL="postgresql://postgres:$$(cat /run/agencyhq/secrets/trigger-db-password)@postgres:5432/main?schema=public&sslmode=disable";
         exec /app/bin/entrypoint start

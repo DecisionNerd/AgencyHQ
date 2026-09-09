@@ -24,7 +24,7 @@ or in any tracked file; they live only in the `secrets` Docker volume.
 
 | File | Purpose |
 | --- | --- |
-| `secrets-init.mjs` | Node.js secret generator (no deps). Writes all secret files with mode 0600. |
+| `secrets-init.mjs` | Node.js secret generator (no deps). Writes all secret files with mode 0644 (see below). |
 | `entrypoint-app.sh` | Wrapper for the AgencyHQ coordinator container; sources `agencyhq.env`. |
 
 The Trigger webapp, the worker stack container, ClickHouse, MinIO, Electric and
@@ -53,3 +53,9 @@ lost on a full volume reset** — this is the intended reset path.
 
 To reset only secrets (keeping data volumes): remove the `agencyhq_secrets`
 volume explicitly, then bring the stack back up with `docker compose up -d`.
+
+## File permissions
+
+Secret files are written with mode **0644** (not 0600). This is intentional: the secrets volume is mounted read-only into every consumer, and services run as different UIDs (Trigger Postgres: root, ClickHouse: uid 101, MinIO: uid 1001, webapp: uid 1000). Since no single UID can own all files and still allow reading by others, 0644 gives all services read access. See trial record defect 7 (`docs/engineering/trials/2026-09-compose.md §Deviations`).
+
+`trigger-prod.key` and `trigger-pat.key` are written by the **bootstrap** container (not by `secrets-init`) with mode **0600**; they live in the `agencyhq-state` volume, not the secrets volume.

@@ -94,15 +94,19 @@ export class ConfigError extends Error {
 export function readSecretFile(name: string, dir: string | undefined): string | undefined {
   if (!dir) return undefined;
 
-  // Try <name>.env — single line `NAME=value` format
+  // Try <name>.env — single line `NAME=value` format (as written by secrets-init)
   try {
     const envContent = readFileSync(join(dir, `${name}.env`), "utf-8");
     for (const line of envContent.split("\n")) {
       const trimmed = line.trim();
       if (trimmed.startsWith("#") || !trimmed.includes("=")) continue;
       const eqIdx = trimmed.indexOf("=");
-      // Accept both `NAME=value` and just `=value` (bare) lines
-      const val = trimmed.slice(eqIdx + 1).trim();
+      const key = trimmed.slice(0, eqIdx);
+      if (key !== name) continue;
+      const raw = trimmed.slice(eqIdx + 1);
+      // Strip single quotes (secrets-init writes NAME='value'; unescape '\'' → ')
+      const val =
+        raw.startsWith("'") && raw.endsWith("'") ? raw.slice(1, -1).replace(/'\\''/g, "'") : raw;
       if (val.length > 0) return val;
     }
   } catch {

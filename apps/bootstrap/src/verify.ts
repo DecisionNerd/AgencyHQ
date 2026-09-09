@@ -15,6 +15,8 @@ export interface DeploymentInfo {
   raw: unknown;
 }
 
+const VERIFY_TIMEOUT_MS = Number(process.env.BOOTSTRAP_VERIFY_TIMEOUT_MS ?? "30000");
+
 function log(msg: string): void {
   console.log(`[bootstrap:verify] ${redact(msg)}`);
 }
@@ -22,6 +24,7 @@ function log(msg: string): void {
 /**
  * GET /api/v1/deployments/current with the prod secret key.
  * Returns the parsed deployment info on success, throws on failure.
+ * Times out after BOOTSTRAP_VERIFY_TIMEOUT_MS (default 30 s).
  */
 export async function verifyDeployment(
   webappUrl: string,
@@ -30,13 +33,24 @@ export async function verifyDeployment(
   const url = `${webappUrl}/api/v1/deployments/current`;
   log(`GET ${url}`);
 
-  const resp = await fetch(url, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${prodSecretKey}`,
-      Accept: "application/json",
-    },
-  });
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${prodSecretKey}`,
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(VERIFY_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "TimeoutError") {
+      throw Object.assign(new Error("verify_deployment timed out"), {
+        errorCategory: "verify_failed",
+      });
+    }
+    throw err;
+  }
 
   if (resp.status === 404) {
     throw Object.assign(
@@ -56,12 +70,21 @@ export async function verifyDeployment(
 
   const body = await resp.json();
   const b = body as Record<string, unknown>;
-  log(`deployment current: status=${b["status"] ?? "unknown"}`);
+  log(`deployment current: status=${b.status ?? "unknown"}`);
 
   const info: DeploymentInfo = { raw: body };
-  if (typeof b["version"] === "string") info.version = b["version"];
-  if (typeof b["status"] === "string") info.status = b["status"];
-  if (typeof b["imageReference"] === "string") info.imageRef = b["imageReference"];
-  if (typeof b["externalId"] === "string") info.externalId = b["externalId"];
+  if (typeof b.version === "string") info.version = b.version;
+  if (typeof b.status === "string") info.status = b.status;
+  if (typeof b.imageReference === "string") info.imageRef = b.imageReference;
+  if (typeof b.externalId === "string") info.externalId = b.externalId;
+
+  // Assert the deployment is in DEPLOYED state (not FAILED, TIMED_OUT, etc.).
+  if (b.status !== "DEPLOYED") {
+    throw Object.assign(
+      new Error(`deployment status is ${b.status ?? "unknown"} (expected DEPLOYED)`),
+      { errorCategory: "verify_failed" },
+    );
+  }
+
   return info;
 }

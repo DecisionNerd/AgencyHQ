@@ -71,8 +71,8 @@ describe("interrupt after org_project — rerun reuses existing org and project"
     const jar = createJar();
     const key = await readProdSecretKey(
       webapp.url,
-      state.phases["org_project"]?.orgSlug ?? FAKE.ORG_SLUG,
-      state.phases["org_project"]?.projectSlug ?? FAKE.PROJECT_SLUG,
+      state.phases.org_project?.orgSlug ?? FAKE.ORG_SLUG,
+      state.phases.org_project?.projectSlug ?? FAKE.PROJECT_SLUG,
       jar,
     );
     sm.writeSecret("trigger-prod-key", key);
@@ -159,16 +159,16 @@ describe("deploy failure — surfaces deploy_failed category and retries on reru
         "trigger deploy exited 1. Re-run bootstrap to retry only the deploy phase.",
       );
 
-      assert.equal(state.phases["deploy"]?.status, "failed");
-      assert.equal(state.phases["deploy"]?.errorCategory, "deploy_failed");
+      assert.equal(state.phases.deploy?.status, "failed");
+      assert.equal(state.phases.deploy?.errorCategory, "deploy_failed");
       assert.match(
-        state.phases["deploy"]?.errorMessage ?? "",
+        state.phases.deploy?.errorMessage ?? "",
         /Re-run bootstrap to retry only the deploy phase/,
       );
 
       // Reload — status persists.
       const reloaded = sm2.load();
-      assert.equal(reloaded.phases["deploy"]?.status, "failed");
+      assert.equal(reloaded.phases.deploy?.status, "failed");
 
       // Simulate rerun: since deploy is failed (not done), it will run again.
       assert.ok(!sm2.isDone(reloaded, "deploy"), "failed deploy should not be isDone");
@@ -188,11 +188,11 @@ describe("deploy failure — surfaces deploy_failed category and retries on reru
       // First attempt: set failed.
       sm2.setRunning(state, "deploy");
       sm2.setFailed(state, "deploy", "deploy_failed", "exit 1");
-      assert.equal(state.phases["deploy"]?.status, "failed");
+      assert.equal(state.phases.deploy?.status, "failed");
 
       // Second attempt: setRunning again clears the failure.
       sm2.setRunning(state, "deploy");
-      assert.equal(state.phases["deploy"]?.status, "running");
+      assert.equal(state.phases.deploy?.status, "running");
 
       // Succeed.
       sm2.setDone(state, "deploy");

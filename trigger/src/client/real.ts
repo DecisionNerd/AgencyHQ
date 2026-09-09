@@ -62,22 +62,41 @@ export type SdkSurface = {
 export class RealExecutionRuntime implements ExecutionRuntime {
   private readonly _sdk: SdkSurface;
   private readonly _taskIds: Record<string, string>;
+  private readonly _apiUrl: string;
+  private readonly _secretKeyProvider: () => string;
+  private _configuredKey = "";
 
   constructor(
-    opts: { apiUrl: string; secretKey: string; taskIds?: Record<string, string> },
+    opts: {
+      apiUrl: string;
+      /** Plain string or a provider function (called lazily on each operation). */
+      secretKey: string | (() => string);
+      taskIds?: Record<string, string>;
+    },
     /** Inject a fake SDK surface in unit tests; defaults to the real SDK. */
     sdk?: SdkSurface,
   ) {
     this._sdk = sdk ?? { configure, idempotencyKeys, tasks, runs, auth };
     this._taskIds = opts.taskIds ?? {};
+    this._apiUrl = opts.apiUrl;
+    this._secretKeyProvider =
+      typeof opts.secretKey === "function" ? opts.secretKey : () => opts.secretKey as string;
 
-    // configure() is called once during construction and sets the global SDK
-    // default client; subsequent calls are no-ops if the configuration is
-    // unchanged.  This matches the spike usage in trigger/scripts/lib/trigger-client.ts.
-    this._sdk.configure({
-      baseURL: opts.apiUrl,
-      secretKey: opts.secretKey,
-    });
+    // Configure immediately if a non-empty key is available at construction.
+    const initialKey = this._secretKeyProvider();
+    if (initialKey.length > 0) {
+      this._sdk.configure({ baseURL: this._apiUrl, secretKey: initialKey });
+      this._configuredKey = initialKey;
+    }
+  }
+
+  /** Re-configure the SDK if the key has changed or was not yet set. */
+  private _ensureConfigured(): void {
+    const key = this._secretKeyProvider();
+    if (key.length > 0 && key !== this._configuredKey) {
+      this._sdk.configure({ baseURL: this._apiUrl, secretKey: key });
+      this._configuredKey = key;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -96,6 +115,7 @@ export class RealExecutionRuntime implements ExecutionRuntime {
       maxDurationSeconds?: number;
     };
   }): Promise<{ runId: string }> {
+    this._ensureConfigured();
     try {
       const { task, payload, options } = input;
       const taskId = this._taskIds[task] ?? task;
@@ -122,6 +142,7 @@ export class RealExecutionRuntime implements ExecutionRuntime {
   }
 
   async cancel(runId: string): Promise<void> {
+    this._ensureConfigured();
     try {
       await this._sdk.runs.cancel(runId);
     } catch (err) {
@@ -130,6 +151,7 @@ export class RealExecutionRuntime implements ExecutionRuntime {
   }
 
   async retrieve(runId: string): Promise<RunObservation> {
+    this._ensureConfigured();
     try {
       const run = await this._sdk.runs.retrieve(runId);
       const obs: RunObservation = {
@@ -154,6 +176,7 @@ export class RealExecutionRuntime implements ExecutionRuntime {
   }
 
   async createPublicToken(input: { tags: string[]; expiresIn: string }): Promise<string> {
+    this._ensureConfigured();
     try {
       return await this._sdk.auth.createPublicToken({
         scopes: { read: { tags: input.tags } },
@@ -179,6 +202,7 @@ export class RealExecutionRuntime implements ExecutionRuntime {
     input: { tags: string[]; signal: AbortSignal },
     onObservation: (obs: RunObservation) => void,
   ): Promise<void> {
+    this._ensureConfigured();
     // Internal controller: aborted when input.signal fires OR when any tag
     // subscription errors, so all iterators stop together.
     const ac = new AbortController();

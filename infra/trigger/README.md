@@ -278,6 +278,12 @@ container network. On the host profile, `API_ORIGIN=http://localhost:8030` is
 set in the env file so the host-side `trigger dev` process dials the published
 port.
 
+**Note**: Compose `include` interpolates this vendored file with `infra/trigger/.env` (the host profile's env file), so a host-profile `API_ORIGIN=http://localhost:8030` would leak into the container profile; `infra/agencyhq/trigger-overrides.yaml` therefore pins `API_ORIGIN: http://webapp:3000` for the webapp service, and `tests/compose-config.test.mjs` asserts the rendered value.
+
+## Registry security note
+
+The local task image registry (`registry:2`) runs without authentication and is accessible to any service on the `webapp` network, including runner containers; peers on `webapp` can push to it. On a single host, the registry is currently unused (the Trigger CLI loads localhost-tagged images directly into the daemon). A multi-host setup (issue #19) must add authentication or move the registry to a dedicated network.
+
 The Trigger webapp, worker stack container (supervisor), ClickHouse, MinIO,
 Electric, and Trigger Postgres source their secrets through inline
 `command:`/`entrypoint:` wrappers in `docker-compose.yml`,

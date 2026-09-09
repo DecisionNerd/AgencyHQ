@@ -86,7 +86,7 @@ Machine presets are set per task and verified against `MachinePresetName` in
 | `lead.review` | `small-2x` | Single OpenCode serve session with diff context |
 | `lead.accept` | `small-2x` | Single OpenCode serve session with criteria context |
 | `runtime.probe` | `small-1x` | Lightweight diagnostics; no model or git operations |
-| `image.smoke` | `small-2x` | Clone public fixture + run fixture-node-v1 checks; used by L1 image qualification only |
+| `image.smoke` | `small-2x` | Clone public fixture + run fixture-node-v1 checks; ships in the production deployment (8 tasks total); any prod-key holder can trigger it. |
 
 ### Environment the deployed tasks expect
 
@@ -100,8 +100,7 @@ Machine presets are set per task and verified against `MachinePresetName` in
 | `AGENCYHQ_WORKTREE_BASE` | (required for coding tasks) | Base directory for worktrees and run dirs inside the container |
 | `TRIGGER_PROJECT_REF` | (required) | Trigger project reference |
 
-Provider credentials (API keys for model providers) are delivered via the
-coordinator lease broker (ADR-0008) — they are never baked into the image.
+Provider credentials (API keys for model providers) will be delivered by a coordinator lease (issue #17, not implemented in this PR); today runner containers have no provider credentials. They are never baked into the image.
 
 ### Slice 6 container spike (2026-09-08, historical record)
 

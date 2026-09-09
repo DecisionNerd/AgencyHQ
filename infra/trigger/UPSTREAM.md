@@ -76,14 +76,12 @@ docker-socket-proxy).
    not which values end up in a real deployment.
 
 6. **Registry htpasswd removed** (container profile, P15.1, 2026-09-08).
-   Reason: the registry is published only on 127.0.0.1 (loopback); network
-   isolation is the access control. htpasswd requires a generated bcrypt
-   hash (needs an additional tool in secrets-init) and is redundant when the
-   only allowed callers are the daemon itself (push from the deployer and pull
-   from the Trigger worker stack container). Without htpasswd, the registry
-   accepts any push/pull without credentials. The `docker-compose.yml` edit
-   removes the `volumes: ../registry/auth.htpasswd` bind mount and the three
-   `REGISTRY_AUTH*` environment variables from the registry service.
+   Reason: the registry runs without htpasswd by design (user choice; loopback-only publishing,
+   currently unused on a single host where the Trigger CLI loads images directly into the daemon).
+   Peers on the `webapp` network could push to it. A multi-host setup (issue #19) must add
+   authentication or move the registry to a dedicated network.
+   The `docker-compose.yml` edit removes the `volumes: ../registry/auth.htpasswd` bind mount
+   and the three `REGISTRY_AUTH*` environment variables from the registry service.
    The `.env.example` variables `DOCKER_REGISTRY_USERNAME` and
    `DOCKER_REGISTRY_PASSWORD` are retained in the host-profile .env.example
    for the worker stack's credential settings (they default to empty).

@@ -15,7 +15,7 @@ import { CHECK_CATALOG, profileDigest, resolveProfile } from "@agencyhq/verifica
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.ts";
 import { commandHandlers } from "./commands/index.ts";
-import { loadConfig } from "./config.ts";
+import { loadConfig, readTriggerKeyFromState } from "./config.ts";
 import { BoundedRepairFlow } from "./flow/bounded-repair.ts";
 import { Reconciler } from "./flow/observe.ts";
 import type { FlowDeps } from "./flow/types.ts";
@@ -43,9 +43,12 @@ const pool = createPool(config.databaseUrl);
 let runtime: FakeExecutionRuntime | RealExecutionRuntime;
 
 if (config.runtime === "real") {
+  // Resolve the key lazily so the coordinator can start before bootstrap writes
+  // trigger-prod.key. _ensureConfigured() re-reads on each operation until
+  // the key is non-empty, then memoizes it.
   runtime = new RealExecutionRuntime({
     apiUrl: config.triggerApiUrl,
-    secretKey: config.triggerSecretKey,
+    secretKey: () => config.triggerSecretKey || readTriggerKeyFromState(config.stateDir) || "",
   });
 } else {
   runtime = new FakeExecutionRuntime();

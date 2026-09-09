@@ -205,8 +205,8 @@ test("flow.boundary (a): merge work item + artifact proposal → pending_human B
         work_item_id: string;
       }>("SELECT outcome, work_item_id FROM decisions WHERE kind = 'plan'");
       assert.equal(decisionRows.length, 1, "one plan decision recorded");
-      assert.equal(decisionRows[0]!.outcome, "pending_human", "outcome = pending_human");
-      assert.equal(decisionRows[0]!.work_item_id, workItemId, "decision references work item");
+      assert.equal(decisionRows[0]?.outcome, "pending_human", "outcome = pending_human");
+      assert.equal(decisionRows[0]?.work_item_id, workItemId, "decision references work item");
 
       // Command result contains BOUNDARY_BELOW_REQUESTED violation
       const { rows: cmdRows } = await client.query<{ result: unknown }>(
@@ -214,7 +214,7 @@ test("flow.boundary (a): merge work item + artifact proposal → pending_human B
         [outputCmdId],
       );
       assert.equal(cmdRows.length, 1, "command result stored");
-      const cmdResult = cmdRows[0]!.result as {
+      const cmdResult = cmdRows[0]?.result as {
         violations?: Array<{ code: string; path: string }>;
       };
       assert.ok(Array.isArray(cmdResult.violations), "violations array in result");
@@ -288,7 +288,7 @@ test("flow.boundary (b): merge work item + merge proposal → admitted, contract
         bounds: { boundary: string };
       }>("SELECT id, bounds FROM step_contracts");
       assert.equal(contractRows.length, 1, "one step_contract created");
-      const contractBounds = contractRows[0]!.bounds as { boundary: string };
+      const contractBounds = contractRows[0]?.bounds as { boundary: string };
       assert.equal(contractBounds.boundary, "merge", "contract boundary = merge");
 
       // Decision accepted (not pending_human)
@@ -296,7 +296,7 @@ test("flow.boundary (b): merge work item + merge proposal → admitted, contract
         "SELECT outcome FROM decisions WHERE kind = 'plan'",
       );
       assert.equal(decisionRows.length, 1, "one plan decision recorded");
-      assert.equal(decisionRows[0]!.outcome, "accepted", "decision outcome = accepted");
+      assert.equal(decisionRows[0]?.outcome, "accepted", "decision outcome = accepted");
 
       // Worker dispatched
       const workerTriggers = fake.calls.filter(
@@ -360,7 +360,7 @@ test("flow.boundary (c): artifact work item + artifact proposal → admitted unc
         bounds: { boundary: string };
       }>("SELECT bounds FROM step_contracts");
       assert.equal(contractRows.length, 1, "step_contract created");
-      const bounds = contractRows[0]!.bounds as { boundary: string };
+      const bounds = contractRows[0]?.bounds as { boundary: string };
       assert.equal(bounds.boundary, "artifact", "contract boundary = artifact");
 
       // Decision accepted
@@ -368,7 +368,7 @@ test("flow.boundary (c): artifact work item + artifact proposal → admitted unc
         "SELECT outcome FROM decisions WHERE kind = 'plan'",
       );
       assert.equal(decisionRows.length, 1, "plan decision recorded");
-      assert.equal(decisionRows[0]!.outcome, "accepted", "decision accepted for artifact proposal");
+      assert.equal(decisionRows[0]?.outcome, "accepted", "decision accepted for artifact proposal");
     } finally {
       await pool.end();
     }
@@ -440,7 +440,8 @@ test("flow.boundary (d): artifact completion does not rewrite work_items.boundar
         "SELECT run_id FROM dispatch_intents WHERE task = $1",
         [TASK_IDS.workerAttempt],
       );
-      const workerRunId = workerIntents[0]!.run_id;
+      const workerRunId = workerIntents[0]?.run_id;
+      assert.ok(workerRunId, "workerIntents must have a run id");
       fake.advance(workerRunId);
       fake.advance(workerRunId);
       const workerObs = await fake.retrieve(workerRunId);
@@ -502,7 +503,8 @@ test("flow.boundary (d): artifact completion does not rewrite work_items.boundar
         "SELECT run_id FROM dispatch_intents WHERE task = $1",
         [TASK_IDS.verifyRun],
       );
-      const verifyRunId = verifyIntents[0]!.run_id;
+      const verifyRunId = verifyIntents[0]?.run_id;
+      assert.ok(verifyRunId, "verifyIntents must have a run id");
       fake.advance(verifyRunId);
       fake.advance(verifyRunId);
       const verifyObs = await fake.retrieve(verifyRunId);
@@ -520,7 +522,8 @@ test("flow.boundary (d): artifact completion does not rewrite work_items.boundar
         "SELECT run_id FROM dispatch_intents WHERE task = $1",
         [TASK_IDS.leadReview],
       );
-      const reviewRunId = reviewIntents[0]!.run_id;
+      const reviewRunId = reviewIntents[0]?.run_id;
+      assert.ok(reviewRunId, "reviewIntents must have a run id");
       fake.advance(reviewRunId);
       fake.advance(reviewRunId);
       const reviewObs = await fake.retrieve(reviewRunId);
@@ -531,7 +534,8 @@ test("flow.boundary (d): artifact completion does not rewrite work_items.boundar
         "SELECT run_id FROM dispatch_intents WHERE task = $1",
         [TASK_IDS.leadAccept],
       );
-      const acceptRunId = acceptIntents[0]!.run_id;
+      const acceptRunId = acceptIntents[0]?.run_id;
+      assert.ok(acceptRunId, "acceptIntents must have a run id");
       fake.advance(acceptRunId);
       fake.advance(acceptRunId);
       const acceptObs = await fake.retrieve(acceptRunId);
@@ -543,9 +547,9 @@ test("flow.boundary (d): artifact completion does not rewrite work_items.boundar
         boundary: string;
       }>("SELECT lifecycle, boundary FROM work_items WHERE id = $1", [workItemId]);
       assert.equal(wiRows.length, 1, "work item exists");
-      assert.equal(wiRows[0]!.lifecycle, "completed", "work item completed");
+      assert.equal(wiRows[0]?.lifecycle, "completed", "work item completed");
       assert.equal(
-        wiRows[0]!.boundary,
+        wiRows[0]?.boundary,
         "artifact",
         "boundary column unchanged after artifact completion (Fix 3)",
       );
@@ -653,10 +657,10 @@ test("flow.boundary (e): lead.plan payload for merge item carries integration re
       const e1 = pp.manifest.entries.find((e) => e.position === 1);
       assert.ok(e0, "entry at position 0 exists");
       assert.ok(e1, "entry at position 1 exists");
-      assert.equal(e0!.projectId, proj1, "entry 0 references proj1");
-      assert.equal(e1!.projectId, proj2, "entry 1 references proj2");
-      assert.equal(e0!.targetRef, "main", "entry 0 targetRef = main");
-      assert.equal(e1!.targetRef, "main", "entry 1 targetRef = main");
+      assert.equal(e0?.projectId, proj1, "entry 0 references proj1");
+      assert.equal(e1?.projectId, proj2, "entry 1 references proj2");
+      assert.equal(e0?.targetRef, "main", "entry 0 targetRef = main");
+      assert.equal(e1?.targetRef, "main", "entry 1 targetRef = main");
 
       await schemaPool.end();
     } finally {

@@ -34,7 +34,7 @@ export function createFakeTrigger(): FakeTrigger {
       `echo "trigger deploy: success (fake)"`,
       "exit 0",
     ].join("\n");
-    writeFileSync(scriptPath, script + "\n", { mode: 0o755 });
+    writeFileSync(scriptPath, `${script}\n`, { mode: 0o755 });
     chmodSync(scriptPath, 0o755);
   }
 
@@ -44,7 +44,7 @@ export function createFakeTrigger(): FakeTrigger {
     binDir,
 
     setFail(message: string): void {
-      writeFileSync(flagPath, message + "\n");
+      writeFileSync(flagPath, `${message}\n`);
     },
 
     setPass(): void {
@@ -61,6 +61,6 @@ export function createFakeTrigger(): FakeTrigger {
 export function envWithFakeTrigger(binDir: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
-    PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
+    PATH: `${binDir}:${process.env.PATH ?? ""}`,
   };
 }

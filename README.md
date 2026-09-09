@@ -38,8 +38,8 @@ integrity, capacity, stop/loss) is pending. See [trial record](docs/engineering/
 
 Only Git and Docker with Compose are required on the host. Docker builds and
 starts the full stack, runs migrations, configures internal credentials,
-bootstraps Trigger, and registers the worker image. OpenCode handles first-use
-provider login; authentication and project data survive restarts.
+bootstraps Trigger, and registers the worker image. OpenCode will handle first-use
+provider login (issue #17); persistence of authentication data will be verified in a future trial.
 
 `/api/readiness` returns `provider` and `worker` as `"unknown"` until issues
 #17 and #19 supply real data; a `nextAction` sentence describes what to do.

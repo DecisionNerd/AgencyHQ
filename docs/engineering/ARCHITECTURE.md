@@ -256,7 +256,7 @@ config pinning Docker's embedded DNS 127.0.0.11. The webapp advertises
 `http://webapp:3000` as `API_ORIGIN`; the CLI and runner processes take the API
 URL from the webapp's project-env response. The image is loaded into the daemon
 (the registry stays empty on a single host). Runner processes receive `HOME` via
-a deploy env var, not only via image `ENV`.
+a deploy env var, not only via image `ENV`. Note: the `docker-proxy-build` socket proxy also allows container/exec/volume/network endpoints for the `bootstrap` service while it builds the task image (L1 trial deviation; see ADR-0008 status).
 
 The task-image toolchain (observed in L1, 2026-09-09): node v24.18.0, git
 2.39.5, opencode-ai 1.18.29, pnpm 11.25.0; uid 1000; linux/arm64.

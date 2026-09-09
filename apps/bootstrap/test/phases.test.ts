@@ -83,22 +83,22 @@ describe("phase machine — happy path", () => {
   it("state machine: setRunning / setDone / isDone round-trip", () => {
     const state = sm.load();
     sm.setRunning(state, "org_project");
-    assert.equal(state.phases["org_project"]?.status, "running");
+    assert.equal(state.phases.org_project?.status, "running");
     sm.setDone(state, "org_project", {
       orgSlug: FAKE.ORG_SLUG,
       projectSlug: FAKE.PROJECT_SLUG,
       projectRef: FAKE.PROJECT_REF,
     });
-    assert.equal(state.phases["org_project"]?.status, "done");
+    assert.equal(state.phases.org_project?.status, "done");
     assert.ok(sm.isDone(state, "org_project"));
   });
 
   it("state machine: setFailed records category and message", () => {
     const state = sm.load();
     sm.setFailed(state, "deploy", "deploy_failed", "trigger deploy exited 1");
-    assert.equal(state.phases["deploy"]?.status, "failed");
-    assert.equal(state.phases["deploy"]?.errorCategory, "deploy_failed");
-    assert.match(state.phases["deploy"]?.errorMessage ?? "", /exited 1/);
+    assert.equal(state.phases.deploy?.status, "failed");
+    assert.equal(state.phases.deploy?.errorCategory, "deploy_failed");
+    assert.match(state.phases.deploy?.errorMessage ?? "", /exited 1/);
   });
 
   it("secrets: write/read/has round-trip", () => {

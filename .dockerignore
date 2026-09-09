@@ -4,9 +4,9 @@
 
 # ── Secrets and credentials ───────────────────────────────────────────────────
 # Never allow environment files, credential files, or local config into images.
-.env
-.env.*
-!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 auth.json
 **/auth.json
 # Trigger.dev local env and CLI build cache — never copied into image layers.
@@ -41,7 +41,7 @@ coverage
 .nyc_output
 
 # ── Scratch and Claude outputs ────────────────────────────────────────────────
-"Claude outputs/"
+Claude outputs/
 .claude/
 
 # ── Docker files (no recursion needed) ───────────────────────────────────────
