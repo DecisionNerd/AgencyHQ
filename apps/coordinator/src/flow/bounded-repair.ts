@@ -1247,9 +1247,76 @@ export class BoundedRepairFlow {
       // Immediately run a scheduling pass so a free slot dispatches without
       // waiting for the next poll interval. All gates (provider capacity,
       // repository busy, slot count) apply here too — R-008.
-      // Errors propagate to the outer catch so Defect-4 recovery records
-      // a failure row and parks the work item pending_human.
-      await scheduleQueuedIntents(this.deps, (id) => this.retryDispatch(id));
+      //
+      // scheduleQueuedIntents never throws for a single intent's dispatch error;
+      // it returns per-intent outcomes. We inspect the result for the newly
+      // queued worker intent only. Failures of OTHER queued intents during this
+      // pass are logged and left queued — the next poll retries them.
+      const scheduleResult = await scheduleQueuedIntents(this.deps, (id) => this.retryDispatch(id));
+
+      // Log failures for other intents (they stay queued; next poll retries).
+      for (const f of scheduleResult.failed) {
+        if (f.intentId !== String(workerIntentId)) {
+          console.warn(
+            "[scheduler] other intent dispatch failed during admission, will retry on next poll",
+            f.intentId,
+            f.error,
+          );
+        }
+      }
+
+      // If OWN worker intent's dispatch failed, fire recovery inline (Defect-4
+      // recovery path): failure row + pending_human + mark own worker intent
+      // failed so it is not re-dispatched under a pending_human decision.
+      const ownFailure = scheduleResult.failed.find((f) => f.intentId === String(workerIntentId));
+      if (ownFailure) {
+        const recoveryClient = await pool.connect();
+        try {
+          await recoveryClient.query("BEGIN");
+          await recoveryClient.query(
+            `INSERT INTO failures (id, class, phase, run_id, cause, evidence)
+             VALUES ($1, 'execution', 'plan', NULL, $2, $3)`,
+            [
+              String(ids.next("fl")),
+              (ownFailure.error instanceof Error
+                ? ownFailure.error.message
+                : String(ownFailure.error)
+              ).slice(0, 500),
+              JSON.stringify({ intentId, error: String(ownFailure.error) }),
+            ],
+          );
+          await recoveryClient.query(
+            `INSERT INTO decisions (id, kind, actor, work_item_id, outcome, at)
+             VALUES ($1, 'plan', 'coordinator', $2, 'pending_human', $3)`,
+            [String(ids.next("dec")), workItemId, new Date()],
+          );
+          // Close lead.plan intent so it is not re-processed.
+          await recoveryClient.query(
+            "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
+            [intentId],
+          );
+          // Mark own worker intent failed so a subsequent poll cannot dispatch it
+          // while the work item is parked pending_human.
+          await recoveryClient.query(
+            "UPDATE dispatch_intents SET status = 'failed', updated_at = now() WHERE id = $1",
+            [String(workerIntentId)],
+          );
+          await recoveryClient.query("COMMIT");
+        } catch (recErr) {
+          console.error("[onLeadPlanOutput] own dispatch recovery failed", recErr);
+          try {
+            await recoveryClient.query("ROLLBACK");
+          } catch {
+            /* best-effort */
+          }
+        } finally {
+          recoveryClient.release();
+        }
+        console.error(
+          "[onLeadPlanOutput] own worker dispatch failed (recovered)",
+          ownFailure.error,
+        );
+      }
     } catch (err) {
       // Rollback any open transaction.
       try {

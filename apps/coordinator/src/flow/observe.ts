@@ -279,6 +279,11 @@ export class Reconciler {
    *
    * Called at the top of pollOnce() (so it runs on every poll and on wake-up).
    * Protected by the pollOnce() in-flight guard — never concurrent.
+   *
+   * scheduleQueuedIntents never throws for individual dispatch errors — those
+   * are logged and returned in outcome.failed so each intent is attempted.
+   * Non-dispatch errors (e.g. DB connectivity) are caught here and logged;
+   * the intent remains queued and the next poll retries.
    */
   async scheduleOnce(): Promise<void> {
     try {

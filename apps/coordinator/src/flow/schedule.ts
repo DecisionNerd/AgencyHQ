@@ -8,6 +8,12 @@
  * Called from BoundedRepairFlow after admission (so gates apply at admission
  * time too — R-008) and from Reconciler.scheduleOnce() (thin wrapper) on
  * every poll and wake-up.
+ *
+ * Error semantics: dispatch errors for individual intents are collected and
+ * returned in the `failed` array; the function never throws for a single
+ * intent's dispatch error.  Every intent is attempted regardless of failures
+ * in prior intents.  Non-dispatch errors (e.g. DB errors loading the queue)
+ * still propagate as thrown exceptions.
  */
 
 import {
@@ -20,23 +26,36 @@ import { selectDispatch, type WorkItemLike } from "@agencyhq/domain";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
+// ScheduleOutcome
+// ---------------------------------------------------------------------------
+
+/** Per-intent outcome returned by scheduleQueuedIntents. */
+export type ScheduleOutcome = {
+  dispatched: Array<{ intentId: string; workItemId: string; runId: string }>;
+  skipped: Array<{ intentId: string; workItemId: string; reason: string }>;
+  failed: Array<{ intentId: string; workItemId: string; error: unknown }>;
+};
+
+// ---------------------------------------------------------------------------
 // scheduleQueuedIntents
 // ---------------------------------------------------------------------------
 
 /**
  * @param deps          Shared flow dependencies (pool, config.workerSlots, …).
  * @param retryDispatch Called for each intent the scheduler elects to dispatch.
+ *                      Must return { runId } on success; may throw on failure.
  */
 export async function scheduleQueuedIntents(
   deps: FlowDeps,
-  retryDispatch: (intentId: string) => Promise<unknown>,
-): Promise<void> {
+  retryDispatch: (intentId: string) => Promise<{ runId: string }>,
+): Promise<ScheduleOutcome> {
+  const outcome: ScheduleOutcome = { dispatched: [], skipped: [], failed: [] };
   const { pool } = deps;
   const client = await pool.connect();
   try {
     // 1. Load queued intents with their work item data.
     const queuedIntents = await listQueuedWorkerIntents(client);
-    if (queuedIntents.length === 0) return;
+    if (queuedIntents.length === 0) return outcome;
 
     // 2. Load active attempts for slot + repo counting.
     //    An attempt is active only when a worker process is or may be running:
@@ -152,19 +171,20 @@ export async function scheduleQueuedIntents(
     }
 
     // 10. Dispatch chosen items.
-    // Try each item; collect errors so we attempt all before re-throwing.
-    // Re-throwing lets callers that need error propagation (e.g. the admission
-    // path in onLeadPlanOutput → Defect-4 recovery) see the failure.
-    // Callers that want resilience (e.g. Reconciler.scheduleOnce) wrap with catch.
-    let firstDispatchError: unknown = undefined;
+    // Every intent is attempted regardless of failures in prior intents.
+    // Dispatch errors are collected in outcome.failed and logged; the function
+    // never throws for a single intent's dispatch error.  Callers that need to
+    // react to their own intent's failure (e.g. the admission path in
+    // onLeadPlanOutput) check outcome.failed for their specific intentId.
     for (const item of result.dispatch) {
       const intentId = intentByWorkItem.get(item.workItemId);
       if (!intentId) continue;
       try {
-        await retryDispatch(intentId);
+        const { runId } = await retryDispatch(intentId);
+        outcome.dispatched.push({ intentId, workItemId: item.workItemId, runId });
       } catch (err) {
         console.error("[scheduler] retryDispatch failed", intentId, err);
-        if (firstDispatchError === undefined) firstDispatchError = err;
+        outcome.failed.push({ intentId, workItemId: item.workItemId, error: err });
       }
     }
 
@@ -179,10 +199,10 @@ export async function scheduleQueuedIntents(
          WHERE id = $1 AND status = 'queued'`,
         [intentId, skipped.reason],
       );
+      outcome.skipped.push({ intentId, workItemId: skipped.workItemId, reason: skipped.reason });
     }
 
-    // Re-throw the first dispatch error after all items have been attempted.
-    if (firstDispatchError !== undefined) throw firstDispatchError;
+    return outcome;
   } finally {
     client.release();
   }

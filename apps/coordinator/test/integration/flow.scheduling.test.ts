@@ -26,6 +26,13 @@
  * (admission-c) slots=2, nothing running, capacity table empty → admission dispatches
  *               immediately through scheduleOnce (intent triggered, run_id set).
  * (admission-d) replaying the same plan observation does not create a second intent.
+ * (admission-N1) own worker trigger fails at admission (lost-response) → failure row,
+ *               item pending_human, lead.plan intent failed, own worker intent `failed`,
+ *               and a subsequent scheduleOnce() does NOT dispatch the parked intent.
+ * (admission-N2) a different queued item B's dispatch fails during C's admission → C's
+ *               worker is triggered normally, C not parked (no failure row, no pending_human),
+ *               B stays queued and is dispatched on the next scheduleOnce() when the fake
+ *               stops failing.
  *
  * Active-attempt definition fix (S6-fix-active-attempts):
  * (i) Dispatched attempt with no triggered worker.attempt intent (only lead.review/accept,
@@ -2211,6 +2218,240 @@ test("scheduling(admission-d): replaying the same plan observation does not crea
         1,
         "still exactly one worker intent after replay (idempotent admission)",
       );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N1: own worker trigger fails at admission → recovery parks item, intent failed
+// ---------------------------------------------------------------------------
+
+test("scheduling(admission-N1): own worker trigger fails at admission → failure row, pending_human, intents failed, next scheduleOnce does not dispatch", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      const { workItemId } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      const deps = makeFlowDeps(pool, fake, { workerSlots: 2 });
+      const flow = new BoundedRepairFlow(deps);
+      const reconciler = new Reconciler(deps, flow, { workerSlots: 2 });
+
+      // Plan the work item.
+      const { intentId: pi, runId: pr } = await flow.plan(workItemId, newId("cmd"));
+      fake.advance(pr);
+      fake.advance(pr);
+
+      // The next trigger() call is the worker.attempt trigger from the admission
+      // scheduling pass. Simulate a lost response.
+      fake.dropNextResponse();
+
+      // Admission must NOT throw even though the worker trigger fails.
+      await assert.doesNotReject(
+        flow.onLeadPlanOutput(pi, goodPlanOutput(), newId("cmd")),
+        "onLeadPlanOutput must not throw when own worker dispatch fails",
+      );
+
+      // A failure row must be recorded.
+      const { rows: failRows } = await client.query<{ class: string; phase: string }>(
+        "SELECT class, phase FROM failures WHERE phase = 'plan'",
+      );
+      assert.equal(failRows.length, 1, "one failure row recorded");
+      assert.equal(failRows[0]?.class, "execution", "failure class = execution");
+
+      // A pending_human decision must be recorded for the work item.
+      const { rows: phRows } = await client.query<{ outcome: string }>(
+        "SELECT outcome FROM decisions WHERE kind = 'plan' AND work_item_id = $1",
+        [workItemId],
+      );
+      const pending = phRows.filter((r) => r.outcome === "pending_human");
+      assert.equal(pending.length, 1, "one pending_human plan decision recorded");
+
+      // The lead.plan intent must be marked failed.
+      const { rows: lpRows } = await client.query<{ status: string }>(
+        "SELECT status FROM dispatch_intents WHERE id = $1",
+        [pi],
+      );
+      assert.equal(lpRows[0]?.status, "failed", "lead.plan intent must be failed");
+
+      // The own worker intent must be marked failed (not left queued).
+      const { rows: workerRows } = await client.query<{ status: string; run_id: string | null }>(
+        `SELECT di.status, di.run_id
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      assert.equal(workerRows[0]?.status, "failed", "own worker intent must be failed, not queued");
+
+      // A subsequent scheduleOnce() must NOT dispatch the failed intent.
+      await reconciler.scheduleOnce();
+      const { rows: afterPoll } = await client.query<{ status: string }>(
+        `SELECT di.status
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, workItemId],
+      );
+      assert.equal(
+        afterPoll[0]?.status,
+        "failed",
+        "worker intent must still be failed after scheduleOnce — not re-dispatched while parked",
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N2: another queued item B's dispatch fails during C's admission → C is not affected
+// ---------------------------------------------------------------------------
+
+test("scheduling(admission-N2): another queued item B fails dispatch during C's admission → C dispatched normally, C not parked, B retried on next poll", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL is not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Seed three work items on separate projects.
+      const { workItemId: wiA } = await seedProjectAndWorkItem(client);
+      const { workItemId: wiB } = await seedProjectAndWorkItem(client);
+      const { workItemId: wiC } = await seedProjectAndWorkItem(client);
+
+      const fake = new FakeExecutionRuntime();
+      scriptLeadPlan(fake);
+      fake.script(TASK_IDS.workerAttempt, () => [{ status: "EXECUTING" }]);
+
+      // slots=1: admit A (dispatched) and B (queued — no_slot).
+      const deps1 = makeFlowDeps(pool, fake, { workerSlots: 1 });
+      const flow1 = new BoundedRepairFlow(deps1);
+
+      for (const wi of [wiA, wiB]) {
+        const { intentId: planIntentId, runId: planRunId } = await flow1.plan(wi, newId("cmd"));
+        fake.advance(planRunId);
+        fake.advance(planRunId);
+        await flow1.onLeadPlanOutput(planIntentId, goodPlanOutput(), newId("cmd"));
+      }
+
+      // Verify setup: A triggered, B queued.
+      const { rows: aSetup } = await client.query<{ status: string; run_id: string | null }>(
+        `SELECT di.status, di.run_id
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wiA],
+      );
+      assert.equal(aSetup[0]?.status, "triggered", "A must be triggered after setup");
+
+      const { rows: bSetup } = await client.query<{ status: string }>(
+        `SELECT di.status
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wiB],
+      );
+      assert.equal(bSetup[0]?.status, "queued", "B must be queued after setup");
+
+      // Free A's slot: mark A's intent observed and attempt completed.
+      await client.query("UPDATE dispatch_intents SET status = 'observed' WHERE run_id = $1", [
+        aSetup[0]!.run_id,
+      ]);
+      await client.query("UPDATE attempts SET status = 'completed' WHERE run_id = $1", [
+        aSetup[0]!.run_id,
+      ]);
+
+      // slots=2: admit C while B is still queued. B (older) is selected first by
+      // the scheduling pass. Make the next trigger() call fail — that is B's dispatch.
+      const deps2 = makeFlowDeps(pool, fake, { workerSlots: 2 });
+      const flow2 = new BoundedRepairFlow(deps2);
+      const reconciler = new Reconciler(deps2, flow2, { workerSlots: 2 });
+
+      const { intentId: piC, runId: prC } = await flow2.plan(wiC, newId("cmd"));
+      fake.advance(prC);
+      fake.advance(prC);
+
+      // Drop the next trigger() — B's worker.attempt is dispatched first (older rank).
+      fake.dropNextResponse();
+
+      // Admission must NOT throw and must NOT park C.
+      await assert.doesNotReject(
+        flow2.onLeadPlanOutput(piC, goodPlanOutput(), newId("cmd")),
+        "onLeadPlanOutput must not throw when another item's dispatch fails",
+      );
+
+      // C's worker intent must be triggered (its own dispatch succeeded).
+      const { rows: cRows } = await client.query<{ status: string; run_id: string | null }>(
+        `SELECT di.status, di.run_id
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wiC],
+      );
+      assert.equal(cRows[0]?.status, "triggered", "C's worker intent must be triggered");
+      assert.ok(cRows[0]?.run_id, "C's worker intent must have a run_id");
+
+      // No failure row — recovery must NOT have fired for C.
+      const { rows: failRows } = await client.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM failures",
+      );
+      assert.equal((failRows[0] as { n: number }).n, 0, "no failure row — C was not affected");
+
+      // No pending_human decision for C.
+      const { rows: phC } = await client.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM decisions WHERE work_item_id = $1 AND outcome = 'pending_human'",
+        [wiC],
+      );
+      assert.equal((phC[0] as { n: number }).n, 0, "no pending_human for C");
+
+      // B's intent must still be queued (failed trigger left it queued for retry).
+      const { rows: bMid } = await client.query<{ status: string }>(
+        `SELECT di.status
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wiB],
+      );
+      assert.equal(bMid[0]?.status, "queued", "B's intent must still be queued");
+
+      // Next scheduleOnce() (no fake failure) must dispatch B.
+      await reconciler.scheduleOnce();
+      const { rows: bAfter } = await client.query<{ status: string }>(
+        `SELECT di.status
+         FROM dispatch_intents di
+         JOIN attempts a ON a.id = di.attempt_id
+         JOIN step_contracts sc ON sc.id = a.contract_id
+         WHERE di.task = $1 AND sc.work_item_id = $2`,
+        [TASK_IDS.workerAttempt, wiB],
+      );
+      assert.equal(bAfter[0]?.status, "triggered", "B must be dispatched on the next scheduleOnce");
     } finally {
       await pool.end();
     }
