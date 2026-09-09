@@ -22,6 +22,7 @@ import {
   createJar,
   findOrCreateOrgProject,
   followMagicLink,
+  hasValidSession,
   mintPAT,
   readProdSecretKey,
   redact,
@@ -107,21 +108,28 @@ async function runAll(): Promise<void> {
       throw err;
     }
   } else {
-    log("phase: login — already done (session must be re-established)");
-    // Re-establish session for subsequent phases by requesting a new magic link.
-    try {
-      const [sinkResult] = await Promise.all([
-        startSmtpSink({ port: SMTP_PORT, timeoutMs: 60_000 }),
-        (async () => {
-          await sleep(200);
-          await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
-        })(),
-      ]);
-      sinkResult.stop();
-      const landingPath = await followMagicLink(sinkResult.magicLink, WEBAPP_URL, jar);
-      await confirmBasicDetailsIfNeeded(WEBAPP_URL, BOOTSTRAP_EMAIL, jar, landingPath);
-    } catch (err) {
-      log(`session re-establishment failed: ${String(err)}; continuing anyway`);
+    log("phase: login — already done; checking session validity");
+    // "done" means a valid session must exist now.
+    // Verify by GET / — if we are redirected to /login the session is absent.
+    const sessionValid = await hasValidSession(WEBAPP_URL, jar).catch(() => false);
+    if (!sessionValid) {
+      log("session invalid — obtaining fresh magic link (never reusing a captured link)");
+      try {
+        const [sinkResult] = await Promise.all([
+          startSmtpSink({ port: SMTP_PORT, timeoutMs: 60_000 }),
+          (async () => {
+            await sleep(200);
+            await requestMagicLink(WEBAPP_URL, BOOTSTRAP_EMAIL, jar);
+          })(),
+        ]);
+        sinkResult.stop();
+        const landingPath = await followMagicLink(sinkResult.magicLink, WEBAPP_URL, jar);
+        await confirmBasicDetailsIfNeeded(WEBAPP_URL, BOOTSTRAP_EMAIL, jar, landingPath);
+      } catch (err) {
+        log(`session re-establishment failed: ${String(err)}; continuing`);
+      }
+    } else {
+      log("session valid — continuing without re-login");
     }
   }
 

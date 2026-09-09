@@ -21,32 +21,23 @@ export function redact(text: string): string {
 
 type CookieJar = Map<string, string>;
 
-function parseCookies(headers: Headers): Map<string, string> {
-  const cookies = new Map<string, string>();
-  // fetch Headers may expose multiple Set-Cookie values; iterate all.
-  const raw = headers.get("set-cookie");
-  if (!raw) return cookies;
-  // Simple parse: each Set-Cookie is separated by commas, but values can
-  // contain commas, so split on "; " boundaries after the name=value pair.
-  for (const part of raw.split(/,(?=[^ ])/)) {
-    const nameVal = part.trim().split(";")[0];
-    if (!nameVal) continue;
-    const eqIdx = nameVal.indexOf("=");
-    if (eqIdx < 0) continue;
-    const name = nameVal.slice(0, eqIdx).trim();
-    const value = nameVal.slice(eqIdx + 1).trim();
-    cookies.set(name, value);
-  }
-  return cookies;
-}
-
 function cookieHeader(jar: CookieJar): string {
   return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
-function mergeCookies(jar: CookieJar, incoming: Map<string, string>): void {
-  for (const [k, v] of incoming) {
-    jar.set(k, v);
+/**
+ * Merge Set-Cookie headers from a response into the jar.
+ * Uses getSetCookie() so each Set-Cookie directive is handled separately.
+ * Overwrites by name; ignores Expires/Max-Age/Path attributes for simplicity.
+ */
+function mergeCookiesFromResponse(jar: CookieJar, headers: Headers): void {
+  for (const cookieStr of headers.getSetCookie()) {
+    const nameVal = (cookieStr.split(";")[0] ?? "").trim();
+    const eq = nameVal.indexOf("=");
+    if (eq < 0) continue;
+    const name = nameVal.slice(0, eq).trim();
+    const value = nameVal.slice(eq + 1).trim();
+    if (name) jar.set(name, value);
   }
 }
 
@@ -90,25 +81,61 @@ async function doFetch(
   body?: URLSearchParams,
   extraHeaders?: Record<string, string>,
 ): Promise<FetchResult> {
-  const headers: Record<string, string> = {
-    ...extraHeaders,
-  };
-  if (jar.size > 0) headers["Cookie"] = cookieHeader(jar);
-  if (body) headers["Content-Type"] = "application/x-www-form-urlencoded";
+  const MAX_REDIRECTS = 10;
+  let currentMethod = method;
+  let currentUrl = url;
+  let currentBody: URLSearchParams | undefined = body;
+  let redirectCount = 0;
 
-  log(`→ ${method} ${url}`);
+  for (;;) {
+    const reqHeaders: Record<string, string> = { ...extraHeaders };
+    if (jar.size > 0) reqHeaders["Cookie"] = cookieHeader(jar);
+    const needsBody = currentMethod !== "GET" && currentMethod !== "HEAD";
+    if (needsBody && currentBody) {
+      reqHeaders["Content-Type"] = "application/x-www-form-urlencoded";
+    }
 
-  const resp = await fetch(url, {
-    method,
-    headers,
-    ...(body !== undefined ? { body: body.toString() } : {}),
-    redirect: "follow",
-  });
+    log(`→ ${currentMethod} ${currentUrl}`);
 
-  mergeCookies(jar, parseCookies(resp.headers));
-  const text = await resp.text();
-  log(`← ${resp.status} ${resp.url} (${text.length} bytes)`);
-  return { status: resp.status, url: resp.url, text, headers: resp.headers };
+    const resp = await fetch(currentUrl, {
+      method: currentMethod,
+      headers: reqHeaders,
+      ...(needsBody && currentBody !== undefined ? { body: currentBody.toString() } : {}),
+      redirect: "manual",
+    });
+
+    // Merge Set-Cookie from every hop so session cookies set on redirects are captured.
+    mergeCookiesFromResponse(jar, resp.headers);
+
+    const isRedirect = resp.status >= 300 && resp.status < 400;
+    const location = isRedirect ? resp.headers.get("location") : null;
+
+    if (location !== null && redirectCount < MAX_REDIRECTS) {
+      // Resolve relative Location against the current URL.
+      currentUrl = new URL(location, currentUrl).toString();
+      redirectCount++;
+
+      // RFC 9110 redirect method rules:
+      // 303: always switch to GET.
+      // 301/302 after POST: switch to GET (common browser behaviour).
+      // 307/308: keep original method.
+      if (
+        resp.status === 303 ||
+        ((resp.status === 301 || resp.status === 302) && currentMethod === "POST")
+      ) {
+        currentMethod = "GET";
+        currentBody = undefined;
+      }
+
+      // Do NOT consume the body of a redirect response.
+      continue;
+    }
+
+    // Final response — consume body.
+    const text = await resp.text();
+    log(`← ${resp.status} ${currentUrl} (${text.length} bytes)`);
+    return { status: resp.status, url: currentUrl, text, headers: resp.headers };
+  }
 }
 
 // ── HTML parsing helpers ─────────────────────────────────────────────────────
@@ -411,6 +438,21 @@ export async function requestFreshMagicLinkUrl(webappUrl: string, email: string)
     "dashboard-link requires the SMTP sink to capture the URL; " +
       "the bootstrap SMTP sink (port 2525) must be running to intercept the email.",
   );
+}
+
+/**
+ * Check whether the current cookie jar holds a valid webapp session.
+ * Performs GET / and returns true if the final URL is NOT a /login page.
+ * Returns false when the server redirects to /login (session absent or expired).
+ */
+export async function hasValidSession(webappUrl: string, jar: CookieJar): Promise<boolean> {
+  const r = await doFetch("GET", webappUrl, jar);
+  try {
+    const finalPath = new URL(r.url).pathname;
+    return !finalPath.startsWith("/login");
+  } catch {
+    return false;
+  }
 }
 
 /** Create a fresh cookie jar. */
