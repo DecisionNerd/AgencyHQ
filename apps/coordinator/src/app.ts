@@ -31,6 +31,8 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { createBearerAuthMiddleware } from "./auth.ts";
 import type { CoordinatorConfig } from "./config.ts";
+import { buildReadiness } from "./readiness/build.ts";
+import type { ReadinessInputs, ReadinessResponse } from "./readiness/types.ts";
 import { buildAuthorityView } from "./views/authority-view.ts";
 import { buildDecisionsView } from "./views/decisions-view.ts";
 import { buildEvidenceView } from "./views/evidence-view.ts";
@@ -324,6 +326,13 @@ async function defaultLoadSnapshot(pool: PoolLike): Promise<LedgerSnapshot> {
 // Dependencies
 // ---------------------------------------------------------------------------
 
+/**
+ * Injectable loader for /api/readiness.
+ * Probes services and reads state files; returns the inputs for buildReadiness.
+ * In tests this is replaced with a stub that returns a fixed ReadinessInputs.
+ */
+export type ReadinessLoaderFn = () => Promise<ReadinessInputs>;
+
 export type AppDeps = {
   pool: PoolLike;
   flow: FlowLike;
@@ -333,6 +342,8 @@ export type AppDeps = {
   clock?: () => string; // ISO now; injectable for tests
   loadSnapshot?: LoadSnapshotFn;
   commands?: CommandsLike;
+  /** Readiness loader — probes services and reads state files. Injectable for tests. */
+  loadReadiness?: ReadinessLoaderFn;
 };
 
 // ---------------------------------------------------------------------------
@@ -349,6 +360,7 @@ export function createApp(deps: AppDeps): Hono {
     clock = () => new Date().toISOString(),
     loadSnapshot = defaultLoadSnapshot,
     commands,
+    loadReadiness,
   } = deps;
 
   const app = new Hono();
@@ -359,10 +371,47 @@ export function createApp(deps: AppDeps): Hono {
   app.use("/api/*", createBearerAuthMiddleware(config.apiToken));
 
   // ------------------------------------------------------------------
-  // GET /api/health
+  // GET /api/health — infra-only, unauthenticated (see auth.ts)
   // ------------------------------------------------------------------
   app.get("/api/health", (c) => {
     return c.json({ ok: true, at: clock() });
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/readiness — bearer-authenticated (same rule as all /api/*)
+  // Returns service/bootstrap/image/provider/worker readiness and a
+  // human-readable nextAction.  No secret values in the response.
+  // ------------------------------------------------------------------
+  app.get("/api/readiness", async (c): Promise<Response> => {
+    if (!loadReadiness) {
+      // No loader injected — return a minimal stub response so the route
+      // is always present even in test environments that do not need it.
+      const stub: ReadinessResponse = {
+        services: { database: "ok", trigger: "unconfigured" },
+        bootstrap: null,
+        image: null,
+        provider: "unknown",
+        worker: "unknown",
+        nextAction: "Bootstrap not started; run `docker compose up -d`",
+      };
+      return c.json(stub);
+    }
+    try {
+      const inputs = await loadReadiness();
+      const readiness = buildReadiness(inputs);
+      return c.json(readiness);
+    } catch {
+      // Any loader error → report services as down; never surface error internals.
+      const fallback: ReadinessResponse = {
+        services: { database: "down", trigger: "unconfigured" },
+        bootstrap: null,
+        image: null,
+        provider: "unknown",
+        worker: "unknown",
+        nextAction: "Readiness check failed; check coordinator logs",
+      };
+      return c.json(fallback, 503);
+    }
   });
 
   // ------------------------------------------------------------------

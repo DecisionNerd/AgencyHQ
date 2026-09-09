@@ -31,7 +31,7 @@ async function main(): Promise<void> {
     secretKey: requireEnv("TRIGGER_SECRET_KEY"),
   });
 
-  const handle = await tasks.trigger("spike.echo", { message: "hello" });
+  const handle = await tasks.trigger("runtime.probe", {});
   console.log(`Triggered run ${handle.id}`);
 
   const deadline = Date.now() + MAX_WAIT_MS;

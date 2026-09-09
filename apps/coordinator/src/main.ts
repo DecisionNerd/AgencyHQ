@@ -19,6 +19,7 @@ import { loadConfig } from "./config.ts";
 import { BoundedRepairFlow } from "./flow/bounded-repair.ts";
 import { Reconciler } from "./flow/observe.ts";
 import type { FlowDeps } from "./flow/types.ts";
+import { loadReadinessInputs } from "./readiness/loader.ts";
 
 // ---------------------------------------------------------------------------
 // Start
@@ -113,6 +114,15 @@ const commands = commandHandlers({
   },
 });
 
+// Wire the readiness loader — re-reads state files on every poll (lazy, no restart needed).
+const readinessLoader = () =>
+  loadReadinessInputs({
+    pool,
+    triggerApiUrl: config.triggerApiUrl,
+    triggerSecretKey: config.triggerSecretKey,
+    stateDir: config.stateDir,
+  });
+
 // Build and serve the app
 const app = createApp({
   pool,
@@ -128,6 +138,7 @@ const app = createApp({
   runtime,
   config,
   commands,
+  loadReadiness: readinessLoader,
 });
 
 const server = serve({

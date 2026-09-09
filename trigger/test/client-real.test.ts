@@ -419,7 +419,7 @@ test("subscribe() respects AbortSignal to stop iteration", async () => {
 test("live trigger roundtrip", { skip: !process.env.TRIGGER_LIVE }, async () => {
   // This test requires TRIGGER_LIVE=1 plus TRIGGER_API_URL and
   // TRIGGER_SECRET_KEY set in the environment.  It triggers the
-  // `spike.echo` task (registered in trigger/src/tasks/) and waits for
+  // `runtime.probe` task (registered in trigger/src/tasks/) and waits for
   // a non-QUEUED status.  Do not run it in CI.
   const { RealExecutionRuntime: RT } = await import("../src/client/real.ts");
 
@@ -431,8 +431,8 @@ test("live trigger roundtrip", { skip: !process.env.TRIGGER_LIVE }, async () => 
 
   const { runId } = await rt.trigger({
     intentId: "live-test-intent",
-    task: "spike.echo",
-    payload: { msg: "hello" },
+    task: "runtime.probe",
+    payload: {},
     options: { idempotencyKey: `live-test-${Date.now()}` },
   });
   assert.ok(runId, "should have a runId");
@@ -455,7 +455,7 @@ test("live subscribe: receives at least one observation for a triggered run", {
   skip: !process.env.TRIGGER_LIVE,
 }, async () => {
   // Requires TRIGGER_LIVE=1, TRIGGER_API_URL and TRIGGER_SECRET_KEY.
-  // Triggers spike.echo with a unique tag, subscribes, and expects at least
+  // Triggers runtime.probe with a unique tag, subscribes, and expects at least
   // one observation before timing out.  This is a wake-up hint test only —
   // the caller is expected to fall back to polling if needed.
   const { RealExecutionRuntime: RT } = await import("../src/client/real.ts");
@@ -477,8 +477,8 @@ test("live subscribe: receives at least one observation for a triggered run", {
   // Trigger a run with the unique tag after starting the subscription
   const { runId } = await rt.trigger({
     intentId: "live-subscribe-intent",
-    task: "spike.echo",
-    payload: { msg: "hello-subscribe" },
+    task: "runtime.probe",
+    payload: {},
     options: {
       idempotencyKey: `live-subscribe-${Date.now()}`,
       tags: [uniqueTag],

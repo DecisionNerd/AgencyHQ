@@ -1,9 +1,33 @@
-export type SpikeEchoPayload = {
-  message: string;
+/** Payload for the `runtime.probe` task (no required fields). */
+export type RuntimeProbePayload = Record<string, never>;
+
+/** Output of the `runtime.probe` task. */
+export type RuntimeProbeOutput = {
+  /** Tool version strings; "unavailable: <reason>" when the binary is not found. */
+  tools: {
+    git: string;
+    opencode: string;
+    pnpm: string;
+    node: string;
+  };
+  /** Current process uid (uid 1000 = node user in a container image). */
+  uid: string;
+  /** Value of process.env.HOME. */
+  home: string;
+  /** Whether HOME is writable (create-and-remove temp file test). */
+  homeWritable: boolean;
+  /** Whether AGENCYHQ_RUN_ROOT is writable (create-and-remove temp file test). */
+  runRootWritable: boolean;
+  /** "platform/arch" string, e.g. "linux/arm64". */
+  platform: string;
+  /** process.cwd() at task start. */
+  cwd: string;
+  /** Sorted env var names (keys only — no values are returned). */
+  envKeys: string[];
 };
 
 export const TASK_IDS = {
-  spikeEcho: "spike.echo",
+  runtimeProbe: "runtime.probe",
   workerAttempt: "worker.attempt",
 } as const;
 

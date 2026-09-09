@@ -24,6 +24,13 @@ const DEFAULT_LEAD_VARIANT = "low";
 
 export const leadAccept = task({
   id: "lead.accept",
+  // small-2x: acceptance runs one OpenCode serve session with criteria and
+  // verification results in context. MachinePresetName verified from
+  // schemas/common.d.ts (read 2026-09-09):
+  //   node_modules/.pnpm/@trigger.dev+core@4.5.16_supports-color@10.2.2/
+  //   node_modules/@trigger.dev/core/dist/commonjs/v3/schemas/common.d.ts
+  // machine field on task verified from types/tasks.d.ts (read 2026-09-09).
+  machine: "small-2x",
   maxDuration: 300,
   queue: { name: "lead", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },
