@@ -80,6 +80,7 @@ export const leadPlan = task({
       "low";
 
     // v2 path: materialize source from coordinator bundle.
+    // Delegates to runLeadPlanV2WithBroker (single code path — X4-2).
     if (isV2LeadPlanPayload(payload)) {
       const coordinatorUrl =
         process.env.AGENCYHQ_COORDINATOR_INTERNAL_URL ??
@@ -91,115 +92,26 @@ export const leadPlan = task({
         (() => {
           throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
         })();
-      // X3-6 / W-6: lead-plan intents have attempt_id NULL; use workItemId (not
-      // attemptId) in the lease request per the shared contract. Purpose "review"
-      // gives a bearer token usable for source download. Fail loudly if refused —
-      // no silent empty token that allows source download without authentication.
       const broker = createBroker(coordinatorUrl);
-      let uploadToken = "";
-      if (payload.leaseNonce) {
-        const leaseResult = await broker.requestLease({
-          runId,
-          workItemId: payload.workItemId,
-          generation: 0,
-          purpose: "review",
-          nonce: payload.leaseNonce,
-        });
-        if (!leaseResult.ok) {
-          throw new AbortTaskRunError(
-            `lead.plan: lease refused: ${leaseResult.refusal.reason} — cannot proceed without source access`,
-          );
-        }
-        if (leaseResult.grant.material.purpose === "review") {
-          uploadToken = leaseResult.grant.material.token;
-        }
-      }
 
-      // tempParent holds src/ subdir and the lead-runs/ subdir for the session.
-      const tempParent = join(runRoot, "runs", `lead-${payload.workItemId}-${runId}`);
-      const cloneDir = join(tempParent, "src");
-
-      const sourceResult = await materializeSource({
-        source: payload.source,
-        dir: cloneDir,
-        broker,
-        token: uploadToken,
+      const output = await runLeadPlanV2WithBroker(payload, runId, broker, runRoot, {
+        variant,
+        onPhase: (phase) => metadata.set("phase", phase),
       });
 
-      if (!sourceResult.ok) {
-        throw new AbortTaskRunError(
-          `lead.plan source materialization failed: ${sourceResult.failureKind}`,
-        );
-      }
-
-      const clonedDir = sourceResult.clonedDir;
-      metadata.set("phase", "source_materialized");
-
-      // Synthesize a v1-compatible payload for runLeadPlanCore.
-      const v1Payload: LeadPlanPayload = {
-        ...payload,
-        payloadVersion: 1 as const,
-        repoPath: clonedDir,
-        worktreeBase: tempParent,
-      };
-
-      try {
-        const output = await runLeadPlanCore({
-          payload: v1Payload,
-          runId,
-          env,
-          ruleset,
-          schema,
-          leadPromptFn: (input) =>
-            leadPrompt({
-              ...input,
-              variant: typeof variant === "string" ? variant : undefined,
-            }),
-          // v2: clone is already at baseRevision; no worktree needed.
-          worktreeAdd: async () => {},
-          worktreeRemove: async () => {},
-          gitLsFiles: async ({ limit }) => {
-            const { stdout } = await execFileAsync("git", ["ls-files"], {
-              cwd: clonedDir,
-              maxBuffer: 16 * 1024 * 1024,
-            });
-            return stdout.trim().split("\n").filter(Boolean).slice(0, limit);
-          },
-          readFile: async (path) => {
-            try {
-              return await readFile(path, "utf8");
-            } catch {
-              return undefined;
-            }
-          },
-          buildPrompt: (p, repoContext) => buildLeadPlanPrompt(p, repoContext),
-          parseOutput: (raw) => {
-            const result = parseWithSchema(LeadPlanOutputSchema, raw);
-            if (result.ok) return result.value;
-            throw new Error(`LeadPlanOutputSchema parse failed: ${result.reason}`);
-          },
-          onPhase: (phase) => metadata.set("phase", phase),
-          timeoutMs: 270_000,
-          // Override worktree path: lead session runs in the clone dir.
-          worktreePath: clonedDir,
+      if (output.kind === "invalid_output") {
+        const syntheticEvent = { type: "error", error: { message: output.reason } };
+        const capacity = classifyCapacity([syntheticEvent], {
+          provider: providerFromModel(payload.model),
+          model: payload.model,
+          now: new Date(),
         });
-
-        if (output.kind === "invalid_output") {
-          const syntheticEvent = { type: "error", error: { message: output.reason } };
-          const capacity = classifyCapacity([syntheticEvent], {
-            provider: providerFromModel(payload.model),
-            model: payload.model,
-            now: new Date(),
-          });
-          if (capacity !== null) {
-            metadata.set("capacity", capacity);
-          }
+        if (capacity !== null) {
+          metadata.set("capacity", capacity);
         }
-
-        return output;
-      } finally {
-        await rm(tempParent, { recursive: true, force: true }).catch(() => undefined);
       }
+
+      return output;
     }
 
     // v1 path: host filesystem paths.
@@ -289,7 +201,7 @@ export async function runLeadPlanV2WithBroker(
   runId: string,
   broker: Broker,
   runRoot: string,
-  opts?: { variant?: string },
+  opts?: { variant?: string; onPhase?: (phase: string) => void },
 ): Promise<LeadPlanOutput> {
   const variant = opts?.variant ?? process.env.AGENCYHQ_LEAD_VARIANT ?? "low";
   const env = scrubbedChildEnv({ attemptId: `lead-${payload.workItemId}` });
@@ -332,6 +244,7 @@ export async function runLeadPlanV2WithBroker(
   }
 
   const clonedDir = sourceResult.clonedDir;
+  opts?.onPhase?.("source_materialized");
 
   const v1Payload: LeadPlanPayload = {
     ...payload,
@@ -374,7 +287,7 @@ export async function runLeadPlanV2WithBroker(
         if (result.ok) return result.value;
         throw new Error(`LeadPlanOutputSchema parse failed: ${result.reason}`);
       },
-      onPhase: () => {},
+      onPhase: opts?.onPhase ?? (() => {}),
       timeoutMs: 270_000,
       worktreePath: clonedDir,
     });

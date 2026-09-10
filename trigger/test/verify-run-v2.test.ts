@@ -10,6 +10,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,11 +34,15 @@ async function makeTmpDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), "agencyhq-verify-v2-"));
 }
 
-/** Create a real git repo at baseRevision + a commit on top (attemptRevision). */
+/** Create a real git repo at baseRevision + a commit on top (attemptRevision).
+ * Also computes the diffDigest (sha256 of `git diff baseRevision` at HEAD=attemptRevision)
+ * so tests can pass a matching digest to runVerifyV2WithBroker and get diffDigestMatches:true.
+ */
 async function makeSourceRepo(): Promise<{
   bundleBytes: Buffer;
   baseRevision: string;
   attemptRevision: string;
+  diffDigest: string;
 }> {
   const repoDir = await makeTmpDir();
   await execFileAsync("git", ["init", repoDir]);
@@ -55,13 +60,20 @@ async function makeSourceRepo(): Promise<{
   const { stdout: attOut } = await execFileAsync("git", ["-C", repoDir, "rev-parse", "HEAD"]);
   const attemptRevision = attOut.trim();
 
+  // Compute diffDigest the same way trigger/src/lib/git.ts#diffDigest does:
+  // sha256(git diff baseRevision) with HEAD=attemptRevision, no untracked files.
+  const { stdout: diffOut } = await execFileAsync("git", ["-C", repoDir, "diff", baseRevision]);
+  const hash = createHash("sha256");
+  hash.update(diffOut);
+  const diffDigest = `sha256:${hash.digest("hex")}`;
+
   // Bundle the full repo (both revisions)
   const bundlePath = join(repoDir, "source.bundle");
   await execFileAsync("git", ["-C", repoDir, "bundle", "create", bundlePath, "--all"]);
   const { readFile } = await import("node:fs/promises");
   const bundleBytes = await readFile(bundlePath);
   await rm(repoDir, { recursive: true, force: true });
-  return { bundleBytes, baseRevision, attemptRevision };
+  return { bundleBytes, baseRevision, attemptRevision, diffDigest };
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +220,12 @@ test("verify-run v2: runVerification with worktreePath override uses clone dir",
 
 test("verify-run v2 W-15: runVerifyV2WithBroker materializes manifest sibling source via broker", async () => {
   // Create two repos: main (with base + attempt commits) and sibling.
-  const { bundleBytes: mainBundleBytes, baseRevision, attemptRevision } = await makeSourceRepo();
+  const {
+    bundleBytes: mainBundleBytes,
+    baseRevision,
+    attemptRevision,
+    diffDigest: realDiffDigest,
+  } = await makeSourceRepo();
 
   // Sibling repo (single commit).
   const siblingDir = await makeTmpDir();
@@ -245,7 +262,7 @@ test("verify-run v2 W-15: runVerifyV2WithBroker materializes manifest sibling so
     source: { projectId: "proj-main-w15", revision: attemptRevision, bundlePath: "source.bundle" },
     baseRevision,
     attemptRevision,
-    diffDigest: `sha256:${"d".repeat(64)}`,
+    diffDigest: realDiffDigest,
     checks: [],
     manifest: (() => {
       const entries = [
@@ -274,26 +291,32 @@ test("verify-run v2 W-15: runVerifyV2WithBroker materializes manifest sibling so
   };
 
   try {
-    await runVerifyV2WithBroker(payload, "run-w15", broker, runRoot, runner);
-  } catch {
-    // Verification may fail due to diffDigest mismatch in the real diff computation;
-    // the important thing is the broker calls happened (source materializations).
+    const output = await runVerifyV2WithBroker(payload, "run-w15", broker, runRoot, runner);
+
+    // The sibling was materialized: both source bundles were downloaded (W-15).
+    const downloadCalls = broker.calls.filter((c) => c.op === "downloadSourceBundle");
+    assert.equal(
+      downloadCalls.length,
+      2,
+      "both main and sibling source bundles must be downloaded (W-15)",
+    );
+    const projectIds = downloadCalls.map((c) => {
+      if (c.op === "downloadSourceBundle") return c.projectId;
+      return "";
+    });
+    assert.ok(projectIds.includes("proj-main-w15"), "main source bundle downloaded");
+    assert.ok(projectIds.includes("proj-sibling-w15"), "sibling source bundle downloaded (W-15)");
+
+    // The profile result was reported: results array returned.
+    assert.ok(Array.isArray(output.results), "output.results must be an array");
+
+    // diffDigest from real git diff matches → diffDigestMatches: true.
+    assert.equal(
+      output.integrity.diffDigestMatches,
+      true,
+      "diffDigestMatches must be true when real diffDigest is used",
+    );
   } finally {
     await rm(runRoot, { recursive: true, force: true });
   }
-
-  // Assert both source bundles were downloaded: main + sibling (W-15).
-  const downloadCalls = broker.calls.filter((c) => c.op === "downloadSourceBundle");
-  assert.equal(
-    downloadCalls.length,
-    2,
-    "both main and sibling source bundles must be downloaded (W-15)",
-  );
-
-  const projectIds = downloadCalls.map((c) => {
-    if (c.op === "downloadSourceBundle") return c.projectId;
-    return "";
-  });
-  assert.ok(projectIds.includes("proj-main-w15"), "main source bundle downloaded");
-  assert.ok(projectIds.includes("proj-sibling-w15"), "sibling source bundle downloaded (W-15)");
 });

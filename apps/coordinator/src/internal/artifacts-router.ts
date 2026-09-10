@@ -126,15 +126,19 @@ async function findSourceLease(
 ): Promise<boolean> {
   const tokenHash = sha256Hex(bearerToken);
   const result = await client.query(
+    // A lease is keyed by an attempt id, or — for attempt-less lead.plan intents —
+    // by the dispatch intent id (X4-1); either must resolve to the requested project.
     `SELECT l.id
        FROM leases l
-       JOIN attempts a ON a.id = l.attempt_id
-       JOIN step_contracts sc ON sc.id = a.contract_id
+       LEFT JOIN attempts a ON a.id = l.attempt_id
+       LEFT JOIN step_contracts sc ON sc.id = a.contract_id
+       LEFT JOIN dispatch_intents di ON di.id = l.attempt_id AND di.attempt_id IS NULL
+       LEFT JOIN work_items wi ON di.idempotency_key LIKE 'leadplan:' || wi.id || ':%'
       WHERE l.token_hash = $1
         AND l.purpose IN ('upload', 'review')
         AND l.revoked_at IS NULL
         AND l.expires_at > now()
-        AND sc.project_id = $2
+        AND (sc.project_id = $2 OR wi.project_id = $2)
       LIMIT 1`,
     [tokenHash, projectId],
   );

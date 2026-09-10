@@ -69,9 +69,9 @@ Time-bounded credential grants issued to worker containers (migration
 | `attempt_id` | text FK → `attempts` | The attempt this lease is scoped to. |
 | `generation` | int | The authority generation for which the lease was issued. |
 | `run_id` | text | Trigger run id of the requesting container. |
-| `purpose` | enum | `provider`, `git-read`, `integrate`, `upload`. |
+| `purpose` | enum | `provider`, `git-read`, `integrate`, `upload`, `review`. |
 | `nonce_hash` | text | SHA-256 hex of the worker's lease request nonce. |
-| `token_hash` | text | SHA-256 hex of the upload bearer token (upload leases only). |
+| `token_hash` | text | SHA-256 hex of the bearer token handed out with `upload` and `review` leases. |
 | `issued_at` | timestamptz | Insertion timestamp. |
 | `expires_at` | timestamptz | Hard expiry; not renewable. |
 | `used_at` | timestamptz | Reserved; `markLeaseUsed` has no callers (not set in current code). |
@@ -92,6 +92,9 @@ starts. The raw nonce is never stored; only its SHA-256 hash.
   repository.
 - `integrate` — same shape as `git-read`, TTL is `AGENCYHQ_INTEGRATE_LEASE_TTL_MS`
   (default 5 min) rather than the standard TTL.
+- `review` — `token`: random 32-byte hex (download only: source bundles and
+  verified attempt bundles). Issued to lead.plan (attempt-less intents, keyed by
+  the dispatch intent id), lead.review and integrate. No provider or git material.
 - `upload` — `token`: random 32-byte hex; SHA-256 stored in `token_hash` for
   bearer-token lookup on artifact/stop-evidence routes.
 

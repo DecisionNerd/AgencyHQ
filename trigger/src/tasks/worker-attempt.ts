@@ -509,7 +509,9 @@ async function runV2(payload: WorkerAttemptPayloadV2, params: any): Promise<Work
   const runRoot = requireEnv("AGENCYHQ_RUN_ROOT");
 
   const broker = createBroker(coordinatorUrl);
-  return runWorkerAttemptV2WithBroker(payload, ctx.run.id, signal, broker, runRoot, nonce);
+  return runWorkerAttemptV2WithBroker(payload, ctx.run.id, signal, broker, runRoot, nonce, {
+    maxDurationSeconds: ctx.run.maxDuration ?? 600,
+  });
 }
 
 /**
@@ -525,6 +527,7 @@ export async function runWorkerAttemptV2WithBroker(
   broker: Broker,
   runRoot: string,
   nonceOverride?: string,
+  opts: { maxDurationSeconds?: number } = {},
 ): Promise<WorkerAttemptOutput> {
   const nonce = nonceOverride ?? payload.leaseNonce;
   if (nonce === undefined) {
@@ -642,7 +645,8 @@ export async function runWorkerAttemptV2WithBroker(
     };
     signal.addEventListener("abort", onAbort, { once: true });
 
-    const maxDurationSeconds = 600;
+    // The run's maxDuration (per-run override) drives the soft deadline (X4-5).
+    const maxDurationSeconds = opts.maxDurationSeconds ?? 600;
     const softDeadlineMs =
       Math.max(SOFT_DEADLINE_MIN_SECONDS, maxDurationSeconds - SOFT_DEADLINE_MARGIN_SECONDS) * 1000;
     const softTimer = setTimeout(() => {

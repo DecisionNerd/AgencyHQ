@@ -351,6 +351,100 @@ test("P1: source bundle download — mirror mode, valid upload token → 200 bun
 });
 
 // ---------------------------------------------------------------------------
+// P16 (X4-1): a review lease issued to an attempt-less lead.plan intent
+// authorizes the source download for its project, and only for its project.
+// ---------------------------------------------------------------------------
+
+test("P16: lead.plan review token downloads the project's source bundle (and no other project's)", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL not set");
+    return;
+  }
+
+  const gitRoot = await mkdtemp(join(tmpdir(), "ahq-pe-gr-"));
+  const base = await makeBaseRepo();
+
+  const schema = `ahq_pe_p16_${process.pid}_${Date.now()}`;
+  const directPool = new pg.Pool({ connectionString: DATABASE_URL });
+  const directClient = await directPool.connect();
+
+  try {
+    await directClient.query(`CREATE SCHEMA ${pg.escapeIdentifier(schema)}`);
+    await runMigrations(directClient, { schema });
+    await directClient.query(`SET search_path TO ${pg.escapeIdentifier(schema)}, public`);
+
+    const projectId = await seedMirrorProject(directClient, `file://${base.repoPath}`);
+    const wiId = await seedWorkItem(directClient, projectId);
+    const otherProjectId = await seedMirrorProject(directClient, `file://${base.repoPath}`);
+
+    // Attempt-less lead.plan intent (as the flow inserts it) keyed by its work item.
+    const intentId = `di_${randomBytes(8).toString("hex")}`;
+    await directClient.query(
+      `INSERT INTO dispatch_intents
+         (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+       VALUES ($1, 'lead.plan', 'digest', NULL, 'triggered', $2, $3, $4)`,
+      [
+        intentId,
+        `run_${randomBytes(4).toString("hex")}`,
+        `leadplan:${wiId}:${intentId}`,
+        createHash("sha256").update(randomBytes(32)).digest("hex"),
+      ],
+    );
+
+    // Review lease stored the way the broker stores lead.plan leases: keyed by the intent id.
+    const reviewToken = randomBytes(32).toString("hex");
+    await issueLease(directClient as unknown as import("pg").PoolClient, {
+      id: `lease_${randomBytes(8).toString("hex")}`,
+      attempt_id: intentId,
+      generation: 0,
+      run_id: `run_${randomBytes(4).toString("hex")}`,
+      purpose: "review",
+      nonce_hash: createHash("sha256").update(randomBytes(32)).digest("hex"),
+      token_hash: createHash("sha256").update(reviewToken, "utf-8").digest("hex"),
+      expires_at: new Date(Date.now() + 60_000),
+    });
+
+    await ensureMirror({ id: projectId, remote: `file://${base.repoPath}` }, { gitRoot });
+    await ensureMirror({ id: otherProjectId, remote: `file://${base.repoPath}` }, { gitRoot });
+
+    const schemaPool = makeSchemaPool(DATABASE_URL, schema);
+    const app = createApp({
+      pool: schemaPool as never,
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(gitRoot),
+    });
+
+    const ok = await app.request(`/internal/source/${projectId}?rev=${base.baseRev}`, {
+      headers: { Authorization: `Bearer ${reviewToken}` },
+    });
+    assert.equal(
+      ok.status,
+      200,
+      `lead.plan review token must download its project's source, got ${ok.status}`,
+    );
+    assert.ok(Buffer.from(await ok.arrayBuffer()).length > 0, "bundle body must be non-empty");
+
+    const other = await app.request(`/internal/source/${otherProjectId}?rev=${base.baseRev}`, {
+      headers: { Authorization: `Bearer ${reviewToken}` },
+    });
+    assert.equal(
+      other.status,
+      403,
+      `token must not authorize another project, got ${other.status}`,
+    );
+
+    await schemaPool.end();
+  } finally {
+    directClient.release();
+    await directPool.end();
+    await rm(gitRoot, { recursive: true, force: true });
+    await rm(base.repoPath, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // P2 + P3: Artifact upload → verified=true; stop evidence → DB row
 // ---------------------------------------------------------------------------
 

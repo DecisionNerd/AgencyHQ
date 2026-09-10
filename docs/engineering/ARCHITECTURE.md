@@ -216,9 +216,9 @@ use `/api/*` routes with the operator bearer token; they never call `/internal/*
 | Route | Auth mechanism | Purpose |
 | --- | --- | --- |
 | `POST /internal/leases` | Dispatch nonce in request body | Request a credential lease (provider, review, integrate, upload). Refused with `run_pending` (409) if the worker.attempt intent exists but run_id is not yet written. |
-| `GET /internal/source/:projectId?rev=<sha>` | Upload lease bearer token | Download a source git bundle from the coordinator mirror. |
+| `GET /internal/source/:projectId?rev=<sha>` | Upload or review lease bearer token (review tokens are issued to lead.plan, lead.review and integrate) | Download a source git bundle from the coordinator mirror. |
 | `POST /internal/attempts/:id/artifacts` | Upload lease bearer token (token_hash lookup) | Upload an attempt artifact bundle. |
-| `GET /internal/attempts/:id/artifacts/:generation/bundle` | Upload lease bearer token | Download a verified artifact bundle from the coordinator mirror. |
+| `GET /internal/attempts/:id/artifacts/:generation/bundle` | Upload or review lease bearer token | Download a verified artifact bundle from the coordinator mirror. |
 | `POST /internal/attempts/:id/checkpoints` | Upload lease bearer token | Upload a checkpoint artifact bundle (empty `changedPaths` permitted). |
 | `POST /internal/attempts/:id/stop-evidence` | Upload lease bearer token | Upload structured stop-sequence evidence. |
 
