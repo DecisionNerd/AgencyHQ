@@ -117,6 +117,7 @@ const reconciler = new Reconciler(flowDeps, flow, {
 reconciler.start(config.reconcileIntervalMs);
 
 // Construct command handlers (workerModel required for approve command evaluation)
+// W-15 / E9: include gitRoot and secretsKey for import_host_project / revert_import.
 const commands = commandHandlers({
   pool,
   runtime,
@@ -126,6 +127,8 @@ const commands = commandHandlers({
     worktreeBase: config.worktreeBase,
     uncertainAfterMs: config.uncertainAfterMs,
   },
+  gitRoot: config.gitRoot ?? `${config.worktreeBase}/git`,
+  secretsKey: config.secretsKey,
 });
 
 // Provider state helper — derive required provider ids from worker/lead models.

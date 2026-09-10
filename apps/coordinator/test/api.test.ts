@@ -535,6 +535,8 @@ describe("POST /api/commands kind=approve — field validation", () => {
       setMainEffort: async () => ({ ok: true }),
       setWorkItemRank: async () => ({ ok: true }),
       updateAuthority: async () => ({ ok: true, version: "2" }),
+      importHostProject: async () => ({ ok: true }),
+      revertImport: async () => ({ ok: true }),
     };
   }
 
@@ -898,6 +900,8 @@ describe("POST /api/commands kind=disposition — field validation", () => {
       setMainEffort: async () => ({ ok: true }),
       setWorkItemRank: async () => ({ ok: true }),
       updateAuthority: async () => ({ ok: true, version: "2" }),
+      importHostProject: async () => ({ ok: true }),
+      revertImport: async () => ({ ok: true }),
     };
   }
 

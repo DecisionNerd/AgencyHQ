@@ -89,10 +89,13 @@ export async function stopAttempt(
       }
       newGeneration = revoke.generation;
 
-      // Revoke all leases for the old generation (D4 / W-2).
-      // revokeLeasesBelowGeneration uses generation < newGeneration, so it covers
-      // all leases issued for the attempt before this stop.
-      await revokeLeasesBelowGeneration(client, attemptId, newGeneration);
+      // Revoke provider and integrate leases for the old generation (D4 / W-2 / E1).
+      // Upload leases are kept so the container can still send stop evidence and
+      // checkpoints after the stop (revokeLeasesBelowGeneration purpose filter).
+      await revokeLeasesBelowGeneration(client, attemptId, newGeneration, [
+        "provider",
+        "integrate",
+      ]);
 
       // Insert a Decision row recording the stop
       await insertDecision(client, {

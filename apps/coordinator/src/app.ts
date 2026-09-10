@@ -160,6 +160,9 @@ export type CommandsLike = {
     authority: unknown;
     actor: string;
   }): Promise<unknown>;
+  // W-15 / E9: import_host_project and revert_import
+  importHostProject(input: { commandId: string; projectId: string }): Promise<unknown>;
+  revertImport(input: { commandId: string; projectId: string }): Promise<unknown>;
 };
 
 // ---------------------------------------------------------------------------
@@ -1881,6 +1884,25 @@ export function createApp(deps: AppDeps): Hono {
           return c.json({ error: "authority object required for update_authority" }, 400);
         }
         const result = await commands.updateAuthority({ commandId, projectId, authority, actor });
+        return c.json({ commandId, result }, 200);
+      }
+
+      // W-15 / E9: import_host_project and revert_import
+      if (kind === "import_host_project") {
+        const projectId = body.projectId;
+        if (!projectId || typeof projectId !== "string") {
+          return c.json({ error: "projectId required for import_host_project" }, 400);
+        }
+        const result = await commands.importHostProject({ commandId, projectId });
+        return c.json({ commandId, result }, 200);
+      }
+
+      if (kind === "revert_import") {
+        const projectId = body.projectId;
+        if (!projectId || typeof projectId !== "string") {
+          return c.json({ error: "projectId required for revert_import" }, 400);
+        }
+        const result = await commands.revertImport({ commandId, projectId });
         return c.json({ commandId, result }, 200);
       }
 

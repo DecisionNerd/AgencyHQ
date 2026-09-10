@@ -147,6 +147,41 @@ export async function diffDigest(args: { worktreePath: string; baseRev: string }
   return `sha256:${hash.digest("hex")}`;
 }
 
+/**
+ * Compute the diff digest for a committed revision against a base.
+ *
+ * E6 / W-9: used for checkpoint artifacts so the worker sends a real diff
+ * digest (not "sha256:") that the coordinator can verify after import.
+ * Empty diff → digest of the empty string, same as diffDigest for an empty worktree.
+ */
+export async function commitDiffDigest(
+  repoPath: string,
+  baseRev: string,
+  headRev: string,
+): Promise<string> {
+  const diffResult = await git(["diff", baseRev, headRev], { cwd: repoPath });
+  const hash = createHash("sha256");
+  hash.update(diffResult.stdout);
+  return `sha256:${hash.digest("hex")}`;
+}
+
+/**
+ * List changed paths between two commits.
+ *
+ * E6 / W-9: used for checkpoint artifacts.
+ */
+export async function commitChangedPaths(
+  repoPath: string,
+  baseRev: string,
+  headRev: string,
+): Promise<string[]> {
+  const result = await git(["diff", "--name-only", baseRev, headRev], { cwd: repoPath });
+  return result.stdout
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .sort();
+}
+
 // ---------------------------------------------------------------------------
 // Credential scrubbing and push-failure classification
 // ---------------------------------------------------------------------------

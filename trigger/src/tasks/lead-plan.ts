@@ -90,9 +90,23 @@ export const leadPlan = task({
         (() => {
           throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
         })();
-      const uploadToken = process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
-
+      // E2 / W-6: request an upload lease using the nonce from the payload.
+      // ctx.run.id (captured as runId above) is the only correct run ID.
       const broker = createBroker(coordinatorUrl);
+      let uploadToken = "";
+      if (payload.leaseNonce) {
+        const leaseResult = await broker.requestLease({
+          runId,
+          attemptId: payload.workItemId,
+          generation: 0,
+          purpose: "upload",
+          nonce: payload.leaseNonce,
+        });
+        if (leaseResult.ok && leaseResult.grant.material.purpose === "upload") {
+          uploadToken = leaseResult.grant.material.token;
+        }
+      }
+
       // tempParent holds src/ subdir and the lead-runs/ subdir for the session.
       const tempParent = join(runRoot, "runs", `lead-${payload.workItemId}-${runId}`);
       const cloneDir = join(tempParent, "src");

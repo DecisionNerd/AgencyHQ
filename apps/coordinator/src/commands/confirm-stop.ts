@@ -57,25 +57,32 @@ export async function readStopEvidenceDbFirst(
     const row = rows.find((r) => r.generation === generation);
     if (!row) return null;
 
-    // Parse steps to extract survivors and checkpointCommit
-    const steps = Array.isArray(row.steps)
-      ? (row.steps as Array<{ step: string; detail?: string }>)
-      : [];
+    // Parse steps to extract survivors and checkpointCommit (E4 / X2-4).
+    // survivors and checkpointCommit are forwarded 1:1 by the collector; read
+    // them directly from the step row rather than deriving from step presence.
+    type StoredStep = {
+      step: string;
+      detail?: string;
+      survivors?: number[];
+      checkpointCommit?: string;
+    };
+    const steps = Array.isArray(row.steps) ? (row.steps as StoredStep[]) : [];
     const uploadDone = steps.some((s) => s.step === "upload_done");
     const aborted = steps.some((s) => s.step === "aborted");
     const processDied = steps.some(
       (s) => s.step === "process_exited" || s.step === "survivor_scan",
     );
 
-    // survivors = [] means clean stop; non-empty means survivors present
-    // We derive from the presence of 'aborted' or 'survivor_scan' steps
-    const survivors: number[] = aborted ? [1] : [];
-
-    // Look for checkpointCommit in checkpoint_committed step detail
-    const cpStep = steps.find((s) => s.step === "checkpoint_committed");
-    const checkpointCommit = cpStep?.detail;
-
     if (!uploadDone && !aborted && !processDied) return null;
+
+    // Read survivors from the stop_done step's survivors field.
+    const stopDoneStep = steps.find((s) => s.step === "stop_done");
+    const survivors: number[] =
+      stopDoneStep?.survivors !== undefined ? stopDoneStep.survivors : aborted ? [1] : [];
+
+    // Read checkpointCommit from checkpoint/checkpoint_committed step fields.
+    const cpStep = steps.find((s) => s.step === "checkpoint_committed" || s.step === "checkpoint");
+    const checkpointCommit = cpStep?.checkpointCommit ?? cpStep?.detail;
 
     const result: StopFileEvidence = { survivors };
     if (checkpointCommit) {

@@ -40,7 +40,8 @@ const execFileAsync = promisify(execFileCb);
 // ---------------------------------------------------------------------------
 
 export interface ImportDeps extends CommandDeps {
-  gitRoot: string;
+  /** Root directory for git mirrors. Defaults to worktreeBase/git when absent. */
+  gitRoot?: string | undefined;
   /** 64-hex AES-256 key for decrypting project_credentials; optional for public remotes. */
   secretsKey?: string | undefined;
 }
@@ -82,6 +83,18 @@ export async function importHostProject(
       };
     }
 
+    // gitRoot is required at runtime (optional in type for test stub convenience).
+    if (!deps.gitRoot) {
+      const result = {
+        ok: false as const,
+        reason: "mirror_failed" as const,
+        detail: "gitRoot not configured",
+      };
+      await completeCommand(client, commandId, result);
+      return result;
+    }
+    const gitRoot = deps.gitRoot;
+
     // 2. Load the project
     const project = await getProject(client, projectId);
     if (!project) {
@@ -122,7 +135,7 @@ export async function importHostProject(
     try {
       mirrorRef = await ensureMirror(
         { id: projectId, remote: project.remote },
-        { gitRoot: deps.gitRoot, askpassToken },
+        { gitRoot, askpassToken },
       );
     } catch (err) {
       const detail = (err as Error).message;
@@ -143,7 +156,7 @@ export async function importHostProject(
 
     // 3. Re-read allowed_refs from the mirror (W-15).
     // List all refs/heads/* in the bare mirror; store short names (e.g. "main").
-    const mp = getMirrorPath(deps.gitRoot, projectId);
+    const mp = getMirrorPath(gitRoot, projectId);
     let allowedRefs: string[] | null = null;
     try {
       const { stdout } = await execFileAsync(

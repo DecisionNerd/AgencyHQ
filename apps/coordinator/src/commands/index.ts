@@ -40,13 +40,15 @@ import { confirmStop } from "./confirm-stop.ts";
 import { createWorkItem } from "./create-work-item.ts";
 import type { DispositionDeps } from "./disposition.ts";
 import { dispositionFinding } from "./disposition.ts";
+import type { ImportDeps } from "./import-host-project.ts";
+import { importHostProject, revertImport } from "./import-host-project.ts";
 import { invalidateAcceptance } from "./invalidate-acceptance.ts";
 import { pauseWorkItem, resumeWorkItem } from "./pause.ts";
 import { rejectWorkItem } from "./reject.ts";
 import { stopAttempt } from "./stop.ts";
 import { updateAuthority } from "./update-authority.ts";
 
-export function commandHandlers(deps: ApproveDeps & DispositionDeps) {
+export function commandHandlers(deps: ApproveDeps & DispositionDeps & ImportDeps) {
   return {
     stop: (input: Parameters<typeof stopAttempt>[1]) => stopAttempt(deps, input),
     confirmStop: (
@@ -70,5 +72,9 @@ export function commandHandlers(deps: ApproveDeps & DispositionDeps) {
     setMainEffort: (input: Parameters<typeof setMainEffort>[1]) => setMainEffort(deps, input),
     setWorkItemRank: (input: Parameters<typeof setWorkItemRank>[1]) => setWorkItemRank(deps, input),
     updateAuthority: (input: Parameters<typeof updateAuthority>[1]) => updateAuthority(deps, input),
+    // W-15 / E9: import_host_project and revert_import commands (W-15)
+    importHostProject: (input: Parameters<typeof importHostProject>[1]) =>
+      importHostProject(deps, input),
+    revertImport: (input: Parameters<typeof revertImport>[1]) => revertImport(deps, input),
   };
 }

@@ -90,8 +90,11 @@ export function validateStopEvidenceAdmission(
   // 5. Lease must reference the same attempt
   if (lease.attemptId !== attempt.id) return err("ATTEMPT_MISMATCH");
 
-  // 6. Generation must match exactly (not stale, not future)
-  if (generation !== attempt.currentGeneration) return err("GENERATION_MISMATCH");
+  // 6. Generation check (E1 / X2-1):
+  // Stop evidence is accepted when generation equals the lease's generation, even
+  // when the attempt's current generation is newer (the stop bumped the generation
+  // but kept upload leases so the container can still upload stop evidence).
+  if (generation !== lease.generation) return err("GENERATION_MISMATCH");
 
   // 7. Steps must not be empty
   if (steps.length === 0) return err("STEPS_EMPTY");

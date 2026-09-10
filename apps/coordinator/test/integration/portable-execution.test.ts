@@ -438,7 +438,8 @@ test("P2+P3: artifact upload (verified=true) + stop evidence via HTTP", async (t
 
     // Assert ref exists in mirror
     const mp = mirrorPath(gitRoot, projectId);
-    const ref = `refs/agencyhq/attempts/${attemptId}/g0`;
+    // X2-8: ref name includes kind segment.
+    const ref = `refs/agencyhq/attempts/${attemptId}/g0/attempt`;
     const refSha = await git(["rev-parse", ref], mp);
     assert.equal(refSha, commitId, "ref in mirror must point to worker commit");
 
@@ -535,7 +536,8 @@ test("P4: wrong upload token → 401 on artifact upload", async (t) => {
       body: new Uint8Array(100),
     });
 
-    assert.ok(res.status === 401 || res.status === 422, `expected 401/422, got ${res.status}`);
+    // E10 / W-16: wrong token must return exactly 401 (not 422).
+    assert.equal(res.status, 401, `expected 401, got ${res.status}`);
 
     await schemaPool.end();
   });
@@ -1038,6 +1040,16 @@ test("P9: dispatch_nonce_hash set in DB for mirror dispatch; payload leaseNonce 
         assert.ok(
           !payloadStr.includes(forbidden),
           `mirror worker payload must not contain '${forbidden}'`,
+        );
+      }
+
+      // Permission rule values must not contain /tmp/worker paths (E8 / W-14).
+      const permRules = payload.permissionRules as Record<string, unknown> | undefined;
+      if (permRules) {
+        const permRulesStr = JSON.stringify(permRules);
+        assert.ok(
+          !permRulesStr.includes("/tmp/worker"),
+          "mirror worker permissionRules must not embed /tmp/worker paths",
         );
       }
     } finally {

@@ -245,7 +245,13 @@ test("C1: cross-container reconstruction — commit → bundle → import → ar
       const imported = await importBundle(
         { mirrorPath: mp, remote: `file://${base.repoPath}` },
         bundleBytes,
-        { attemptId, generation: 0, expectedHead: commitId, maxBundleBytes: 200 * 1024 * 1024 },
+        {
+          attemptId,
+          generation: 0,
+          kind: "attempt",
+          expectedHead: commitId,
+          maxBundleBytes: 200 * 1024 * 1024,
+        },
       );
       assert.equal(imported.headSha, commitId);
 
@@ -315,6 +321,7 @@ test("C2: tampered bundle — byte flipped → import throws, no artifact row", 
         await importBundle({ mirrorPath: mp, remote: `file://${base.repoPath}` }, tampered, {
           attemptId,
           generation: 0,
+          kind: "attempt",
           expectedHead: commitId,
           maxBundleBytes: 200 * 1024 * 1024,
         });

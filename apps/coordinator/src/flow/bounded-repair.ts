@@ -630,16 +630,18 @@ export async function finalizeAcceptedAttempt(
       });
 
       // Insert dispatch intent for integrate.merge (R-002: committed before trigger).
+      // E5: write nonce hash in INSERT (same tx as intent creation).
       await client.query(
         `INSERT INTO dispatch_intents
-           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
         [
           String(mergeIntentId),
           TASK_IDS.integrateMerge,
           String(digestOf(mergePayload)),
           ctx.attemptId,
           mergeIdempotencyKey,
+          mergeNonce ? hashNonce(mergeNonce) : null,
         ],
       );
 
@@ -674,17 +676,11 @@ export async function finalizeAcceptedAttempt(
       },
     });
 
-    if (mergeNonce) {
-      await pool.query(
-        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
-        [String(mergeIntentId), mergeRunId, hashNonce(mergeNonce)],
-      );
-    } else {
-      await pool.query(
-        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-        [String(mergeIntentId), mergeRunId],
-      );
-    }
+    // Update status and run_id only (nonce hash already set in INSERT above).
+    await pool.query(
+      "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+      [String(mergeIntentId), mergeRunId],
+    );
 
     return { boundary: "merge", mergeIntentId: String(mergeIntentId), mergeRunId };
   } else {
@@ -900,12 +896,19 @@ export class BoundedRepairFlow {
       const idempotencyKey = `leadplan:${workItemId}:${String(intentId)}`;
       const payloadDigest = digestOf(payload);
 
+      // E5 / X2-5: write nonce hash in the INSERT (same tx as the intent).
       await client.query("BEGIN");
       await client.query(
         `INSERT INTO dispatch_intents
-           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-         VALUES ($1, $2, $3, NULL, 'recorded', NULL, $4)`,
-        [String(intentId), TASK_IDS.leadPlan, String(payloadDigest), idempotencyKey],
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+         VALUES ($1, $2, $3, NULL, 'recorded', NULL, $4, $5)`,
+        [
+          String(intentId),
+          TASK_IDS.leadPlan,
+          String(payloadDigest),
+          idempotencyKey,
+          planNonce ? hashNonce(planNonce) : null,
+        ],
       );
       await client.query("COMMIT");
 
@@ -919,17 +922,11 @@ export class BoundedRepairFlow {
         },
       });
 
-      if (planNonce) {
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
-          [String(intentId), runId, hashNonce(planNonce)],
-        );
-      } else {
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-          [String(intentId), runId],
-        );
-      }
+      // Update status and run_id only (nonce hash already set in INSERT).
+      await pool.query(
+        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+        [String(intentId), runId],
+      );
 
       const result = { intentId: String(intentId), runId };
       await completeCommand(client, commandId, result);
@@ -1706,9 +1703,148 @@ export class BoundedRepairFlow {
           return;
         }
 
+        // E3 / X2-3 / W-5: mirror mode — verified row is the source of truth.
+        // Check attempt_artifacts for a verified=true row matching the worker's claim.
+        // If absent, the artifact was not admitted (upload never completed or failed
+        // domain validation); treat as an execution failure and apply bounded retry.
+        const isMirrorWorker = projectRow.source_mode === "mirror";
+        let revision = output.commitId;
+        let diffDigest = output.diffDigest ?? String(digestOf({ revision }));
+
+        if (isMirrorWorker) {
+          const { rows: verifiedRows } = await client.query<{
+            commit_id: string;
+            diff_digest: string;
+          }>(
+            `SELECT commit_id, diff_digest FROM attempt_artifacts
+             WHERE attempt_id = $1 AND generation = $2 AND kind = 'attempt'
+               AND commit_id = $3 AND verified = true
+             LIMIT 1`,
+            [attemptRow.id, attemptRow.generation, output.commitId],
+          );
+          if (verifiedRows.length === 0) {
+            // Artifact was not admitted — execution failure, bounded retry.
+            const notAdmittedFailureId = ids.next("fail") as FailureId;
+            const notAdmittedBudget = attemptRow.budget_remaining - 1;
+            await client.query("BEGIN");
+            await client.query(
+              `INSERT INTO failures (id, class, phase, attempt_id, run_id, cause)
+               VALUES ($1, 'execution', 'final', $2, $3, $4)`,
+              [
+                String(notAdmittedFailureId),
+                attemptRow.id,
+                obs.runId,
+                `artifact_not_admitted: no verified artifact row for attempt ${attemptRow.id} generation ${String(attemptRow.generation)} commitId ${output.commitId}`,
+              ],
+            );
+            const { rowCount: notAdmittedFailedRows } = await client.query(
+              "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1 AND status IN ('admitted','dispatched','running')",
+              [attemptRow.id, String(notAdmittedFailureId)],
+            );
+            if (!notAdmittedFailedRows) {
+              await client.query("ROLLBACK");
+              await completeCommand(client, commandId, { skipped: "stale_status" });
+              return;
+            }
+            await client.query(
+              "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+              [workerIntentRow.id],
+            );
+            if (notAdmittedBudget > 0) {
+              const notAdmittedNewAttemptId = ids.next("att") as AttemptId;
+              const notAdmittedWorktreePath = `${config.worktreeBase}/${String(notAdmittedNewAttemptId)}`;
+              const notAdmittedNewPayload = WorkerAttemptPayloadSchema.parse({
+                attemptId: String(notAdmittedNewAttemptId),
+                generation: 1,
+                contractId: contractRow.id,
+                contractVersion: String(contractRow.version),
+                repoPath: projectRow.clone_path ?? config.worktreeBase,
+                baseRev: contractRow.base_revision,
+                prompt: contractRow.inputs?.intent ?? "",
+                allowedPaths: contractRow.bounds.paths.allow,
+                bounds: contractRow.bounds,
+                permissionRules: permissionRulesFor(contractRow.bounds, {
+                  worktreePath: notAdmittedWorktreePath,
+                }),
+                model: config.workerModel,
+                worktreeBase: config.worktreeBase,
+              });
+              const notAdmittedIntentId = ids.next("di") as DispatchIntentId;
+              const notAdmittedIntentKey = `${String(notAdmittedIntentId)}:g1`;
+              await client.query(
+                `INSERT INTO attempts
+                   (id, contract_id, contract_version, generation, status, budget_remaining)
+                 VALUES ($1, $2, $3, 1, 'admitted', $4)`,
+                [
+                  String(notAdmittedNewAttemptId),
+                  contractRow.id,
+                  contractRow.version,
+                  notAdmittedBudget,
+                ],
+              );
+              await client.query(
+                `INSERT INTO dispatch_intents
+                   (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
+                 VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+                [
+                  String(notAdmittedIntentId),
+                  TASK_IDS.workerAttempt,
+                  String(digestOf(notAdmittedNewPayload)),
+                  String(notAdmittedNewAttemptId),
+                  notAdmittedIntentKey,
+                ],
+              );
+              await client.query("COMMIT");
+              const { runId: notAdmittedNewRunId } = await runtime.trigger({
+                intentId: notAdmittedIntentId,
+                task: TASK_IDS.workerAttempt,
+                payload: notAdmittedNewPayload,
+                options: {
+                  idempotencyKey: notAdmittedIntentKey,
+                  maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+                  concurrencyKey: contractRow.project_id,
+                  tags: triggerTags({
+                    projectId: contractRow.project_id,
+                    workItemId: contractRow.work_item_id,
+                    contractId: contractRow.id,
+                    contractVersion: contractRow.version,
+                    attemptId: String(notAdmittedNewAttemptId),
+                  }),
+                },
+              });
+              await pool.query(
+                "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+                [String(notAdmittedIntentId), notAdmittedNewRunId],
+              );
+              await pool.query(
+                "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",
+                [String(notAdmittedNewAttemptId), notAdmittedNewRunId],
+              );
+              await completeCommand(client, commandId, {
+                failureId: String(notAdmittedFailureId),
+                artifactNotAdmitted: true,
+                newAttemptId: String(notAdmittedNewAttemptId),
+                newRunId: notAdmittedNewRunId,
+              });
+            } else {
+              await client.query("COMMIT");
+              await completeCommand(client, commandId, {
+                failureId: String(notAdmittedFailureId),
+                artifactNotAdmitted: true,
+                budgetExhausted: true,
+              });
+            }
+            return;
+          }
+          // Use the verified row's canonical fields — not the worker's claim.
+          const vrow = verifiedRows[0];
+          if (vrow) {
+            revision = vrow.commit_id;
+            diffDigest = vrow.diff_digest;
+          }
+        }
+
         const artifactId = ids.next("art") as ArtifactId;
-        const revision = output.commitId;
-        const diffDigest = output.diffDigest ?? String(digestOf({ revision }));
 
         const resolvedProfile = await profileResolver(contractRow.profile_id);
 
@@ -1836,16 +1972,19 @@ export class BoundedRepairFlow {
         // Combine parsed payload with extension fields (manifest ext is not in the schema).
         const verifyTriggerPayload = { ...(verifyPayload as object), ...verifyManifestExt };
 
+        // E5 / X2-5: write nonce hash in the same INSERT as the intent so a fast
+        // container cannot race to request a lease before the hash lands.
         await client.query(
           `INSERT INTO dispatch_intents
-             (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-           VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+             (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+           VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
           [
             String(verifyIntentId),
             TASK_IDS.verifyRun,
             String(digestOf(verifyPayload)),
             attemptRow.id,
             String(verifyIntentId),
+            verifyNonce ? hashNonce(verifyNonce) : null,
           ],
         );
 
@@ -1875,17 +2014,11 @@ export class BoundedRepairFlow {
           },
         });
 
-        if (verifyNonce) {
-          await pool.query(
-            "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
-            [String(verifyIntentId), verifyRunId, hashNonce(verifyNonce)],
-          );
-        } else {
-          await pool.query(
-            "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-            [String(verifyIntentId), verifyRunId],
-          );
-        }
+        // Update status and run_id only (nonce hash was written in the INSERT above).
+        await pool.query(
+          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+          [String(verifyIntentId), verifyRunId],
+        );
 
         await completeCommand(client, commandId, {
           artifactId: String(artifactId),
@@ -2272,17 +2405,19 @@ export class BoundedRepairFlow {
         });
       }
 
-      // Insert review intent and close incoming verify intent in the same tx (F-5).
+      // E5 / X2-5: write nonce hash in INSERT (same tx); insert review intent and
+      // close incoming verify intent together (F-5).
       await client.query(
         `INSERT INTO dispatch_intents
-           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
         [
           String(reviewIntentId),
           TASK_IDS.leadReview,
           String(digestOf(reviewPayload)),
           attemptRow.id,
           String(reviewIntentId),
+          reviewNonce ? hashNonce(reviewNonce) : null,
         ],
       );
       await client.query(
@@ -2310,17 +2445,11 @@ export class BoundedRepairFlow {
         },
       });
 
-      if (reviewNonce) {
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
-          [String(reviewIntentId), reviewRunId, hashNonce(reviewNonce)],
-        );
-      } else {
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-          [String(reviewIntentId), reviewRunId],
-        );
-      }
+      // Update status and run_id only (nonce hash already set in INSERT).
+      await pool.query(
+        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+        [String(reviewIntentId), reviewRunId],
+      );
 
       await completeCommand(client, commandId, {
         reviewIntentId: String(reviewIntentId),
@@ -2444,11 +2573,11 @@ export class BoundedRepairFlow {
             });
           }
 
-          // ON CONFLICT ensures idempotency across reconciler replays.
+          // E5: write nonce hash in INSERT. ON CONFLICT ensures idempotency.
           await client.query(
             `INSERT INTO dispatch_intents
-               (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-             VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)
+               (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+             VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)
              ON CONFLICT (idempotency_key) DO NOTHING`,
             [
               String(retryIntentId),
@@ -2456,6 +2585,7 @@ export class BoundedRepairFlow {
               String(digestOf(retryPayload)),
               attemptRow.id,
               retryKey,
+              retryReviewNonce ? hashNonce(retryReviewNonce) : null,
             ],
           );
           await client.query(
@@ -2482,17 +2612,11 @@ export class BoundedRepairFlow {
               }),
             },
           });
-          if (retryReviewNonce) {
-            await pool.query(
-              "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
-              [String(retryIntentId), retryRunId, hashNonce(retryReviewNonce)],
-            );
-          } else {
-            await pool.query(
-              "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-              [String(retryIntentId), retryRunId],
-            );
-          }
+          // Update status and run_id only (nonce hash already set in INSERT).
+          await pool.query(
+            "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+            [String(retryIntentId), retryRunId],
+          );
         } else {
           // Retry also failed: record pending_human decision and stop.
           const decisionId = ids.next("dec") as DecisionId;
@@ -2579,17 +2703,19 @@ export class BoundedRepairFlow {
         ],
       );
 
-      // Insert accept intent and close incoming review intent in same tx (F-5).
+      // E5 / X2-5: write nonce hash in INSERT; insert accept intent and close
+      // incoming review intent in same tx (F-5).
       await client.query(
         `INSERT INTO dispatch_intents
-           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
         [
           String(acceptIntentId),
           TASK_IDS.leadAccept,
           String(digestOf(acceptPayload)),
           attemptRow.id,
           String(acceptIntentId),
+          acceptNonce ? hashNonce(acceptNonce) : null,
         ],
       );
       await client.query(
@@ -2617,17 +2743,11 @@ export class BoundedRepairFlow {
         },
       });
 
-      if (acceptNonce) {
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
-          [String(acceptIntentId), acceptRunId, hashNonce(acceptNonce)],
-        );
-      } else {
-        await pool.query(
-          "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-          [String(acceptIntentId), acceptRunId],
-        );
-      }
+      // Update status and run_id only (nonce hash already set in INSERT).
+      await pool.query(
+        "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+        [String(acceptIntentId), acceptRunId],
+      );
 
       await completeCommand(client, commandId, {
         reviewId: String(reviewId),
@@ -2767,10 +2887,11 @@ export class BoundedRepairFlow {
               });
             }
 
+            // E5: write nonce hash in INSERT. ON CONFLICT ensures idempotency.
             await client.query(
               `INSERT INTO dispatch_intents
-                 (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-               VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)
+                 (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+               VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)
                ON CONFLICT (idempotency_key) DO NOTHING`,
               [
                 String(retryIntentId),
@@ -2778,6 +2899,7 @@ export class BoundedRepairFlow {
                 String(digestOf(retryPayload)),
                 failAttemptRow.id,
                 retryKey,
+                retryAcceptNonce ? hashNonce(retryAcceptNonce) : null,
               ],
             );
             await client.query(
@@ -2803,17 +2925,11 @@ export class BoundedRepairFlow {
                 }),
               },
             });
-            if (retryAcceptNonce) {
-              await pool.query(
-                "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, dispatch_nonce_hash = $3, updated_at = now() WHERE id = $1",
-                [String(retryIntentId), retryRunId, hashNonce(retryAcceptNonce)],
-              );
-            } else {
-              await pool.query(
-                "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
-                [String(retryIntentId), retryRunId],
-              );
-            }
+            // Update status and run_id only (nonce hash already set in INSERT).
+            await pool.query(
+              "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+              [String(retryIntentId), retryRunId],
+            );
           } else {
             // No review row → cannot rebuild payload; escalate to pending_human.
             const decisionId = ids.next("dec") as DecisionId;
@@ -3038,7 +3154,7 @@ export class BoundedRepairFlow {
         allowedPaths: contractRow.bounds.paths.allow,
         bounds: contractRow.bounds,
         permissionRules: permissionRulesFor(contractRow.bounds, {
-          worktreePath: `/tmp/worker/${attemptRow.id}`,
+          worktreePath: "",
         }),
         model: config.workerModel,
         leaseNonce: dispatchNonce,
@@ -3061,6 +3177,16 @@ export class BoundedRepairFlow {
       });
     }
 
+    // E5 / X2-5: for worker.attempt the intent was inserted by planAttempt, so
+    // we UPDATE the nonce hash BEFORE trigger (the intent's own row is already
+    // committed; the UPDATE is visible before trigger starts).
+    if (dispatchNonce) {
+      await pool.query(
+        "UPDATE dispatch_intents SET dispatch_nonce_hash = $1, updated_at = now() WHERE id = $2",
+        [hashNonce(dispatchNonce), intentId],
+      );
+    }
+
     const { runId } = await runtime.trigger({
       intentId: intentId as DispatchIntentId,
       task: intentRow.task,
@@ -3081,13 +3207,10 @@ export class BoundedRepairFlow {
       },
     });
 
-    // Store nonce hash atomically with triggered status (D1 / W-1).
+    // Mark as triggered with run_id (nonce hash already written above).
     await pool.query(
-      `UPDATE dispatch_intents
-         SET status = 'triggered', run_id = $2, skip_reason = NULL, updated_at = now()
-             ${dispatchNonce ? ", dispatch_nonce_hash = $3" : ""}
-       WHERE id = $1`,
-      dispatchNonce ? [intentId, runId, hashNonce(dispatchNonce)] : [intentId, runId],
+      "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, skip_reason = NULL, updated_at = now() WHERE id = $1",
+      [intentId, runId],
     );
     await pool.query(
       "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",

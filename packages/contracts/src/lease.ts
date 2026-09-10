@@ -16,7 +16,9 @@ import { z } from "zod";
 // LeasePurpose
 // ---------------------------------------------------------------------------
 
-export const LeasePurposeSchema = z.enum(["provider", "git-read", "integrate", "upload"]);
+// E7 / W-10: "review" purpose — grants an opaque bearer token (like upload) for
+// downloading attempt bundles; carries no external credentials.
+export const LeasePurposeSchema = z.enum(["provider", "git-read", "integrate", "upload", "review"]);
 export type LeasePurpose = z.infer<typeof LeasePurposeSchema>;
 
 // ---------------------------------------------------------------------------
@@ -86,6 +88,13 @@ const LeaseMaterialSchema = z.discriminatedUnion("purpose", [
     /** Upload bearer token. Treat as secret. */
     token: z.string(),
   }),
+  z.object({
+    // E7 / W-10: review lease — opaque bearer token for artifact bundle downloads.
+    // No external credentials (no authJson, no askpassToken).
+    purpose: z.literal("review"),
+    /** Bearer token for bundle download authentication. Treat as secret. */
+    token: z.string(),
+  }),
 ]);
 
 type LeaseMaterial = z.infer<typeof LeaseMaterialSchema>;
@@ -142,6 +151,9 @@ export function redactLeaseGrant(grant: LeaseGrant): LeaseGrant {
       break;
     case "upload":
       redactedMaterial = { purpose: "upload", token: "<redacted>" };
+      break;
+    case "review":
+      redactedMaterial = { purpose: "review", token: "<redacted>" };
       break;
   }
 

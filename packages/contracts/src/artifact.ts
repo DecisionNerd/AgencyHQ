@@ -128,6 +128,16 @@ const StopEvidenceStepSchema = z.object({
     .max(2000)
     .refine((s) => !s.includes("\n"), { message: "detail must not contain newlines" })
     .optional(),
+  /**
+   * Survivor PIDs from the post-kill scan (step: "stop_done").
+   * Forwarded 1:1 from stop.ndjson by the evidence collector (E4).
+   */
+  survivors: z.array(z.number().int()).optional(),
+  /**
+   * Git SHA of the checkpoint commit (step: "checkpoint" / "checkpoint_committed").
+   * Forwarded 1:1 from stop.ndjson by the evidence collector (E4).
+   */
+  checkpointCommit: z.string().optional(),
 });
 
 /**

@@ -106,11 +106,18 @@ export function validateArtifactAdmission(
   // 5. Lease must reference the same attempt
   if (lease.attemptId !== attempt.id) return err("ATTEMPT_MISMATCH");
 
-  // 6. Claimed generation must not be stale (< current)
-  if (claimed.generation < attempt.currentGeneration) return err("STALE_GENERATION");
-
-  // 7. Claimed generation must not be future (> current)
-  if (claimed.generation > attempt.currentGeneration) return err("FUTURE_GENERATION");
+  // 6–7. Generation check (E1 / X2-1):
+  //  - "attempt" (final) artifacts: generation must equal attempt.currentGeneration.
+  //  - "checkpoint" artifacts: generation must equal the lease's generation so
+  //    that a container can still upload a checkpoint after an operator stop bumped
+  //    the generation and revoked provider/integrate leases (upload leases are kept).
+  if (claimed.kind === "attempt") {
+    if (claimed.generation < attempt.currentGeneration) return err("STALE_GENERATION");
+    if (claimed.generation > attempt.currentGeneration) return err("FUTURE_GENERATION");
+  } else {
+    // checkpoint: must match the lease generation (the lease was issued for that gen)
+    if (claimed.generation !== lease.generation) return err("STALE_GENERATION");
+  }
 
   // 8. Attempt must not be in a terminal state
   if (TERMINAL_STATUSES.has(attempt.status)) return err("ATTEMPT_TERMINAL");

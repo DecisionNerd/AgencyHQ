@@ -76,6 +76,10 @@ type StopStep = {
     | "checkpoint_failed"
     | "stop_done";
   detail?: string;
+  /** PIDs that survived the kill scan (forwarded 1:1 from stop.ndjson, E4). */
+  survivors?: number[];
+  /** Git SHA of the checkpoint commit (forwarded 1:1 from stop.ndjson, E4). */
+  checkpointCommit?: string;
 };
 
 export type CollectStopEvidenceResult = {
@@ -133,11 +137,18 @@ export async function collectStopEvidence(runDir: string): Promise<CollectStopEv
     const detail =
       rawDetail !== undefined ? rawDetail.replace(/\n/g, " ").slice(0, 2000) : undefined;
 
-    if (detail !== undefined) {
-      steps.push({ at, step, detail });
-    } else {
-      steps.push({ at, step });
-    }
+    // Forward survivors and checkpointCommit 1:1 from stop.ndjson (E4).
+    const survivors = Array.isArray(obj.survivors)
+      ? (obj.survivors as unknown[]).filter((x): x is number => typeof x === "number")
+      : undefined;
+    const checkpointCommit =
+      typeof obj.checkpointCommit === "string" ? obj.checkpointCommit : undefined;
+
+    const entry: StopStep = { at, step };
+    if (detail !== undefined) entry.detail = detail;
+    if (survivors !== undefined) entry.survivors = survivors;
+    if (checkpointCommit !== undefined) entry.checkpointCommit = checkpointCommit;
+    steps.push(entry);
   }
 
   return { steps };

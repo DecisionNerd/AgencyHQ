@@ -9,7 +9,8 @@
 // The clone is deleted in a finally block.
 
 import { execFile as execFileCb } from "node:child_process";
-import { rm } from "node:fs/promises";
+import { rm, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { LeadReviewPayload, LeadReviewPayloadV2 } from "@agencyhq/contracts";
@@ -55,7 +56,11 @@ export const leadReview = task({
   queue: { name: "lead", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },
 
-  run: async (rawPayload: unknown): Promise<ReviewTaskOutput & { reviewerModel: string }> => {
+  // biome-ignore lint/suspicious/noExplicitAny: ctx shape is opaque from Trigger SDK
+  run: async (
+    rawPayload: unknown,
+    { ctx }: any,
+  ): Promise<ReviewTaskOutput & { reviewerModel: string }> => {
     // Validate with the union schema (accepts v1 and v2).
     const parseResult = LeadReviewPayloadAnySchema.safeParse(rawPayload);
     if (!parseResult.success) {
@@ -76,7 +81,7 @@ export const leadReview = task({
 
     // v2 path: materialize source from coordinator bundle, compute diff in clone.
     if (isV2LeadReviewPayload(payload)) {
-      return runReviewV2(payload, variant);
+      return runReviewV2(payload, variant, ctx.run.id as string);
     }
 
     // v1 path: host filesystem repo and patchPath.
@@ -120,6 +125,7 @@ export const leadReview = task({
 async function runReviewV2(
   payload: LeadReviewPayloadV2,
   variant: string,
+  runId: string,
 ): Promise<ReviewTaskOutput & { reviewerModel: string }> {
   const coordinatorUrl =
     process.env.AGENCYHQ_COORDINATOR_INTERNAL_URL ??
@@ -131,42 +137,35 @@ async function runReviewV2(
     (() => {
       throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
     })();
-  // D1 / W-6: get the nonce from the payload to request an upload lease for source download.
-  // Fall back to env var for compatibility during transition.
-  const nonce = payload.leaseNonce ?? process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
 
-  // If nonce is available, request an upload lease; otherwise fall back to empty token.
-  let uploadToken = "";
-  if (nonce && payload.leaseNonce) {
-    const runId =
-      process.env.TRIGGER_RUN_ID ?? process.env.AGENCYHQ_RUN_ID ?? `review-${payload.attemptId}`;
-    const leaseResult = await createBroker(coordinatorUrl).requestLease({
+  // E2 / X2-2: use ctx.run.id (passed as runId) to request the review lease.
+  // E7 / W-10: request a review-purpose lease (not upload) — the review task
+  // only needs to download bundles, not upload artifacts.
+  const broker = createBroker(coordinatorUrl);
+  let reviewToken = "";
+  if (payload.leaseNonce) {
+    const leaseResult = await broker.requestLease({
       runId,
       attemptId: payload.attemptId,
       generation: payload.generation,
-      purpose: "upload",
+      purpose: "review",
       nonce: payload.leaseNonce,
     });
-    if (leaseResult.ok && leaseResult.grant.material.purpose === "upload") {
-      uploadToken = leaseResult.grant.material.token;
+    if (leaseResult.ok && leaseResult.grant.material.purpose === "review") {
+      reviewToken = leaseResult.grant.material.token;
     }
-  } else {
-    uploadToken = process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
   }
 
-  // Reuse the broker created above (or create a new one if nonce path was not taken).
-  const broker = createBroker(coordinatorUrl);
   // Temp parent: holds the cloned src subdir and the review runDir subdir.
   const tempParent = join(runRoot, "runs", `review-${payload.attemptId}-${payload.generation}`);
   const cloneDir = join(tempParent, "src");
 
-  // Materialize source. For review, source.revision is the attemptRevision so
-  // the clone has full history through the attempt (diff base..attempt works).
+  // E7 / W-10: Materialize base source (clones at baseRevision).
   const sourceResult = await materializeSource({
     source: payload.source,
     dir: cloneDir,
     broker,
-    token: uploadToken,
+    token: reviewToken,
   });
 
   if (!sourceResult.ok) {
@@ -176,6 +175,30 @@ async function runReviewV2(
   }
 
   const clonedDir = sourceResult.clonedDir;
+
+  // E7 / W-10: Download the attempt bundle and fetch it into the base clone
+  // so the attempt commit is available for diff.
+  let bundleTmpPath: string | undefined;
+  try {
+    const bundleResult = await broker.downloadAttemptBundle({
+      attemptId: payload.patch.attemptId,
+      generation: payload.patch.generation,
+      token: reviewToken,
+    });
+    bundleTmpPath = join(tmpdir(), `agencyhq-review-${payload.attemptId}-${Date.now()}.bundle`);
+    await writeFile(bundleTmpPath, bundleResult.bundleBytes);
+    // Fetch the attempt ref into the clone so base..attempt diff works.
+    const attemptRef = `refs/agencyhq/attempts/${payload.patch.attemptId}/g${payload.patch.generation}/attempt`;
+    await execFileAsync("git", ["fetch", bundleTmpPath, `${attemptRef}:${attemptRef}`], {
+      cwd: clonedDir,
+    });
+  } catch (err) {
+    throw new AbortTaskRunError(`review attempt bundle fetch failed: ${(err as Error).message}`);
+  } finally {
+    if (bundleTmpPath) {
+      await unlink(bundleTmpPath).catch(() => undefined);
+    }
+  }
 
   try {
     metadata.set("phase", "source_materialized");
@@ -192,11 +215,10 @@ async function runReviewV2(
     };
 
     const result = await runReview(v1Payload, {
-      // v2: clone is already at the right revision; no worktree needed.
+      // v2: clone is already set up; no worktree needed.
       worktreeAdd: async () => {},
       worktreeRemove: async () => {},
-      // gitDiff uses the clone dir (not the synthetic payload.repoPath which
-      // equals clonedDir anyway, but passed explicitly for clarity).
+      // gitDiff uses the clone dir where both base and attempt commits exist.
       gitDiff: (_repoPath, base, attempt) => gitDiff(clonedDir, base, attempt),
       leadSession: (input) =>
         leadPrompt({

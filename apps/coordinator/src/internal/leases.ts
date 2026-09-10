@@ -183,9 +183,9 @@ export async function issueLeaseBroker(
         const refusal: LeaseRefusal = { purpose, reason: "expired" };
         return { ok: false, status: 409, refusal };
       }
-      // For upload leases, mint a new token and update token_hash (W-3: idempotent re-issue).
+      // For upload/review leases, mint a new token and update token_hash (W-3: idempotent re-issue).
       let reissueUploadToken: string | undefined;
-      if (purpose === "upload") {
+      if (purpose === "upload" || purpose === "review") {
         reissueUploadToken = randomHex(32);
         const reissueTokenHash = sha256hex(reissueUploadToken);
         await client.query(`UPDATE leases SET token_hash = $1 WHERE id = $2`, [
@@ -249,8 +249,8 @@ export async function issueLeaseBroker(
     const expiresAt = new Date(Date.now() + ttl);
     const leaseId = `lease_${randomHex(16)}`;
 
-    // For upload leases, pre-generate the token so we can store token_hash atomically (W-3).
-    const uploadToken = purpose === "upload" ? randomHex(32) : undefined;
+    // For upload and review leases, pre-generate the token so token_hash is stored atomically (W-3).
+    const uploadToken = purpose === "upload" || purpose === "review" ? randomHex(32) : undefined;
     const tokenHash = uploadToken !== undefined ? sha256hex(uploadToken) : undefined;
 
     await issueLease(client, {
@@ -384,6 +384,18 @@ async function buildGrant(
       purpose,
       expiresAt: expiresAt.toISOString(),
       material: { purpose: "upload", token: uploadToken },
+    });
+  }
+
+  // E7 / W-10: review lease — opaque bearer token, no external credentials.
+  if (purpose === "review") {
+    const reviewToken = preGeneratedUploadToken ?? randomHex(32);
+
+    return LeaseGrantSchema.parse({
+      leaseId,
+      purpose,
+      expiresAt: expiresAt.toISOString(),
+      material: { purpose: "review", token: reviewToken },
     });
   }
 

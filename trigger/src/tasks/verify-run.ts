@@ -87,7 +87,8 @@ export const verifyRun = task({
   queue: { name: "verify", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },
 
-  run: async (rawPayload: unknown, { signal }): Promise<VerifyRunOutput> => {
+  // biome-ignore lint/suspicious/noExplicitAny: ctx shape is opaque from Trigger SDK
+  run: async (rawPayload: unknown, { signal, ctx }: any): Promise<VerifyRunOutput> => {
     // Validate payload with the contracts schema (accepts v1 and v2).
     const parseResult = VerifyRunPayloadAnySchema.safeParse(rawPayload);
     if (!parseResult.success) {
@@ -113,12 +114,12 @@ export const verifyRun = task({
       const broker = createBroker(coordinatorUrl);
       const cloneDir = join(runRoot, "runs", `verify-${payload.attemptId}`, "src");
 
-      // D1 / W-6: get upload token from payload nonce (request a lease) or fall back to env.
-      let uploadToken = process.env.AGENCYHQ_UPLOAD_TOKEN ?? "";
+      // E2 / X2-2 / W-6: use ctx.run.id for the lease request. TRIGGER_RUN_ID is
+      // not set by the Trigger.dev SDK 4.5 runtime; ctx.run.id is the correct value.
+      let uploadToken = "";
       if (payload.leaseNonce) {
-        const runId = process.env.TRIGGER_RUN_ID ?? `verify-${payload.attemptId}`;
         const leaseResult = await broker.requestLease({
-          runId,
+          runId: ctx.run.id as string,
           attemptId: payload.attemptId,
           generation: payload.generation,
           purpose: "upload",

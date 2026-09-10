@@ -14,7 +14,7 @@ export interface LeaseInsert {
   attempt_id: string;
   generation: number;
   run_id: string;
-  purpose: "provider" | "git-read" | "integrate" | "upload";
+  purpose: "provider" | "git-read" | "integrate" | "upload" | "review";
   /** SHA-256 hex hash of the raw nonce — the nonce value itself is not stored. */
   nonce_hash: string;
   /**
@@ -100,23 +100,42 @@ export async function markLeaseUsed(
 }
 
 /**
- * Revoke all leases for an attempt with generation < the given generation.
+ * Revoke leases for an attempt with generation < the given generation.
  * Called when a new generation starts; older leases should no longer be usable.
  * Returns the count of revoked rows.
+ *
+ * @param purposeFilter - When provided, only revoke leases with a purpose in
+ *   this list. A stop/fence should pass ["provider", "integrate"] so that
+ *   upload leases remain valid for the container to send stop evidence and
+ *   checkpoints (E1 / X2-1). When omitted, all leases are revoked.
  */
 export async function revokeLeasesBelowGeneration(
   client: pg.PoolClient,
   attemptId: string,
   generation: number,
+  purposeFilter?: string[],
 ): Promise<number> {
-  const { rowCount } = await client.query(
-    `UPDATE leases
+  let query: string;
+  let params: unknown[];
+  if (purposeFilter && purposeFilter.length > 0) {
+    // Build a parameterised IN clause.
+    const placeholders = purposeFilter.map((_, i) => `$${i + 3}`).join(", ");
+    query = `UPDATE leases
      SET revoked_at = now()
      WHERE attempt_id = $1
        AND generation < $2
-       AND revoked_at IS NULL`,
-    [attemptId, generation],
-  );
+       AND revoked_at IS NULL
+       AND purpose IN (${placeholders})`;
+    params = [attemptId, generation, ...purposeFilter];
+  } else {
+    query = `UPDATE leases
+     SET revoked_at = now()
+     WHERE attempt_id = $1
+       AND generation < $2
+       AND revoked_at IS NULL`;
+    params = [attemptId, generation];
+  }
+  const { rowCount } = await client.query(query, params);
   return rowCount ?? 0;
 }
 

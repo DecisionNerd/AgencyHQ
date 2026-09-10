@@ -149,6 +149,8 @@ export interface ImportBundleOpts {
   attemptId: string;
   /** The generation number — used to construct the ref name. */
   generation: number;
+  /** The artifact kind — used to construct the ref name (X2-8). */
+  kind: "attempt" | "checkpoint";
   /** The expected head commit SHA (40-hex). */
   expectedHead: string;
   /** Max allowed bundle bytes (defaults to 200 MiB). */
@@ -240,7 +242,8 @@ export async function importBundle(
     // Fetch head commit into a named ref.
     // The bundle was created with refs/agencyhq/export/<sha>, so we fetch that ref.
     const exportRef = `${EXPORT_REF_PREFIX}${opts.expectedHead}`;
-    const targetRef = `refs/agencyhq/attempts/${opts.attemptId}/g${opts.generation}`;
+    // X2-8: ref name includes kind so attempt and checkpoint refs are distinct.
+    const targetRef = `refs/agencyhq/attempts/${opts.attemptId}/g${opts.generation}/${opts.kind}`;
     try {
       await git(["fetch", tmpPath, `${exportRef}:${targetRef}`], mirror.mirrorPath);
     } catch (err) {

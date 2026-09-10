@@ -16,7 +16,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import type { LeaseGrant } from "@agencyhq/contracts";
-import { uploadAttemptArtifact } from "../src/lib/artifact-upload.ts";
+import { exportAttemptBundle, uploadAttemptArtifact } from "../src/lib/artifact-upload.ts";
 import { FakeBroker } from "../src/lib/broker.ts";
 import { uploadStopEvidence } from "../src/lib/evidence.ts";
 import { prepareRuntime } from "../src/lib/runtime.ts";
@@ -272,5 +272,100 @@ test("v2 adapter: full pipeline — materialize, upload artifact, upload evidenc
   } finally {
     await rm(cloneDir, { recursive: true, force: true });
     await rm(runDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P11: Worker path end-to-end — broker issuance → token → exportAttemptBundle
+// → upload → verified row.
+//
+// Uses the worker's real export/upload functions (exportAttemptBundle +
+// uploadAttemptArtifact), not git bundle create in the test itself. The
+// "verified row" is the uploadArtifact call recorded by FakeBroker.
+// Provider lease is skipped (host profile: no AGENCYHQ_RUNTIME_PROFILE).
+// ---------------------------------------------------------------------------
+
+test("P11: broker issuance → exportAttemptBundle → upload → verified row", async () => {
+  const repoDir = await makeTmpDir();
+
+  try {
+    // 1. Create a git repo with a base commit and a worker commit.
+    await execFileAsync("git", ["init", "--initial-branch=main", repoDir]);
+    await execFileAsync("git", ["-C", repoDir, "config", "user.email", "p11@test.com"]);
+    await execFileAsync("git", ["-C", repoDir, "config", "user.name", "P11"]);
+    await writeFile(join(repoDir, "base.ts"), "export const base = 1;");
+    await execFileAsync("git", ["-C", repoDir, "add", "-A"]);
+    await execFileAsync("git", ["-C", repoDir, "commit", "-m", "base"]);
+    const { stdout: baseOut } = await execFileAsync("git", ["-C", repoDir, "rev-parse", "HEAD"]);
+    const baseRevision = baseOut.trim();
+
+    await writeFile(join(repoDir, "worker.ts"), "export const answer = 42;");
+    await execFileAsync("git", ["-C", repoDir, "add", "-A"]);
+    await execFileAsync("git", ["-C", repoDir, "commit", "-m", "worker output"]);
+    const { stdout: headOut } = await execFileAsync("git", ["-C", repoDir, "rev-parse", "HEAD"]);
+    const commitId = headOut.trim();
+
+    // 2. Set up FakeBroker with upload grant.
+    const broker = new FakeBroker();
+    const UPLOAD_TOKEN = "p11-upload-token-secret";
+    broker.grants.set("upload:attempt-p11", {
+      leaseId: "lease-p11",
+      purpose: "upload",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      material: { purpose: "upload", token: UPLOAD_TOKEN },
+    } satisfies LeaseGrant);
+
+    // 3. Broker issuance: call requestLease to get the upload token.
+    const leaseResult = await broker.requestLease({
+      runId: "run-p11",
+      attemptId: "attempt-p11",
+      generation: 0,
+      purpose: "upload",
+      nonce: "p".repeat(32),
+    });
+    assert.equal(leaseResult.ok, true, "upload lease must be granted");
+    if (!leaseResult.ok) return;
+    assert.equal(leaseResult.grant.material.purpose, "upload");
+    const mat = leaseResult.grant.material;
+    const uploadToken = mat.purpose === "upload" ? mat.token : "";
+
+    // 4. exportAttemptBundle (worker's real function, not git bundle create in test).
+    const exported = await exportAttemptBundle({
+      repoPath: repoDir,
+      commitId,
+      baseRevision,
+    });
+    assert.ok(exported.bundleBytes > 0, "bundle must have bytes");
+    assert.ok(exported.bundleSha256.length > 0, "bundle must have sha256");
+
+    // 5. Upload via broker.uploadArtifact using the real exported bundle.
+    const { unlink, readFile } = await import("node:fs/promises");
+    const bundleBuffer = await readFile(exported.bundlePath);
+    await broker.uploadArtifact({
+      attemptId: "attempt-p11",
+      token: uploadToken,
+      meta: {
+        attemptId: "attempt-p11",
+        generation: 0,
+        kind: "attempt",
+        commitId,
+        diffDigest: `sha256:${"c".repeat(64)}`,
+        changedPaths: ["worker.ts"],
+        bundleSha256: exported.bundleSha256,
+        bundleBytes: exported.bundleBytes,
+      },
+      bundleBytes: bundleBuffer,
+    });
+    await unlink(exported.bundlePath).catch(() => undefined);
+
+    // 6. "Verified row": FakeBroker recorded the uploadArtifact call.
+    const uploadCall = broker.calls.find((c) => c.op === "uploadArtifact");
+    assert.ok(uploadCall !== undefined, "uploadArtifact must be recorded as verified row");
+
+    // 7. Token must not appear in any call record.
+    const callsStr = JSON.stringify(broker.calls);
+    assert.ok(!callsStr.includes(UPLOAD_TOKEN), "upload token must not appear in call records");
+  } finally {
+    await rm(repoDir, { recursive: true, force: true });
   }
 });

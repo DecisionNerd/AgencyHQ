@@ -127,6 +127,8 @@ function makeControlPlaneCommands(): CommandsLike {
     setMainEffort: async () => ({ ok: true }),
     setWorkItemRank: async () => ({ ok: true }),
     updateAuthority: async () => ({ ok: true, version: "2" }),
+    importHostProject: async () => ({ ok: true }),
+    revertImport: async () => ({ ok: true }),
   };
 }
 

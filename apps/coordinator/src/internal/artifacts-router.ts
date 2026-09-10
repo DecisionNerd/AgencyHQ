@@ -115,8 +115,8 @@ async function findUploadLease(
 }
 
 /**
- * Find a valid upload lease for a given project (via attempt) by token_hash.
- * Upload leases use token_hash; the bearer token is sha256'd to look up the lease.
+ * Find a valid upload or review lease for a given project (via attempt) by token_hash.
+ * Upload/review leases use token_hash; the bearer token is sha256'd to look up the lease.
  * Used for source download authorization.
  */
 async function findSourceLease(
@@ -131,12 +131,35 @@ async function findSourceLease(
        JOIN attempts a ON a.id = l.attempt_id
        JOIN step_contracts sc ON sc.id = a.contract_id
       WHERE l.token_hash = $1
-        AND l.purpose = 'upload'
+        AND l.purpose IN ('upload', 'review')
         AND l.revoked_at IS NULL
         AND l.expires_at > now()
         AND sc.project_id = $2
       LIMIT 1`,
     [tokenHash, projectId],
+  );
+  return result.rows.length > 0;
+}
+
+/**
+ * Find a valid review lease for a given attempt by token_hash.
+ * E7 / W-10: review leases authenticate artifact bundle download.
+ */
+async function findReviewLease(
+  client: PgPoolClient,
+  attemptId: string,
+  bearerToken: string,
+): Promise<boolean> {
+  const tokenHash = sha256Hex(bearerToken);
+  const result = await client.query(
+    `SELECT id FROM leases
+      WHERE token_hash = $1
+        AND attempt_id = $2
+        AND purpose = 'review'
+        AND revoked_at IS NULL
+        AND expires_at > now()
+      LIMIT 1`,
+    [tokenHash, attemptId],
   );
   return result.rows.length > 0;
 }
@@ -267,10 +290,14 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
     const client = await pool.connect();
     let bundlePath: string | undefined;
     try {
-      // Authenticate: upload-purpose lease for this attempt.
+      // Authenticate: upload or review-purpose lease for this attempt (E7 / W-10).
       const leaseRow = await findUploadLease(client, attemptId, token);
-      if (!leaseRow) {
-        return c.json({ error: "Forbidden: no valid upload lease for this attempt" }, 403);
+      const reviewAuthorized = leaseRow ? true : await findReviewLease(client, attemptId, token);
+      if (!reviewAuthorized) {
+        return c.json(
+          { error: "Forbidden: no valid upload or review lease for this attempt" },
+          403,
+        );
       }
 
       // Look up the verified artifact for this (attemptId, generation).
@@ -484,6 +511,7 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
         importResult = await importBundle(mirrorRef, bodyBuffer, {
           attemptId: claimed.attemptId,
           generation: claimed.generation,
+          kind,
           expectedHead: claimed.commitId,
           maxBundleBytes,
         });
@@ -514,16 +542,16 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
       const finalDiffDigest = await diffDigest(mirrorRef, contract.base_revision, claimed.commitId);
 
       // 9. Post-import admission: verify digest matches and bundle sha matches.
+      // X2-8: ref name includes kind so attempt and checkpoint refs are distinct.
+      const admissionTargetRef = `refs/agencyhq/attempts/${claimed.attemptId}/g${claimed.generation}/${kind}`;
       if (importResult.bundleSha256 !== claimed.bundleSha256) {
         // Delete the fetched ref on failure (D3: no state advance on failure)
-        const targetRef = `refs/agencyhq/attempts/${claimed.attemptId}/g${claimed.generation}`;
-        await deleteRef(mirrorRef.mirrorPath, targetRef).catch(() => undefined);
+        await deleteRef(mirrorRef.mirrorPath, admissionTargetRef).catch(() => undefined);
         return c.json({ error: "BUNDLE_TAMPERED" }, 422);
       }
 
       if (finalDiffDigest !== claimed.diffDigest) {
-        const targetRef = `refs/agencyhq/attempts/${claimed.attemptId}/g${claimed.generation}`;
-        await deleteRef(mirrorRef.mirrorPath, targetRef).catch(() => undefined);
+        await deleteRef(mirrorRef.mirrorPath, admissionTargetRef).catch(() => undefined);
         return c.json({ error: "DIGEST_MISMATCH" }, 422);
       }
 

@@ -67,6 +67,17 @@ export interface Broker {
   }): Promise<SourceBundleResult>;
 
   /**
+   * GET /internal/attempts/:id/artifacts/:generation/bundle — download a verified artifact bundle.
+   * E7 / W-10: authenticated with a review (or upload) lease token.
+   * Retried up to 3 times (idempotent GET). Returns bundle bytes + commitId.
+   */
+  downloadAttemptBundle(args: {
+    attemptId: string;
+    generation: number;
+    token: string;
+  }): Promise<{ bundleBytes: Buffer; commitId: string }>;
+
+  /**
    * POST /internal/attempts/:id/artifacts — upload an attempt artifact bundle.
    * Never retried. Token is from an upload lease grant.
    */
@@ -186,6 +197,41 @@ export function createBroker(baseUrl: string): Broker {
       throw lastError ?? new Error("source bundle download failed after retries");
     },
 
+    async downloadAttemptBundle({ attemptId, generation, token }) {
+      const url = `${baseUrl}/internal/attempts/${encodeURIComponent(attemptId)}/artifacts/${generation}/bundle`;
+      let lastError: Error | undefined;
+
+      for (let attempt = 0; attempt < MAX_GET_ATTEMPTS; attempt++) {
+        try {
+          const res = await fetchWithTimeout(
+            url,
+            {
+              method: "GET",
+              headers: { Authorization: `Bearer ${token}` },
+            },
+            BUNDLE_TIMEOUT_MS,
+          );
+
+          if (!res.ok) {
+            throw new Error(`attempt bundle download failed: HTTP ${res.status}`);
+          }
+
+          const commitId = res.headers.get("x-commit-id") ?? "";
+          const arrayBuffer = await res.arrayBuffer();
+          const bundleBytes = Buffer.from(arrayBuffer);
+
+          return { bundleBytes, commitId };
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (attempt < MAX_GET_ATTEMPTS - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+          }
+        }
+      }
+
+      throw lastError ?? new Error("attempt bundle download failed after retries");
+    },
+
     async uploadArtifact({ attemptId, token, meta, bundleBytes }) {
       const url = `${baseUrl}/internal/attempts/${encodeURIComponent(attemptId)}/artifacts`;
       const res = await fetchWithTimeout(
@@ -280,6 +326,7 @@ export function createBroker(baseUrl: string): Broker {
 export type BrokerCall =
   | { op: "requestLease"; purpose: string; attemptId: string; generation: number }
   | { op: "downloadSourceBundle"; projectId: string; rev: string }
+  | { op: "downloadAttemptBundle"; attemptId: string; generation: number }
   | { op: "uploadArtifact"; attemptId: string; metaKind: string; bundleBytes: number }
   | { op: "uploadCheckpoint"; attemptId: string; metaKind: string; bundleBytes: number }
   | { op: "uploadStopEvidence"; attemptId: string; stepCount: number };
@@ -364,6 +411,29 @@ export class FakeBroker implements Broker {
     const bundleBytes = this.bundles.get(key) ?? Buffer.alloc(0);
     const sha256 = createHash("sha256").update(bundleBytes).digest("hex");
     return { bundleBytes, bundleSha256: sha256 };
+  }
+
+  /**
+   * Bundle bytes keyed by `${attemptId}:${generation}` for downloadAttemptBundle.
+   */
+  attemptBundles: Map<string, { bundleBytes: Buffer; commitId: string }> = new Map();
+
+  async downloadAttemptBundle(args: {
+    attemptId: string;
+    generation: number;
+    token: string;
+  }): Promise<{ bundleBytes: Buffer; commitId: string }> {
+    this.calls.push({
+      op: "downloadAttemptBundle",
+      attemptId: args.attemptId,
+      generation: args.generation,
+    });
+    const key = `${args.attemptId}:${args.generation}`;
+    const entry = this.attemptBundles.get(key);
+    if (!entry) {
+      throw new Error(`FakeBroker: no attempt bundle for ${key}`);
+    }
+    return entry;
   }
 
   async uploadArtifact(args: {

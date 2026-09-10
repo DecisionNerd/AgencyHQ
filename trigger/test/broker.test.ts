@@ -419,3 +419,38 @@ test("createBroker: downloadSourceBundle retries GET up to 3 times", async () =>
     stub.close();
   }
 });
+
+test("createBroker: downloadAttemptBundle retries GET up to 3 times", async () => {
+  let callCount = 0;
+  const BUNDLE = Buffer.from("attempt-bundle-bytes");
+  const COMMIT_ID = "aabbcc0011223344556677889900aabbcc001122";
+
+  const stub = await makeStubServer((_req, res) => {
+    callCount++;
+    if (callCount < 3) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "x-commit-id": COMMIT_ID,
+    });
+    res.end(BUNDLE);
+  });
+
+  try {
+    const broker = createBroker(stub.baseUrl);
+    const result = await broker.downloadAttemptBundle({
+      attemptId: "attempt-retry",
+      generation: 1,
+      token: "dl-attempt-token",
+    });
+
+    assert.deepEqual(result.bundleBytes, BUNDLE);
+    assert.equal(result.commitId, COMMIT_ID);
+    assert.equal(callCount, 3, "GET must retry until success (MAX_GET_ATTEMPTS = 3)");
+  } finally {
+    stub.close();
+  }
+});
