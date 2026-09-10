@@ -12,7 +12,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type {
   Authority,
@@ -30,16 +30,22 @@ import {
   criteriaDigestInput,
   digestOf,
   IntegrateMergePayloadSchema,
+  IntegrateMergePayloadV2Schema,
   LeadAcceptPayloadSchema,
+  LeadAcceptPayloadV2Schema,
   LeadPlanPayloadSchema,
+  LeadPlanPayloadV2Schema,
   LeadReviewPayloadSchema,
+  LeadReviewPayloadV2Schema,
   permissionRulesFor,
   ReviewOutputSchema,
   TASK_IDS,
   VerifyRunOutputSchema,
   VerifyRunPayloadSchema,
+  VerifyRunPayloadV2Schema,
   WorkerAttemptOutputSchema,
   WorkerAttemptPayloadSchema,
+  WorkerAttemptPayloadV2Schema,
 } from "@agencyhq/contracts";
 import {
   applyObservation,
@@ -87,6 +93,20 @@ import { scheduleQueuedIntents } from "./schedule.ts";
 import type { FlowDeps } from "./types.ts";
 
 // ---------------------------------------------------------------------------
+// Nonce helpers (D1 / W-1)
+// ---------------------------------------------------------------------------
+
+/** Generate a 32-byte random nonce (64-char hex). SECURITY: never log the raw value. */
+function generateDispatchNonce(): string {
+  return randomBytes(32).toString("hex");
+}
+
+/** sha256 hex of a nonce value. Only the hash is stored in the DB. */
+function hashNonce(nonce: string): string {
+  return createHash("sha256").update(nonce, "utf8").digest("hex");
+}
+
+// ---------------------------------------------------------------------------
 // Row types (raw DB rows, accessed via pool.query)
 // ---------------------------------------------------------------------------
 
@@ -99,6 +119,8 @@ interface ProjectRow {
   authority_version: string;
   profile_catalog?: unknown;
   allowed_refs: unknown;
+  /** Source mode: 'mirror' uses v2 payloads; 'host_clone' uses v1 (D8). */
+  source_mode?: "mirror" | "host_clone" | null;
 }
 
 interface WorkItemRow {
@@ -523,19 +545,46 @@ export async function finalizeAcceptedAttempt(
     const mergeIntentId = randomUUID() as unknown as DispatchIntentId;
     const mergeIdempotencyKey = `${String(mergeIntentId)}:g${String(attemptRow.generation)}`;
 
-    const mergePayload = IntegrateMergePayloadSchema.parse({
-      attemptId: ctx.attemptId,
-      generation: attemptRow.generation,
-      contractId: ctx.contractId,
-      contractVersion: ctx.contractVersion,
-      projectId: contractRow.project_id,
-      repoPath: projectRow.clone_path ?? worktreeBase,
-      remote: projectRow.remote ?? "origin",
-      targetRef,
-      expectedBaseRevision,
-      attemptRevision: ctx.artifactRevision,
-      strategy: "merge_commit",
-    });
+    // D8 / W-5: v2 payload for mirror projects; v1 for host_clone.
+    const mergeIsMirror = projectRow.source_mode === "mirror";
+    const mergeNonce = mergeIsMirror ? generateDispatchNonce() : undefined;
+    let mergePayload: unknown;
+    if (mergeIsMirror) {
+      mergePayload = IntegrateMergePayloadV2Schema.parse({
+        payloadVersion: 2,
+        attemptId: ctx.attemptId,
+        generation: attemptRow.generation,
+        contractId: ctx.contractId,
+        contractVersion: ctx.contractVersion,
+        projectId: contractRow.project_id,
+        remote: projectRow.remote ?? "origin",
+        targetRef,
+        expectedBaseRevision,
+        attemptRevision: ctx.artifactRevision,
+        strategy: "merge_commit",
+        source: {
+          projectId: contractRow.project_id,
+          revision: ctx.artifactRevision,
+          bundlePath: `/internal/source/${contractRow.project_id}?rev=${ctx.artifactRevision}`,
+        },
+        integrateLease: { purpose: "integrate" },
+        leaseNonce: mergeNonce,
+      });
+    } else {
+      mergePayload = IntegrateMergePayloadSchema.parse({
+        attemptId: ctx.attemptId,
+        generation: attemptRow.generation,
+        contractId: ctx.contractId,
+        contractVersion: ctx.contractVersion,
+        projectId: contractRow.project_id,
+        repoPath: projectRow.clone_path ?? worktreeBase,
+        remote: projectRow.remote ?? "origin",
+        targetRef,
+        expectedBaseRevision,
+        attemptRevision: ctx.artifactRevision,
+        strategy: "merge_commit",
+      });
+    }
 
     await client.query("BEGIN");
     try {
@@ -581,16 +630,18 @@ export async function finalizeAcceptedAttempt(
       });
 
       // Insert dispatch intent for integrate.merge (R-002: committed before trigger).
+      // E5: write nonce hash in INSERT (same tx as intent creation).
       await client.query(
         `INSERT INTO dispatch_intents
-           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
         [
           String(mergeIntentId),
           TASK_IDS.integrateMerge,
           String(digestOf(mergePayload)),
           ctx.attemptId,
           mergeIdempotencyKey,
+          mergeNonce ? hashNonce(mergeNonce) : null,
         ],
       );
 
@@ -625,6 +676,7 @@ export async function finalizeAcceptedAttempt(
       },
     });
 
+    // Update status and run_id only (nonce hash already set in INSERT above).
     await pool.query(
       "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
       [String(mergeIntentId), mergeRunId],
@@ -797,32 +849,66 @@ export class BoundedRepairFlow {
           : {}),
       });
 
-      const payload = LeadPlanPayloadSchema.parse({
-        workItemId: wiRow.id,
-        projectId: targetProjectRow.id,
-        repoPath: targetProjectRow.clone_path ?? config.worktreeBase,
-        baseRevision,
-        worktreeBase: config.worktreeBase,
-        authority: targetProjectRow.authority,
-        profileCatalog: Array.isArray(targetProjectRow.profile_catalog)
-          ? (targetProjectRow.profile_catalog as string[])
-          : [],
-        ...(wiRow.defect ? { defect: wiRow.defect } : {}),
-        operatorIntent,
-        model: config.leadModel,
-        ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
-      });
+      // D8 / W-5: v2 payload for mirror projects.
+      const planIsMirror = targetProjectRow.source_mode === "mirror";
+      const planNonce = planIsMirror ? generateDispatchNonce() : undefined;
+      let payload: unknown;
+      if (planIsMirror) {
+        payload = LeadPlanPayloadV2Schema.parse({
+          payloadVersion: 2,
+          workItemId: wiRow.id,
+          projectId: targetProjectRow.id,
+          source: {
+            projectId: targetProjectRow.id,
+            revision: baseRevision,
+            bundlePath: `/internal/source/${targetProjectRow.id}?rev=${baseRevision}`,
+          },
+          baseRevision,
+          authority: targetProjectRow.authority,
+          profileCatalog: Array.isArray(targetProjectRow.profile_catalog)
+            ? (targetProjectRow.profile_catalog as string[])
+            : [],
+          ...(wiRow.defect ? { defect: wiRow.defect } : {}),
+          operatorIntent,
+          model: config.leadModel,
+          ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
+          leaseNonce: planNonce,
+        });
+      } else {
+        payload = LeadPlanPayloadSchema.parse({
+          workItemId: wiRow.id,
+          projectId: targetProjectRow.id,
+          repoPath: targetProjectRow.clone_path ?? config.worktreeBase,
+          baseRevision,
+          worktreeBase: config.worktreeBase,
+          authority: targetProjectRow.authority,
+          profileCatalog: Array.isArray(targetProjectRow.profile_catalog)
+            ? (targetProjectRow.profile_catalog as string[])
+            : [],
+          ...(wiRow.defect ? { defect: wiRow.defect } : {}),
+          operatorIntent,
+          model: config.leadModel,
+          ...(manifestForPayload ? { manifest: manifestForPayload } : {}),
+        });
+      }
 
       const intentId = ids.next("di") as DispatchIntentId;
       const idempotencyKey = `leadplan:${workItemId}:${String(intentId)}`;
       const payloadDigest = digestOf(payload);
 
+      // E5 / X2-5: write nonce hash in the INSERT (same tx as the intent).
       await client.query("BEGIN");
       await client.query(
         `INSERT INTO dispatch_intents
-           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-         VALUES ($1, $2, $3, NULL, 'recorded', NULL, $4)`,
-        [String(intentId), TASK_IDS.leadPlan, String(payloadDigest), idempotencyKey],
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+         VALUES ($1, $2, $3, NULL, 'recorded', NULL, $4, $5)`,
+        [
+          String(intentId),
+          TASK_IDS.leadPlan,
+          String(payloadDigest),
+          idempotencyKey,
+          planNonce ? hashNonce(planNonce) : null,
+        ],
       );
       await client.query("COMMIT");
 
@@ -836,6 +922,7 @@ export class BoundedRepairFlow {
         },
       });
 
+      // Update status and run_id only (nonce hash already set in INSERT).
       await pool.query(
         "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
         [String(intentId), runId],
@@ -893,7 +980,6 @@ export class BoundedRepairFlow {
       let activeEntryTargetRef: string | null = null;
       let manifestDigestValue: string | null = null;
       let activeManifestEntry: ManifestEntry | null = null;
-      let allManifestEntries: ManifestEntry[] | null = null;
       if (wipRows.length > 0) {
         const manifestEntries: ManifestEntry[] = wipRows.map((row) => ({
           position: row.position,
@@ -902,7 +988,6 @@ export class BoundedRepairFlow {
           expectedBaseRevision: row.expected_base_revision,
           resultRevision: row.result_revision,
         }));
-        allManifestEntries = manifestEntries;
         const activeEntry = nextEntry(manifestEntries);
         activeManifestEntry = activeEntry ?? null;
         projectRow = await loadProject(pool, activeEntry?.projectId ?? wiRow.project_id);
@@ -1259,7 +1344,12 @@ export class BoundedRepairFlow {
       // it returns per-intent outcomes. We inspect the result for the newly
       // queued worker intent only. Failures of OTHER queued intents during this
       // pass are logged and left queued — the next poll retries them.
-      const scheduleResult = await scheduleQueuedIntents(this.deps, (id) => this.retryDispatch(id));
+      // D9 / W-11: pass provider status to gate at admission.
+      const scheduleResult = await scheduleQueuedIntents(
+        this.deps,
+        (id) => this.retryDispatch(id),
+        this.deps.providerState?.(),
+      );
 
       // Log failures for other intents (they stay queued; next poll retries).
       for (const f of scheduleResult.failed) {
@@ -1613,9 +1703,176 @@ export class BoundedRepairFlow {
           return;
         }
 
+        // E3 / X2-3 / W-5: mirror mode — verified row is the source of truth.
+        // Check attempt_artifacts for a verified=true row matching the worker's claim.
+        // If absent, the artifact was not admitted (upload never completed or failed
+        // domain validation); treat as an execution failure and apply bounded retry.
+        const isMirrorWorker = projectRow.source_mode === "mirror";
+        let revision = output.commitId;
+        let diffDigest = output.diffDigest ?? String(digestOf({ revision }));
+
+        if (isMirrorWorker) {
+          const { rows: verifiedRows } = await client.query<{
+            commit_id: string;
+            diff_digest: string;
+          }>(
+            `SELECT commit_id, diff_digest FROM attempt_artifacts
+             WHERE attempt_id = $1 AND generation = $2 AND kind = 'attempt'
+               AND commit_id = $3 AND verified = true
+             LIMIT 1`,
+            [attemptRow.id, attemptRow.generation, output.commitId],
+          );
+          if (verifiedRows.length === 0) {
+            // Artifact was not admitted — execution failure, bounded retry.
+            const notAdmittedFailureId = ids.next("fail") as FailureId;
+            const notAdmittedBudget = attemptRow.budget_remaining - 1;
+            await client.query("BEGIN");
+            await client.query(
+              `INSERT INTO failures (id, class, phase, attempt_id, run_id, cause)
+               VALUES ($1, 'execution', 'final', $2, $3, $4)`,
+              [
+                String(notAdmittedFailureId),
+                attemptRow.id,
+                obs.runId,
+                `artifact_not_admitted: no verified artifact row for attempt ${attemptRow.id} generation ${String(attemptRow.generation)} commitId ${output.commitId}`,
+              ],
+            );
+            const { rowCount: notAdmittedFailedRows } = await client.query(
+              "UPDATE attempts SET status = 'failed', failure_id = $2, updated_at = now() WHERE id = $1 AND status IN ('admitted','dispatched','running')",
+              [attemptRow.id, String(notAdmittedFailureId)],
+            );
+            if (!notAdmittedFailedRows) {
+              await client.query("ROLLBACK");
+              await completeCommand(client, commandId, { skipped: "stale_status" });
+              return;
+            }
+            await client.query(
+              "UPDATE dispatch_intents SET status = 'observed', updated_at = now() WHERE id = $1 AND status = 'triggered'",
+              [workerIntentRow.id],
+            );
+            if (notAdmittedBudget > 0) {
+              const notAdmittedNewAttemptId = ids.next("att") as AttemptId;
+              // X3-7: build v2 payload for mirror-mode retries (no host path).
+              let notAdmittedNewPayload: unknown;
+              let notAdmittedDispatchNonce: string | undefined;
+              if (isMirrorWorker) {
+                notAdmittedDispatchNonce = generateDispatchNonce();
+                const notAdmittedBundlePath = `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`;
+                notAdmittedNewPayload = WorkerAttemptPayloadV2Schema.parse({
+                  payloadVersion: 2,
+                  attemptId: String(notAdmittedNewAttemptId),
+                  generation: 1,
+                  contractId: contractRow.id,
+                  contractVersion: String(contractRow.version),
+                  source: {
+                    projectId: projectRow.id,
+                    revision: contractRow.base_revision,
+                    bundlePath: notAdmittedBundlePath,
+                  },
+                  baseRev: contractRow.base_revision,
+                  prompt: contractRow.inputs?.intent ?? "",
+                  allowedPaths: contractRow.bounds.paths.allow,
+                  bounds: contractRow.bounds,
+                  permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath: "" }),
+                  model: config.workerModel,
+                  leaseNonce: notAdmittedDispatchNonce,
+                });
+              } else {
+                const notAdmittedWorktreePath = `${config.worktreeBase}/${String(notAdmittedNewAttemptId)}`;
+                notAdmittedNewPayload = WorkerAttemptPayloadSchema.parse({
+                  attemptId: String(notAdmittedNewAttemptId),
+                  generation: 1,
+                  contractId: contractRow.id,
+                  contractVersion: String(contractRow.version),
+                  repoPath: projectRow.clone_path ?? config.worktreeBase,
+                  baseRev: contractRow.base_revision,
+                  prompt: contractRow.inputs?.intent ?? "",
+                  allowedPaths: contractRow.bounds.paths.allow,
+                  bounds: contractRow.bounds,
+                  permissionRules: permissionRulesFor(contractRow.bounds, {
+                    worktreePath: notAdmittedWorktreePath,
+                  }),
+                  model: config.workerModel,
+                  worktreeBase: config.worktreeBase,
+                });
+              }
+              const notAdmittedIntentId = ids.next("di") as DispatchIntentId;
+              const notAdmittedIntentKey = `${String(notAdmittedIntentId)}:g1`;
+              await client.query(
+                `INSERT INTO attempts
+                   (id, contract_id, contract_version, generation, status, budget_remaining)
+                 VALUES ($1, $2, $3, 1, 'admitted', $4)`,
+                [
+                  String(notAdmittedNewAttemptId),
+                  contractRow.id,
+                  contractRow.version,
+                  notAdmittedBudget,
+                ],
+              );
+              await client.query(
+                `INSERT INTO dispatch_intents
+                   (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+                 VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
+                [
+                  String(notAdmittedIntentId),
+                  TASK_IDS.workerAttempt,
+                  String(digestOf(notAdmittedNewPayload)),
+                  String(notAdmittedNewAttemptId),
+                  notAdmittedIntentKey,
+                  notAdmittedDispatchNonce ? hashNonce(notAdmittedDispatchNonce) : null,
+                ],
+              );
+              await client.query("COMMIT");
+              const { runId: notAdmittedNewRunId } = await runtime.trigger({
+                intentId: notAdmittedIntentId,
+                task: TASK_IDS.workerAttempt,
+                payload: notAdmittedNewPayload,
+                options: {
+                  idempotencyKey: notAdmittedIntentKey,
+                  maxDurationSeconds: contractRow.bounds.budget.maxDurationSeconds,
+                  concurrencyKey: contractRow.project_id,
+                  tags: triggerTags({
+                    projectId: contractRow.project_id,
+                    workItemId: contractRow.work_item_id,
+                    contractId: contractRow.id,
+                    contractVersion: contractRow.version,
+                    attemptId: String(notAdmittedNewAttemptId),
+                  }),
+                },
+              });
+              await pool.query(
+                "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
+                [String(notAdmittedIntentId), notAdmittedNewRunId],
+              );
+              await pool.query(
+                "UPDATE attempts SET run_id = $2, status = 'dispatched', updated_at = now() WHERE id = $1",
+                [String(notAdmittedNewAttemptId), notAdmittedNewRunId],
+              );
+              await completeCommand(client, commandId, {
+                failureId: String(notAdmittedFailureId),
+                artifactNotAdmitted: true,
+                newAttemptId: String(notAdmittedNewAttemptId),
+                newRunId: notAdmittedNewRunId,
+              });
+            } else {
+              await client.query("COMMIT");
+              await completeCommand(client, commandId, {
+                failureId: String(notAdmittedFailureId),
+                artifactNotAdmitted: true,
+                budgetExhausted: true,
+              });
+            }
+            return;
+          }
+          // Use the verified row's canonical fields — not the worker's claim.
+          const vrow = verifiedRows[0];
+          if (vrow) {
+            revision = vrow.commit_id;
+            diffDigest = vrow.diff_digest;
+          }
+        }
+
         const artifactId = ids.next("art") as ArtifactId;
-        const revision = output.commitId;
-        const diffDigest = output.diffDigest ?? String(digestOf({ revision }));
 
         const resolvedProfile = await profileResolver(contractRow.profile_id);
 
@@ -1693,36 +1950,69 @@ export class BoundedRepairFlow {
           };
         }
 
-        const verifyPayload = VerifyRunPayloadSchema.parse({
-          attemptId: attemptRow.id,
-          generation: attemptRow.generation,
-          contractId: contractRow.id,
-          profileId: contractRow.profile_id,
-          profileDigest: resolvedProfile.digest,
-          criteriaDigest: contractRow.criteria_digest,
-          repoPath: projectRow.clone_path ?? config.worktreeBase,
-          worktreeBase: config.worktreeBase,
-          baseRevision: contractRow.base_revision,
-          attemptRevision: revision,
-          diffDigest,
-          checks: resolvedProfile.checks,
-          protectedPaths: resolvedProfile.protectedPaths, // F-6
-          ...(verifyManifestPayload ? { manifest: verifyManifestPayload } : {}),
-        });
+        // D8 / W-5: use v2 payload for mirror projects, v1 for host_clone.
+        // D1 / W-1: generate dispatch nonce for v2.
+        const verifyIsMirror = projectRow.source_mode === "mirror";
+        const verifyNonce = verifyIsMirror ? generateDispatchNonce() : undefined;
+        let verifyPayload: unknown;
+        if (verifyIsMirror) {
+          const bundlePath = `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`;
+          verifyPayload = VerifyRunPayloadV2Schema.parse({
+            payloadVersion: 2,
+            attemptId: attemptRow.id,
+            generation: attemptRow.generation,
+            contractId: contractRow.id,
+            profileId: contractRow.profile_id,
+            profileDigest: resolvedProfile.digest,
+            criteriaDigest: contractRow.criteria_digest,
+            source: {
+              projectId: projectRow.id,
+              revision: contractRow.base_revision,
+              bundlePath,
+            },
+            baseRevision: contractRow.base_revision,
+            attemptRevision: revision,
+            diffDigest,
+            checks: resolvedProfile.checks,
+            protectedPaths: resolvedProfile.protectedPaths,
+            ...(verifyManifestPayload ? { manifest: verifyManifestPayload } : {}),
+            leaseNonce: verifyNonce,
+          });
+        } else {
+          verifyPayload = VerifyRunPayloadSchema.parse({
+            attemptId: attemptRow.id,
+            generation: attemptRow.generation,
+            contractId: contractRow.id,
+            profileId: contractRow.profile_id,
+            profileDigest: resolvedProfile.digest,
+            criteriaDigest: contractRow.criteria_digest,
+            repoPath: projectRow.clone_path ?? config.worktreeBase,
+            worktreeBase: config.worktreeBase,
+            baseRevision: contractRow.base_revision,
+            attemptRevision: revision,
+            diffDigest,
+            checks: resolvedProfile.checks,
+            protectedPaths: resolvedProfile.protectedPaths, // F-6
+            ...(verifyManifestPayload ? { manifest: verifyManifestPayload } : {}),
+          });
+        }
 
         // Combine parsed payload with extension fields (manifest ext is not in the schema).
-        const verifyTriggerPayload = { ...verifyPayload, ...verifyManifestExt };
+        const verifyTriggerPayload = { ...(verifyPayload as object), ...verifyManifestExt };
 
+        // E5 / X2-5: write nonce hash in the same INSERT as the intent so a fast
+        // container cannot race to request a lease before the hash lands.
         await client.query(
           `INSERT INTO dispatch_intents
-             (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-           VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+             (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+           VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
           [
             String(verifyIntentId),
             TASK_IDS.verifyRun,
             String(digestOf(verifyPayload)),
             attemptRow.id,
             String(verifyIntentId),
+            verifyNonce ? hashNonce(verifyNonce) : null,
           ],
         );
 
@@ -1752,6 +2042,7 @@ export class BoundedRepairFlow {
           },
         });
 
+        // Update status and run_id only (nonce hash was written in the INSERT above).
         await pool.query(
           "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
           [String(verifyIntentId), verifyRunId],
@@ -1815,22 +2106,51 @@ export class BoundedRepairFlow {
       } else if (classification.autoNewAttempt) {
         const newAttemptId = ids.next("att") as AttemptId;
         const newBudget = attemptRow.budget_remaining - 1;
-        const worktreePath = `${config.worktreeBase}/${String(newAttemptId)}`;
+        // X3-7: mirror check for autoNewAttempt (same as artifact_not_admitted path).
+        const isMirrorWorker = projectRow.source_mode === "mirror";
 
-        const newWorkerPayload = WorkerAttemptPayloadSchema.parse({
-          attemptId: String(newAttemptId),
-          generation: 1,
-          contractId: contractRow.id,
-          contractVersion: String(contractRow.version),
-          repoPath: projectRow.clone_path ?? config.worktreeBase,
-          baseRev: contractRow.base_revision,
-          prompt: contractRow.inputs?.intent ?? "",
-          allowedPaths: contractRow.bounds.paths.allow,
-          bounds: contractRow.bounds,
-          permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath }),
-          model: config.workerModel,
-          worktreeBase: config.worktreeBase,
-        });
+        // X3-7: build v2 payload for mirror-mode retries (no host path/worktreePath).
+        let newWorkerPayload: unknown;
+        let newDispatchNonce: string | undefined;
+        if (isMirrorWorker) {
+          newDispatchNonce = generateDispatchNonce();
+          const newBundlePath = `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`;
+          newWorkerPayload = WorkerAttemptPayloadV2Schema.parse({
+            payloadVersion: 2,
+            attemptId: String(newAttemptId),
+            generation: 1,
+            contractId: contractRow.id,
+            contractVersion: String(contractRow.version),
+            source: {
+              projectId: projectRow.id,
+              revision: contractRow.base_revision,
+              bundlePath: newBundlePath,
+            },
+            baseRev: contractRow.base_revision,
+            prompt: contractRow.inputs?.intent ?? "",
+            allowedPaths: contractRow.bounds.paths.allow,
+            bounds: contractRow.bounds,
+            permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath: "" }),
+            model: config.workerModel,
+            leaseNonce: newDispatchNonce,
+          });
+        } else {
+          const worktreePath = `${config.worktreeBase}/${String(newAttemptId)}`;
+          newWorkerPayload = WorkerAttemptPayloadSchema.parse({
+            attemptId: String(newAttemptId),
+            generation: 1,
+            contractId: contractRow.id,
+            contractVersion: String(contractRow.version),
+            repoPath: projectRow.clone_path ?? config.worktreeBase,
+            baseRev: contractRow.base_revision,
+            prompt: contractRow.inputs?.intent ?? "",
+            allowedPaths: contractRow.bounds.paths.allow,
+            bounds: contractRow.bounds,
+            permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath }),
+            model: config.workerModel,
+            worktreeBase: config.worktreeBase,
+          });
+        }
 
         const newIntentId = ids.next("di") as DispatchIntentId;
         // New attempt starts at generation 1; encode it in the idempotency key (F-2).
@@ -1860,14 +2180,15 @@ export class BoundedRepairFlow {
         );
         await client.query(
           `INSERT INTO dispatch_intents
-             (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-           VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+             (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+           VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
           [
             String(newIntentId),
             TASK_IDS.workerAttempt,
             String(digestOf(newWorkerPayload)),
             String(newAttemptId),
             newIntentKey,
+            newDispatchNonce ? hashNonce(newDispatchNonce) : null,
           ],
         );
         // Close the incoming worker intent inside the transaction (F-5).
@@ -2092,34 +2413,69 @@ export class BoundedRepairFlow {
         }
       }
       const reviewIntentId = ids.next("di") as DispatchIntentId;
-      const reviewPayload = LeadReviewPayloadSchema.parse({
-        attemptId: attemptRow.id,
-        generation: attemptRow.generation,
-        contractId: contractRow.id,
-        criteria: contractRow.criteria,
-        criteriaDigest: contractRow.criteria_digest,
-        profileDigest: resolvedProfile.digest,
-        attemptRevision: artifactRow.revision,
-        diffDigest: artifactRow.diff_digest,
-        patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
-        verificationResults: results,
-        model: config.reviewerModel,
-        repoPath: projectRow.clone_path ?? config.worktreeBase,
-        worktreeBase: config.worktreeBase,
-        baseRevision: contractRow.base_revision,
-      });
+      // D8 / W-5: use v2 payload for mirror projects.
+      const reviewIsMirror = projectRow.source_mode === "mirror";
+      const reviewNonce = reviewIsMirror ? generateDispatchNonce() : undefined;
+      let reviewPayload: unknown;
+      if (reviewIsMirror) {
+        // D7 / W-10: source = base bundle, patch = attempt artifact bundle.
+        reviewPayload = LeadReviewPayloadV2Schema.parse({
+          payloadVersion: 2,
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          contractId: contractRow.id,
+          criteria: contractRow.criteria,
+          criteriaDigest: contractRow.criteria_digest,
+          profileDigest: resolvedProfile.digest,
+          attemptRevision: artifactRow.revision,
+          diffDigest: artifactRow.diff_digest,
+          patch: {
+            attemptId: attemptRow.id,
+            generation: attemptRow.generation,
+            revision: artifactRow.revision,
+          },
+          verificationResults: results,
+          model: config.reviewerModel,
+          source: {
+            projectId: projectRow.id,
+            revision: contractRow.base_revision,
+            bundlePath: `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`,
+          },
+          baseRevision: contractRow.base_revision,
+          leaseNonce: reviewNonce,
+        });
+      } else {
+        reviewPayload = LeadReviewPayloadSchema.parse({
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          contractId: contractRow.id,
+          criteria: contractRow.criteria,
+          criteriaDigest: contractRow.criteria_digest,
+          profileDigest: resolvedProfile.digest,
+          attemptRevision: artifactRow.revision,
+          diffDigest: artifactRow.diff_digest,
+          patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
+          verificationResults: results,
+          model: config.reviewerModel,
+          repoPath: projectRow.clone_path ?? config.worktreeBase,
+          worktreeBase: config.worktreeBase,
+          baseRevision: contractRow.base_revision,
+        });
+      }
 
-      // Insert review intent and close incoming verify intent in the same tx (F-5).
+      // E5 / X2-5: write nonce hash in INSERT (same tx); insert review intent and
+      // close incoming verify intent together (F-5).
       await client.query(
         `INSERT INTO dispatch_intents
-           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
         [
           String(reviewIntentId),
           TASK_IDS.leadReview,
           String(digestOf(reviewPayload)),
           attemptRow.id,
           String(reviewIntentId),
+          reviewNonce ? hashNonce(reviewNonce) : null,
         ],
       );
       await client.query(
@@ -2147,6 +2503,7 @@ export class BoundedRepairFlow {
         },
       });
 
+      // Update status and run_id only (nonce hash already set in INSERT).
       await pool.query(
         "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
         [String(reviewIntentId), reviewRunId],
@@ -2224,28 +2581,61 @@ export class BoundedRepairFlow {
           // First failure: dispatch a bounded retry with idempotency key <intentId>:r1.
           const retryIntentId = ids.next("di") as DispatchIntentId;
           const retryKey = `${intentRow.id}:r1`;
-          const retryPayload = LeadReviewPayloadSchema.parse({
-            attemptId: attemptRow.id,
-            generation: attemptRow.generation,
-            contractId: contractRow.id,
-            criteria: contractRow.criteria,
-            criteriaDigest: contractRow.criteria_digest,
-            profileDigest: resolvedProfile.digest,
-            attemptRevision: artifactRow?.revision ?? "",
-            diffDigest: artifactRow?.diff_digest ?? "",
-            patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
-            verificationResults,
-            model: config.reviewerModel,
-            repoPath: projectRow.clone_path ?? config.worktreeBase,
-            worktreeBase: config.worktreeBase,
-            baseRevision: contractRow.base_revision,
-          });
+          // D8 / W-5: v2 payload for mirror projects on retry too.
+          const retryReviewIsMirror = projectRow.source_mode === "mirror";
+          const retryReviewNonce = retryReviewIsMirror ? generateDispatchNonce() : undefined;
+          let retryPayload: unknown;
+          if (retryReviewIsMirror) {
+            // D7 / W-10: source = base bundle, patch = attempt artifact bundle.
+            retryPayload = LeadReviewPayloadV2Schema.parse({
+              payloadVersion: 2,
+              attemptId: attemptRow.id,
+              generation: attemptRow.generation,
+              contractId: contractRow.id,
+              criteria: contractRow.criteria,
+              criteriaDigest: contractRow.criteria_digest,
+              profileDigest: resolvedProfile.digest,
+              attemptRevision: artifactRow?.revision ?? "",
+              diffDigest: artifactRow?.diff_digest ?? "",
+              patch: {
+                attemptId: attemptRow.id,
+                generation: attemptRow.generation,
+                revision: artifactRow?.revision ?? "",
+              },
+              verificationResults,
+              model: config.reviewerModel,
+              source: {
+                projectId: projectRow.id,
+                revision: contractRow.base_revision,
+                bundlePath: `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`,
+              },
+              baseRevision: contractRow.base_revision,
+              leaseNonce: retryReviewNonce,
+            });
+          } else {
+            retryPayload = LeadReviewPayloadSchema.parse({
+              attemptId: attemptRow.id,
+              generation: attemptRow.generation,
+              contractId: contractRow.id,
+              criteria: contractRow.criteria,
+              criteriaDigest: contractRow.criteria_digest,
+              profileDigest: resolvedProfile.digest,
+              attemptRevision: artifactRow?.revision ?? "",
+              diffDigest: artifactRow?.diff_digest ?? "",
+              patchPath: `${config.worktreeBase}/${attemptRow.id}.patch`,
+              verificationResults,
+              model: config.reviewerModel,
+              repoPath: projectRow.clone_path ?? config.worktreeBase,
+              worktreeBase: config.worktreeBase,
+              baseRevision: contractRow.base_revision,
+            });
+          }
 
-          // ON CONFLICT ensures idempotency across reconciler replays.
+          // E5: write nonce hash in INSERT. ON CONFLICT ensures idempotency.
           await client.query(
             `INSERT INTO dispatch_intents
-               (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-             VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)
+               (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+             VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)
              ON CONFLICT (idempotency_key) DO NOTHING`,
             [
               String(retryIntentId),
@@ -2253,6 +2643,7 @@ export class BoundedRepairFlow {
               String(digestOf(retryPayload)),
               attemptRow.id,
               retryKey,
+              retryReviewNonce ? hashNonce(retryReviewNonce) : null,
             ],
           );
           await client.query(
@@ -2279,6 +2670,7 @@ export class BoundedRepairFlow {
               }),
             },
           });
+          // Update status and run_id only (nonce hash already set in INSERT).
           await pool.query(
             "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
             [String(retryIntentId), retryRunId],
@@ -2313,19 +2705,41 @@ export class BoundedRepairFlow {
       const review = reviewOutput.data;
 
       const acceptIntentId = ids.next("di") as DispatchIntentId;
-      const acceptPayload = LeadAcceptPayloadSchema.parse({
-        attemptId: attemptRow.id,
-        generation: attemptRow.generation,
-        contractId: contractRow.id,
-        criteria: contractRow.criteria,
-        criteriaDigest: contractRow.criteria_digest,
-        profileDigest: resolvedProfile.digest,
-        attemptRevision: artifactRow?.revision ?? "",
-        diffDigest: artifactRow?.diff_digest ?? "",
-        verificationResults,
-        review,
-        model: config.leadModel,
-      });
+      // D8 / W-5: v2 payload for mirror projects.
+      const acceptIsMirror = projectRow.source_mode === "mirror";
+      const acceptNonce = acceptIsMirror ? generateDispatchNonce() : undefined;
+      let acceptPayload: unknown;
+      if (acceptIsMirror) {
+        acceptPayload = LeadAcceptPayloadV2Schema.parse({
+          payloadVersion: 2,
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          contractId: contractRow.id,
+          criteria: contractRow.criteria,
+          criteriaDigest: contractRow.criteria_digest,
+          profileDigest: resolvedProfile.digest,
+          attemptRevision: artifactRow?.revision ?? "",
+          diffDigest: artifactRow?.diff_digest ?? "",
+          verificationResults,
+          review,
+          model: config.leadModel,
+          leaseNonce: acceptNonce,
+        });
+      } else {
+        acceptPayload = LeadAcceptPayloadSchema.parse({
+          attemptId: attemptRow.id,
+          generation: attemptRow.generation,
+          contractId: contractRow.id,
+          criteria: contractRow.criteria,
+          criteriaDigest: contractRow.criteria_digest,
+          profileDigest: resolvedProfile.digest,
+          attemptRevision: artifactRow?.revision ?? "",
+          diffDigest: artifactRow?.diff_digest ?? "",
+          verificationResults,
+          review,
+          model: config.leadModel,
+        });
+      }
 
       const reviewId = ids.next("rev") as ReviewId;
       await client.query("BEGIN");
@@ -2347,17 +2761,19 @@ export class BoundedRepairFlow {
         ],
       );
 
-      // Insert accept intent and close incoming review intent in same tx (F-5).
+      // E5 / X2-5: write nonce hash in INSERT; insert accept intent and close
+      // incoming review intent in same tx (F-5).
       await client.query(
         `INSERT INTO dispatch_intents
-           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+           (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+         VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
         [
           String(acceptIntentId),
           TASK_IDS.leadAccept,
           String(digestOf(acceptPayload)),
           attemptRow.id,
           String(acceptIntentId),
+          acceptNonce ? hashNonce(acceptNonce) : null,
         ],
       );
       await client.query(
@@ -2385,6 +2801,7 @@ export class BoundedRepairFlow {
         },
       });
 
+      // Update status and run_id only (nonce hash already set in INSERT).
       await pool.query(
         "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
         [String(acceptIntentId), acceptRunId],
@@ -2488,26 +2905,51 @@ export class BoundedRepairFlow {
               }>,
             };
 
+            const failProjectRow = await loadProject(pool, failContractRow.project_id);
+
             const retryIntentId = ids.next("di") as DispatchIntentId;
             const retryKey = `${intentRow.id}:r1`;
-            const retryPayload = LeadAcceptPayloadSchema.parse({
-              attemptId: failAttemptRow.id,
-              generation: failAttemptRow.generation,
-              contractId: failContractRow.id,
-              criteria: failContractRow.criteria,
-              criteriaDigest: failContractRow.criteria_digest,
-              profileDigest: failResolvedProfile.digest,
-              attemptRevision: failArtifactRow?.revision ?? "",
-              diffDigest: failArtifactRow?.diff_digest ?? "",
-              verificationResults: failVerificationResults,
-              review: failReview,
-              model: config.leadModel,
-            });
+            // D8 / W-5: v2 payload for mirror projects on retry.
+            const retryAcceptIsMirror = failProjectRow?.source_mode === "mirror";
+            const retryAcceptNonce = retryAcceptIsMirror ? generateDispatchNonce() : undefined;
+            let retryPayload: unknown;
+            if (retryAcceptIsMirror && failProjectRow) {
+              retryPayload = LeadAcceptPayloadV2Schema.parse({
+                payloadVersion: 2,
+                attemptId: failAttemptRow.id,
+                generation: failAttemptRow.generation,
+                contractId: failContractRow.id,
+                criteria: failContractRow.criteria,
+                criteriaDigest: failContractRow.criteria_digest,
+                profileDigest: failResolvedProfile.digest,
+                attemptRevision: failArtifactRow?.revision ?? "",
+                diffDigest: failArtifactRow?.diff_digest ?? "",
+                verificationResults: failVerificationResults,
+                review: failReview,
+                model: config.leadModel,
+                leaseNonce: retryAcceptNonce,
+              });
+            } else {
+              retryPayload = LeadAcceptPayloadSchema.parse({
+                attemptId: failAttemptRow.id,
+                generation: failAttemptRow.generation,
+                contractId: failContractRow.id,
+                criteria: failContractRow.criteria,
+                criteriaDigest: failContractRow.criteria_digest,
+                profileDigest: failResolvedProfile.digest,
+                attemptRevision: failArtifactRow?.revision ?? "",
+                diffDigest: failArtifactRow?.diff_digest ?? "",
+                verificationResults: failVerificationResults,
+                review: failReview,
+                model: config.leadModel,
+              });
+            }
 
+            // E5: write nonce hash in INSERT. ON CONFLICT ensures idempotency.
             await client.query(
               `INSERT INTO dispatch_intents
-                 (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-               VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)
+                 (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+               VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)
                ON CONFLICT (idempotency_key) DO NOTHING`,
               [
                 String(retryIntentId),
@@ -2515,6 +2957,7 @@ export class BoundedRepairFlow {
                 String(digestOf(retryPayload)),
                 failAttemptRow.id,
                 retryKey,
+                retryAcceptNonce ? hashNonce(retryAcceptNonce) : null,
               ],
             );
             await client.query(
@@ -2540,6 +2983,7 @@ export class BoundedRepairFlow {
                 }),
               },
             });
+            // Update status and run_id only (nonce hash already set in INSERT).
             await pool.query(
               "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, updated_at = now() WHERE id = $1",
               [String(retryIntentId), retryRunId],
@@ -2743,21 +3187,63 @@ export class BoundedRepairFlow {
     const contractRow = await loadContract(pool, attemptRow.contract_id);
     const projectRow = await loadProject(pool, contractRow.project_id);
 
-    const worktreePath = `${config.worktreeBase}/${attemptRow.id}`;
-    const payload = WorkerAttemptPayloadSchema.parse({
-      attemptId: attemptRow.id,
-      generation: attemptRow.generation,
-      contractId: contractRow.id,
-      contractVersion: String(contractRow.version),
-      repoPath: projectRow.clone_path ?? config.worktreeBase,
-      baseRev: contractRow.base_revision,
-      prompt: contractRow.inputs?.intent ?? "",
-      allowedPaths: contractRow.bounds.paths.allow,
-      bounds: contractRow.bounds,
-      permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath }),
-      model: config.workerModel,
-      worktreeBase: config.worktreeBase,
-    });
+    const isMirror = projectRow.source_mode === "mirror";
+
+    // Build payload (D8 / W-5): v2 for mirror-mode, v1 for host_clone.
+    // Generate a dispatch nonce for v2 and store sha256(nonce) in dispatch_intents (D1 / W-1).
+    let payload: unknown;
+    let dispatchNonce: string | undefined;
+    if (isMirror) {
+      dispatchNonce = generateDispatchNonce();
+      const bundlePath = `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`;
+      payload = WorkerAttemptPayloadV2Schema.parse({
+        payloadVersion: 2,
+        attemptId: attemptRow.id,
+        generation: attemptRow.generation,
+        contractId: contractRow.id,
+        contractVersion: String(contractRow.version),
+        source: {
+          projectId: projectRow.id,
+          revision: contractRow.base_revision,
+          bundlePath,
+        },
+        baseRev: contractRow.base_revision,
+        prompt: contractRow.inputs?.intent ?? "",
+        allowedPaths: contractRow.bounds.paths.allow,
+        bounds: contractRow.bounds,
+        permissionRules: permissionRulesFor(contractRow.bounds, {
+          worktreePath: "",
+        }),
+        model: config.workerModel,
+        leaseNonce: dispatchNonce,
+      });
+    } else {
+      const worktreePath = `${config.worktreeBase}/${attemptRow.id}`;
+      payload = WorkerAttemptPayloadSchema.parse({
+        attemptId: attemptRow.id,
+        generation: attemptRow.generation,
+        contractId: contractRow.id,
+        contractVersion: String(contractRow.version),
+        repoPath: projectRow.clone_path ?? config.worktreeBase,
+        baseRev: contractRow.base_revision,
+        prompt: contractRow.inputs?.intent ?? "",
+        allowedPaths: contractRow.bounds.paths.allow,
+        bounds: contractRow.bounds,
+        permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath }),
+        model: config.workerModel,
+        worktreeBase: config.worktreeBase,
+      });
+    }
+
+    // E5 / X2-5: for worker.attempt the intent was inserted by planAttempt, so
+    // we UPDATE the nonce hash BEFORE trigger (the intent's own row is already
+    // committed; the UPDATE is visible before trigger starts).
+    if (dispatchNonce) {
+      await pool.query(
+        "UPDATE dispatch_intents SET dispatch_nonce_hash = $1, updated_at = now() WHERE id = $2",
+        [hashNonce(dispatchNonce), intentId],
+      );
+    }
 
     const { runId } = await runtime.trigger({
       intentId: intentId as DispatchIntentId,
@@ -2779,6 +3265,7 @@ export class BoundedRepairFlow {
       },
     });
 
+    // Mark as triggered with run_id (nonce hash already written above).
     await pool.query(
       "UPDATE dispatch_intents SET status = 'triggered', run_id = $2, skip_reason = NULL, updated_at = now() WHERE id = $1",
       [intentId, runId],

@@ -3,7 +3,11 @@ import test from "node:test";
 import { HOST_TRIAL_AUTHORITY, TASK_IDS } from "../src/index.ts";
 import { AcceptanceProposalSchema, LeadAcceptPayloadSchema } from "../src/tasks/lead-accept.ts";
 import { LeadPlanPayloadSchema } from "../src/tasks/lead-plan.ts";
-import { LeadReviewPayloadSchema, ReviewOutputSchema } from "../src/tasks/lead-review.ts";
+import {
+  LeadReviewPayloadSchema,
+  LeadReviewPayloadV1Schema,
+  ReviewOutputSchema,
+} from "../src/tasks/lead-review.ts";
 import { VerifyRunOutputSchema, VerifyRunPayloadSchema } from "../src/tasks/verify-run.ts";
 import {
   WorkerAttemptOutputSchema,
@@ -232,7 +236,8 @@ test("VerifyRunOutputSchema: parses output without integrity field (backward com
 // --- LeadReviewPayload (independence invariant) ---
 
 test("LeadReviewPayloadSchema: has no sessionId/transcript/conversation key", () => {
-  const keys = Object.keys(LeadReviewPayloadSchema.shape);
+  // Check the v1 schema shape (the union schema itself has no .shape; check the underlying v1)
+  const keys = Object.keys(LeadReviewPayloadV1Schema.shape);
   const forbidden = keys.filter((k) => /session|transcript|conversation/i.test(k));
   assert.deepEqual(
     forbidden,

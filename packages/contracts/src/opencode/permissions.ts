@@ -102,18 +102,20 @@ export function permissionRulesFor(
 
   // --- edit pattern map ---
   // Default deny, then allow globs (both forms), then deny paths (last wins).
+  // When worktreePath is empty (container/mirror profile), skip the absolute-path
+  // variant to avoid emitting root-anchored keys like "/<glob>" (X3-5).
   const edit: PermissionPatternMap = { "*": "deny" };
   for (const glob of allowPaths) {
     edit[glob] = "allow";
-    edit[`${opts.worktreePath}/${glob}`] = "allow";
+    if (opts.worktreePath) edit[`${opts.worktreePath}/${glob}`] = "allow";
   }
   for (const glob of denyPaths) {
     edit[glob] = "deny";
-    edit[`${opts.worktreePath}/${glob}`] = "deny";
+    if (opts.worktreePath) edit[`${opts.worktreePath}/${glob}`] = "deny";
   }
   for (const glob of WORKER_ALWAYS_DENY_PATHS) {
     edit[glob] = "deny";
-    edit[`${opts.worktreePath}/${glob}`] = "deny";
+    if (opts.worktreePath) edit[`${opts.worktreePath}/${glob}`] = "deny";
   }
 
   // --- bash pattern map ---

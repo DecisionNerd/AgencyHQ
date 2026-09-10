@@ -141,7 +141,7 @@ test("layer deploy.env contains AGENCYHQ_RUNTIME_PROFILE=container", () => {
   const { ctx, layers } = makeFakeContext();
   agencyhqToolchain().onBuildComplete?.(ctx, {} as never);
   const env = layers[0]?.deploy?.env ?? {};
-  assert.equal(env["AGENCYHQ_RUNTIME_PROFILE"], "container");
+  assert.equal(env.AGENCYHQ_RUNTIME_PROFILE, "container");
 });
 
 test("layer deploy.env contains AGENCYHQ_COORDINATOR_INTERNAL_URL", () => {
@@ -149,8 +149,8 @@ test("layer deploy.env contains AGENCYHQ_COORDINATOR_INTERNAL_URL", () => {
   agencyhqToolchain().onBuildComplete?.(ctx, {} as never);
   const env = layers[0]?.deploy?.env ?? {};
   assert.ok(
-    typeof env["AGENCYHQ_COORDINATOR_INTERNAL_URL"] === "string" &&
-      env["AGENCYHQ_COORDINATOR_INTERNAL_URL"].length > 0,
+    typeof env.AGENCYHQ_COORDINATOR_INTERNAL_URL === "string" &&
+      env.AGENCYHQ_COORDINATOR_INTERNAL_URL.length > 0,
     "AGENCYHQ_COORDINATOR_INTERNAL_URL should be set",
   );
 });
@@ -160,7 +160,7 @@ test("layer deploy.env contains AGENCYHQ_RUN_ROOT", () => {
   agencyhqToolchain().onBuildComplete?.(ctx, {} as never);
   const env = layers[0]?.deploy?.env ?? {};
   assert.ok(
-    typeof env["AGENCYHQ_RUN_ROOT"] === "string" && env["AGENCYHQ_RUN_ROOT"].length > 0,
+    typeof env.AGENCYHQ_RUN_ROOT === "string" && env.AGENCYHQ_RUN_ROOT.length > 0,
     "AGENCYHQ_RUN_ROOT should be set in deploy.env",
   );
 });
@@ -177,7 +177,7 @@ test("layer deploy.env sets HOME to the writable home created in the image layer
   const { ctx, layers } = makeFakeContext();
   agencyhqToolchain().onBuildComplete?.(ctx, {} as never);
   const env = layers[0]?.deploy?.env ?? {};
-  assert.equal(env["HOME"], "/home/node");
+  assert.equal(env.HOME, "/home/node");
   const instructions = layers[0]?.image?.instructions ?? [];
   assert.ok(
     instructions.some((i) => i.includes("mkdir -p /home/node") && i.includes("chown 1000:1000")),

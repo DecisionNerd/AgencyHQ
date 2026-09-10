@@ -67,6 +67,42 @@ export type CoordinatorConfig = {
    * when the corresponding environment variable is not set.
    */
   secretsDir?: string;
+  /**
+   * Path to the OpenCode data directory (contains auth.json).
+   * Only set when AGENCYHQ_RUNTIME_PROFILE=container.
+   * Default when container profile: AGENCYHQ_OPENCODE_DATA_DIR env (required in that profile).
+   * Unset on host profile.
+   */
+  opencodeDataDir?: string;
+  /**
+   * AES-256-GCM hex key for decrypting project credentials.
+   * 64 hex characters (32 bytes). Required when issuing git-read/integrate leases.
+   */
+  secretsKey?: string;
+  /**
+   * TTL for issued leases in milliseconds. Default: 900_000 (15 minutes).
+   */
+  leaseTtlMs?: number;
+  /**
+   * TTL for integrate leases in milliseconds. Default: 300_000 (5 minutes).
+   */
+  integrateLeaseTtlMs?: number;
+  /**
+   * Runtime profile: "host" (default) or "container".
+   * Determines whether provider auth state is read from the OpenCode data dir.
+   */
+  runtimeProfile?: "host" | "container";
+  /**
+   * Root directory for git bare mirrors used in the portable execution model.
+   * Default: <worktreeBase>/git (host profile), /var/agencyhq/git (container).
+   * Set via AGENCYHQ_GIT_ROOT.
+   */
+  gitRoot?: string;
+  /**
+   * Maximum bundle size in bytes for artifact upload and source download.
+   * Default: 200 MiB. Set via AGENCYHQ_MAX_BUNDLE_BYTES.
+   */
+  maxBundleBytes?: number;
 };
 
 export class ConfigError extends Error {
@@ -258,6 +294,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     missing.push("AGENCYHQ_API_TOKEN");
   }
 
+  // Runtime profile: "host" (default) or "container".
+  const runtimeProfileRaw = optional("AGENCYHQ_RUNTIME_PROFILE");
+  const runtimeProfile: "host" | "container" =
+    runtimeProfileRaw === "container" ? "container" : "host";
+
+  // OpenCode data dir: only relevant in container profile.
+  // Read from AGENCYHQ_OPENCODE_DATA_DIR; absent on host profile.
+  const opencodeDataDir =
+    runtimeProfile === "container" ? optional("AGENCYHQ_OPENCODE_DATA_DIR") : undefined;
+
+  // AES-256-GCM key for project credential decryption.
+  const secretsKey = secretOptional("AGENCYHQ_SECRETS_KEY");
+
+  // Lease TTLs
+  const leaseTtlMs = integer("AGENCYHQ_LEASE_TTL_MS", 900_000);
+  const integrateLeaseTtlMs = integer("AGENCYHQ_INTEGRATE_LEASE_TTL_MS", 300_000);
+  // Git mirror root: AGENCYHQ_GIT_ROOT, defaults to <worktreeBase>/git
+  const gitRoot = optional("AGENCYHQ_GIT_ROOT") ?? `${worktreeBase}/git`;
+  // Max bundle bytes: AGENCYHQ_MAX_BUNDLE_BYTES, default 200 MiB
+  const maxBundleBytesRaw = env.AGENCYHQ_MAX_BUNDLE_BYTES;
+  const maxBundleBytes =
+    maxBundleBytesRaw !== undefined && maxBundleBytesRaw !== ""
+      ? parseInt(maxBundleBytesRaw, 10)
+      : 200 * 1024 * 1024;
+  if (Number.isNaN(maxBundleBytes) || maxBundleBytes <= 0) {
+    invalid.push("AGENCYHQ_MAX_BUNDLE_BYTES");
+  }
   if (missing.length > 0 || invalid.length > 0) {
     throw new ConfigError(missing, invalid);
   }
@@ -280,6 +343,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
     realtimeWakeup: realtimeWakeup,
     port,
     bindHost,
+    runtimeProfile,
+    leaseTtlMs,
+    integrateLeaseTtlMs,
   };
 
   let result: CoordinatorConfig = base;
@@ -295,5 +361,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): CoordinatorCon
   if (secretsDir !== undefined) {
     result = { ...result, secretsDir };
   }
+  if (opencodeDataDir !== undefined) {
+    result = { ...result, opencodeDataDir };
+  }
+  if (secretsKey !== undefined) {
+    result = { ...result, secretsKey };
+  }
+  // gitRoot defaults to <worktreeBase>/git if not explicitly set
+  result = { ...result, gitRoot, maxBundleBytes };
   return result;
 }

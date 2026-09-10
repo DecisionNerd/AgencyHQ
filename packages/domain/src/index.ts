@@ -1,5 +1,8 @@
 export const PACKAGE_NAME = "@agencyhq/domain";
 
+// Admission module — pure validators for container artifact/lease/evidence (P18.1)
+export * from "./admission/index.ts";
+
 // Aggregates (wave 2.E)
 export * from "./aggregates/approval.ts";
 export * from "./aggregates/artifact.ts";

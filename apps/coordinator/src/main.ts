@@ -19,6 +19,8 @@ import { loadConfig, readTriggerKeyFromState } from "./config.ts";
 import { BoundedRepairFlow } from "./flow/bounded-repair.ts";
 import { Reconciler } from "./flow/observe.ts";
 import type { FlowDeps } from "./flow/types.ts";
+import type { ProviderStatus } from "./provider/state.ts";
+import { providerIdFromModel, readProviderState } from "./provider/state.ts";
 import { loadReadinessInputs } from "./readiness/loader.ts";
 
 // ---------------------------------------------------------------------------
@@ -101,6 +103,8 @@ const flowDeps: FlowDeps = {
     ...(config.integrateRetries !== undefined ? { integrateRetries: config.integrateRetries } : {}),
   },
   profileResolver,
+  // D9 / W-11: provider state for dispatch gate — only for container runtime profile.
+  ...(config.runtimeProfile === "container" ? { providerState: readCurrentProviderState } : {}),
 };
 
 // Construct flow and reconciler
@@ -113,6 +117,7 @@ const reconciler = new Reconciler(flowDeps, flow, {
 reconciler.start(config.reconcileIntervalMs);
 
 // Construct command handlers (workerModel required for approve command evaluation)
+// W-15 / E9: include gitRoot and secretsKey for import_host_project / revert_import.
 const commands = commandHandlers({
   pool,
   runtime,
@@ -122,16 +127,56 @@ const commands = commandHandlers({
     worktreeBase: config.worktreeBase,
     uncertainAfterMs: config.uncertainAfterMs,
   },
+  gitRoot: config.gitRoot ?? `${config.worktreeBase}/git`,
+  secretsKey: config.secretsKey,
 });
 
+// Provider state helper — derive required provider ids from worker/lead models.
+const requiredProviderIds: string[] = [];
+for (const model of [config.workerModel, config.leadModel]) {
+  const id = providerIdFromModel(model);
+  if (id && !requiredProviderIds.includes(id)) requiredProviderIds.push(id);
+}
+
+function readCurrentProviderState(): ProviderStatus | undefined {
+  if (config.runtimeProfile !== "container") return undefined;
+  const state = readProviderState({
+    dataDir: config.opencodeDataDir,
+    now: new Date().toISOString(),
+    requiredProviderIds,
+  });
+  return state.status;
+}
+
 // Wire the readiness loader — re-reads state files on every poll (lazy, no restart needed).
-const readinessLoader = () =>
-  loadReadinessInputs({
+const readinessLoader = async () => {
+  const inputs = await loadReadinessInputs({
     pool,
     triggerApiUrl: config.triggerApiUrl,
     triggerSecretKey: config.triggerSecretKey,
     stateDir: config.stateDir,
   });
+  const providerStatus = readCurrentProviderState();
+  if (providerStatus !== undefined) {
+    return { ...inputs, providerStatus };
+  }
+  return inputs;
+};
+
+// Wire internal router deps (lease broker) when secretsKey is available.
+const internalDeps =
+  config.runtimeProfile === "container"
+    ? {
+        pool,
+        providerState: async (): Promise<ProviderStatus> => {
+          return readCurrentProviderState() ?? "unavailable";
+        },
+        dataDirFn: () => config.opencodeDataDir,
+        secretsKey: () => config.secretsKey,
+        leaseTtlMs: config.leaseTtlMs,
+        integrateLeaseTtlMs: config.integrateLeaseTtlMs,
+      }
+    : undefined;
 
 // Build and serve the app
 const app = createApp({
@@ -149,6 +194,7 @@ const app = createApp({
   config,
   commands,
   loadReadiness: readinessLoader,
+  ...(internalDeps ? { internalDeps } : {}),
 });
 
 const server = serve({

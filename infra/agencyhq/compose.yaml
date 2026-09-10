@@ -112,6 +112,12 @@ services:
       AGENCYHQ_LEAD_VARIANT: ${AGENCYHQ_LEAD_VARIANT:-}
       AGENCYHQ_WORKER_SLOTS: ${AGENCYHQ_WORKER_SLOTS:-1}
       AGENCYHQ_STATE_DIR: /var/agencyhq/state
+      # Container profile: provider state is read from the OpenCode setup volume
+      # (ids and types only), mirrors live in the git volume, and the lease broker
+      # decrypts project credentials with AGENCYHQ_SECRETS_KEY from agencyhq.env.
+      AGENCYHQ_RUNTIME_PROFILE: container
+      AGENCYHQ_OPENCODE_DATA_DIR: /var/agencyhq/opencode
+      AGENCYHQ_GIT_ROOT: /var/agencyhq/git
       AGENCYHQ_GIT_DIR: /var/agencyhq/git
       WEB_DIST: /app/apps/web/dist
       PORT: "8787"

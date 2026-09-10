@@ -10,17 +10,22 @@ import type {
   Criterion,
   LeadProposal,
   ReviewOutput,
+  SourceRef,
   StepContract,
+  WorkerAttemptPayloadV2,
 } from "@agencyhq/contracts";
 import {
   criteriaDigestInput,
   digestOf,
   LeadAcceptPayloadSchema,
   LeadPlanPayloadSchema,
+  LeadPlanPayloadV2Schema,
   LeadReviewPayloadSchema,
+  LeadReviewPayloadV2Schema,
   permissionRulesFor,
   VerifyRunPayloadSchema,
   WorkerAttemptPayloadSchema,
+  WorkerAttemptPayloadV2Schema,
 } from "@agencyhq/contracts";
 import type { ProfileResolver } from "./types.ts";
 
@@ -35,6 +40,10 @@ interface ProjectRecord {
   authority: Authority;
   authority_version: string;
   profile_catalog?: unknown;
+  /** Source mode: 'mirror' uses v2 payloads; 'host_clone' uses v1. */
+  source_mode?: "mirror" | "host_clone";
+  /** HTTPS remote URL (for mirror projects to build SourceRef). */
+  remote?: string | null;
 }
 
 interface WorkItemRecord {
@@ -78,8 +87,40 @@ export function leadPlanPayload(
     worktreeBase: string;
     model: string;
     narrowing?: LeadProposal | undefined;
+    /** Optional dispatch nonce (supplied by P17.1 when present). */
+    leaseNonce?: string | undefined;
   },
-): ReturnType<typeof LeadPlanPayloadSchema.parse> {
+):
+  | ReturnType<typeof LeadPlanPayloadSchema.parse>
+  | ReturnType<typeof LeadPlanPayloadV2Schema.parse> {
+  const isMirror = project.source_mode === "mirror";
+
+  if (isMirror) {
+    // v2 payload: host paths replaced by SourceRef
+    const bundlePath = `/internal/source/${project.id}?rev=${opts.baseRevision}`;
+    const payload = {
+      payloadVersion: 2 as const,
+      workItemId: workItem.id,
+      projectId: project.id,
+      source: {
+        projectId: project.id,
+        revision: opts.baseRevision,
+        bundlePath,
+      },
+      baseRevision: opts.baseRevision,
+      authority: project.authority,
+      profileCatalog: Array.isArray(project.profile_catalog)
+        ? (project.profile_catalog as string[])
+        : ["node-pnpm-v1"],
+      operatorIntent: workItem.intent,
+      ...(workItem.defect ? { defect: workItem.defect } : {}),
+      model: opts.model,
+      ...(opts.narrowing ? { narrowing: opts.narrowing } : {}),
+    };
+    return LeadPlanPayloadV2Schema.parse(payload);
+  }
+
+  // v1 payload: host paths (host_clone mode)
   const payload = {
     workItemId: workItem.id,
     projectId: project.id,
@@ -98,15 +139,54 @@ export function leadPlanPayload(
 }
 
 // ---------------------------------------------------------------------------
-// workerAttemptPayload
+// workerAttemptPayload (v1 — unchanged)
 // ---------------------------------------------------------------------------
 
 export function workerAttemptPayload(
   project: ProjectRecord,
   contract: ContractRecord,
   attempt: AttemptRecord,
-  opts: { worktreeBase: string; workerModel: string },
-): ReturnType<typeof WorkerAttemptPayloadSchema.parse> {
+  opts: {
+    worktreeBase: string;
+    workerModel: string;
+    /** Optional dispatch nonce (supplied by P17.1 when present). */
+    leaseNonce?: string | undefined;
+  },
+):
+  | ReturnType<typeof WorkerAttemptPayloadSchema.parse>
+  | ReturnType<typeof WorkerAttemptPayloadV2Schema.parse> {
+  const isMirror = project.source_mode === "mirror";
+
+  if (isMirror) {
+    // v2 payload: SourceRef replaces host paths
+    const bundlePath = `/internal/source/${project.id}?rev=${contract.base_revision}`;
+    const source = {
+      projectId: project.id,
+      revision: contract.base_revision,
+      bundlePath,
+    };
+    const bounds = contract.bounds;
+    // W-14: v2 workers materialise source from a bundle; no host worktree path.
+    // Pass empty string so permissionRulesFor emits only relative glob rules.
+    const permissionRules = permissionRulesFor(bounds, { worktreePath: "" });
+    const payload = {
+      payloadVersion: 2 as const,
+      attemptId: attempt.id,
+      generation: attempt.generation,
+      contractId: contract.id,
+      contractVersion: String(contract.version),
+      source,
+      baseRev: contract.base_revision,
+      prompt: `Execute bounded repair for contract ${contract.id}`,
+      allowedPaths: bounds.paths.allow,
+      bounds,
+      permissionRules,
+      model: opts.workerModel,
+    };
+    return WorkerAttemptPayloadV2Schema.parse(payload);
+  }
+
+  // v1 payload: host paths (host_clone mode)
   const worktreePath = attempt.worktree_path ?? `${opts.worktreeBase}/${attempt.id}`;
   const bounds = contract.bounds;
   const permissionRules = permissionRulesFor(bounds, { worktreePath });
@@ -125,6 +205,67 @@ export function workerAttemptPayload(
     worktreeBase: opts.worktreeBase,
   };
   return WorkerAttemptPayloadSchema.parse(payload);
+}
+
+// ---------------------------------------------------------------------------
+// workerAttemptPayloadV2 — portable execution (v2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extended v2 payload type that includes the optional leaseNonce field.
+ * leaseNonce is a 32-byte random hex string generated at dispatch time.
+ * Only the sha256 hash of the nonce is stored in the database; the raw
+ * nonce is passed to the task container so it can authenticate lease requests.
+ *
+ * SECURITY: leaseNonce must never be logged. Use only to pass to the task.
+ */
+export type WorkerAttemptPayloadV2WithNonce = WorkerAttemptPayloadV2 & {
+  /** Raw nonce for lease request authentication. Never log this value. */
+  leaseNonce?: string;
+};
+
+/**
+ * Build a v2 worker attempt payload for portable (container) execution.
+ *
+ * v2 payloads use SourceRef instead of host filesystem paths. An optional
+ * leaseNonce is appended for lease request authentication; the coordinator
+ * stores only sha256(leaseNonce) in dispatch_intents.dispatch_nonce_hash.
+ *
+ * Callers must store sha256(leaseNonce) before triggering the task and
+ * pass the raw nonce to the task through the payload only.
+ *
+ * v1 payloads (workerAttemptPayload) are unchanged.
+ */
+export function workerAttemptPayloadV2(
+  contract: ContractRecord,
+  attempt: AttemptRecord,
+  opts: {
+    workerModel: string;
+    source: SourceRef;
+    /** Optional nonce for lease authentication. Must be 32 bytes (64 hex chars). */
+    leaseNonce?: string;
+  },
+): WorkerAttemptPayloadV2WithNonce {
+  const bounds = contract.bounds;
+  const permissionRules = permissionRulesFor(bounds, { worktreePath: "" });
+  const base: WorkerAttemptPayloadV2 = WorkerAttemptPayloadV2Schema.parse({
+    payloadVersion: 2,
+    attemptId: attempt.id,
+    generation: attempt.generation,
+    contractId: contract.id,
+    contractVersion: String(contract.version),
+    source: opts.source,
+    baseRev: contract.base_revision,
+    prompt: `Execute bounded repair for contract ${contract.id}`,
+    allowedPaths: bounds.paths.allow,
+    bounds,
+    permissionRules,
+    model: opts.workerModel,
+  });
+  if (opts.leaseNonce !== undefined) {
+    return { ...base, leaseNonce: opts.leaseNonce } as WorkerAttemptPayloadV2WithNonce;
+  }
+  return base as WorkerAttemptPayloadV2WithNonce;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +306,7 @@ export async function verifyRunPayload(
 // ---------------------------------------------------------------------------
 
 export function leadReviewPayload(
+  project: ProjectRecord,
   contract: ContractRecord,
   attempt: AttemptRecord,
   opts: {
@@ -172,19 +314,55 @@ export function leadReviewPayload(
     worktreeBase: string;
     baseRevision: string;
     patchPath: string;
+    /** Artifact ref for the review patch (used in v2 / mirror mode). */
+    patchArtifactRef?: { attemptId: string; generation: number; revision: string } | undefined;
     verificationResults: ReturnType<typeof VerifyRunPayloadSchema.parse>["checks"] extends unknown[]
       ? unknown[]
       : never;
     model: string;
     profileDigest: string;
+    /** Optional dispatch nonce (supplied by P17.1 when present). */
+    leaseNonce?: string | undefined;
   },
-): ReturnType<typeof LeadReviewPayloadSchema.parse> {
+):
+  | ReturnType<typeof LeadReviewPayloadSchema.parse>
+  | ReturnType<typeof LeadReviewPayloadV2Schema.parse> {
   if (!attempt.commit_sha) {
     throw new Error("leadReviewPayload: attempt.commit_sha is required");
   }
   if (!attempt.diff_digest) {
     throw new Error("leadReviewPayload: attempt.diff_digest is required");
   }
+
+  const isMirror = project.source_mode === "mirror";
+
+  if (isMirror && opts.patchArtifactRef) {
+    // v2 payload: source and patch are portable refs
+    const bundlePath = `/internal/source/${project.id}?rev=${opts.baseRevision}`;
+    const payload = {
+      payloadVersion: 2 as const,
+      attemptId: attempt.id,
+      generation: attempt.generation,
+      contractId: contract.id,
+      criteria: contract.criteria,
+      criteriaDigest: contract.criteria_digest,
+      profileDigest: opts.profileDigest,
+      attemptRevision: attempt.commit_sha,
+      diffDigest: attempt.diff_digest,
+      patch: opts.patchArtifactRef,
+      verificationResults: opts.verificationResults,
+      model: opts.model,
+      source: {
+        projectId: project.id,
+        revision: opts.baseRevision,
+        bundlePath,
+      },
+      baseRevision: opts.baseRevision,
+    };
+    return LeadReviewPayloadV2Schema.parse(payload);
+  }
+
+  // v1 payload: host paths (host_clone mode)
   const payload = {
     attemptId: attempt.id,
     generation: attempt.generation,

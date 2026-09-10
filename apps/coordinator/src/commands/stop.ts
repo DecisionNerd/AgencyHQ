@@ -18,6 +18,7 @@ import {
   getAttempt,
   insertDecision,
   revokeGeneration,
+  revokeLeasesBelowGeneration,
 } from "@agencyhq/db";
 import type { ExecutionRuntime } from "@agencyhq/trigger/client";
 import type pg from "pg";
@@ -87,6 +88,14 @@ export async function stopAttempt(
         return result;
       }
       newGeneration = revoke.generation;
+
+      // Revoke provider and integrate leases for the old generation (D4 / W-2 / E1).
+      // Upload leases are kept so the container can still send stop evidence and
+      // checkpoints after the stop (revokeLeasesBelowGeneration purpose filter).
+      await revokeLeasesBelowGeneration(client, attemptId, newGeneration, [
+        "provider",
+        "integrate",
+      ]);
 
       // Insert a Decision row recording the stop
       await insertDecision(client, {

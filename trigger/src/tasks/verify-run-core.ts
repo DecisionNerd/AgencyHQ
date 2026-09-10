@@ -72,6 +72,12 @@ export type VerifyRunDeps = {
   fingerprint?: () => Promise<Record<string, string>>;
   /** ISO 8601 timestamp factory. */
   now: () => string;
+  /**
+   * Optional: override the computed worktree path.
+   * Used by the v2 adapter when the source has been pre-materialized into
+   * a clone directory; the computed path from worktreeBase is ignored.
+   */
+  worktreePath?: string;
   // ---- Combined manifest verification (Packet 4.2.c, R-006) ----
   /**
    * ProjectId of the project currently under verification.
@@ -180,11 +186,13 @@ export async function runVerification(
   payload: VerifyRunPayload,
   deps: VerifyRunDeps,
 ): Promise<RunVerificationOutput> {
-  const worktreePath = resolveVerifyWorktreePath({
-    worktreeBase: payload.worktreeBase,
-    attemptId: payload.attemptId,
-    generation: payload.generation,
-  });
+  const worktreePath =
+    deps.worktreePath ??
+    resolveVerifyWorktreePath({
+      worktreeBase: payload.worktreeBase,
+      attemptId: payload.attemptId,
+      generation: payload.generation,
+    });
 
   const environmentFingerprint = deps.fingerprint ? await deps.fingerprint() : {};
 

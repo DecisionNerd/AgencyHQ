@@ -100,6 +100,18 @@ Each violation carries a `ViolationCode`, a dot-path, and a detail string. Codes
 
 `checkBoundarySupport(bounds)` checks whether the contract's completion boundary is currently implemented. Returns a `RuntimeViolation` with code `DEPLOY_NOT_SUPPORTED` when `bounds.boundary === "deploy"` (deploy is declared but not yet implemented), or `null` when the boundary is supported. This check is distinct from `requiredBoundariesFor`/`enforceable` — it is a categorical "not implemented" gate applied before dispatch.
 
+## Admission (`src/admission/`)
+
+Pure validator functions for container-execution submissions. No I/O; imports only `result.ts` and `@agencyhq/contracts` types.
+
+- **`paths.ts`** — `validateChangedPaths(paths) → Result<true, "PATH_UNSAFE">`: rejects an empty list or any path that is empty, absolute (`/`), uses a backslash, contains a NUL byte, starts with `./`, ends with `/`, matches `.git` or `.git/…`, or contains `..` or `.` as a bare segment. `isSafePath(p)` is the exported per-path predicate used by property-based tests.
+
+- **`artifact.ts`** — `validateArtifactAdmission(input) → Result<true, ArtifactAdmissionCode>`: twelve ordered checks — `LEASE_MISSING`, `LEASE_REVOKED`, `LEASE_EXPIRED`, `LEASE_PURPOSE_MISMATCH`, `ATTEMPT_MISMATCH`, `STALE_GENERATION`, `FUTURE_GENERATION`, `ATTEMPT_TERMINAL`, `BUNDLE_TOO_LARGE`, `PATH_UNSAFE`, `COMMIT_NOT_IN_MIRROR`, `DIGEST_MISMATCH`. The first failing code is returned (fail-fast). Terminal statuses: `completed`, `quarantined`, `failed`, `stopped`.
+
+- **`evidence.ts`** — `validateStopEvidenceAdmission(input) → Result<true, StopEvidenceAdmissionCode>`: eight checks — `LEASE_MISSING`, `LEASE_REVOKED`, `LEASE_EXPIRED`, `LEASE_PURPOSE_MISMATCH`, `ATTEMPT_MISMATCH`, `GENERATION_MISMATCH` (exact equality), `STEPS_EMPTY`, `STEPS_TOO_MANY` (> 200).
+
+- **`lease.ts`** — `validateLeaseRequest(input) → Result<LeasePurpose, LeaseRefusalReason>`: four decision points — `unknown_attempt` (intent not found), `unknown_run` (runId mismatch), `stale_generation` (request.generation < intent.generation), then provider-state checks for `purpose === "provider"` (`login_required`, `expired`, `unavailable`). Returns `Ok(purpose)` when the request is grantable.
+
 ## Modules
 
 - **`ids.ts`** — Branded id types (`ProjectId`, `WorkItemId`, `StepContractId`, `AttemptId`, `DispatchIntentId`, `ArtifactId`, `VerificationResultId`, `ReviewId`, `DecisionId`, `ApprovalId`, `FindingId`, `FailureId`, `CommandId`). `newId(prefix)` generates a UUID-backed id. `asXId(s)` performs a prefix-check cast.

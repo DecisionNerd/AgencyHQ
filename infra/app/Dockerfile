@@ -192,6 +192,13 @@ RUN groupadd -r opencode --gid 1001 && useradd -r -g opencode --uid 1001 -m -d /
 
 ENV HOME=/home/opencode
 
+# The data and config directories are mounted as named volumes. Creating them
+# here, owned by the opencode user, makes Docker seed an empty volume with this
+# ownership; otherwise the volume mounts root-owned and `opencode auth login`
+# cannot write auth.json (L2 trial, 2026-09-10).
+RUN mkdir -p /home/opencode/.local/share/opencode /home/opencode/.config/opencode \
+ && chown -R opencode:opencode /home/opencode
+
 USER opencode
 
 # Provider state is stored in $HOME/.local/share/opencode (a named volume).

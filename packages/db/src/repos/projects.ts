@@ -61,3 +61,21 @@ export async function listProjects(
   const { rows } = await client.query<ProjectRow>("SELECT * FROM projects ORDER BY created_at");
   return rows.map((r) => mapProjectRow(ProjectRowSchema.parse(r)));
 }
+
+/**
+ * Set the source_mode for a project (added in 0008_container_runtime).
+ * Returns the updated parsed row or null if the project was not found.
+ */
+export async function setProjectSourceMode(
+  client: pg.PoolClient,
+  projectId: string,
+  mode: "host_clone" | "mirror",
+): Promise<ReturnType<typeof mapProjectRow> | null> {
+  const { rows } = await client.query<ProjectRow>(
+    `UPDATE projects SET source_mode = $1, updated_at = now() WHERE id = $2 RETURNING *`,
+    [mode, projectId],
+  );
+  const first = rows[0];
+  if (!first) return null;
+  return mapProjectRow(ProjectRowSchema.parse(first));
+}

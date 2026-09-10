@@ -244,6 +244,12 @@ if (!supervisorExists) {
 
 const agencyhqFile = join(SECRETS_DIR, "agencyhq.env");
 
+// AES-256-GCM key (64 hex chars = 32 bytes) for project credential rows
+// (packages/db/src/crypto.ts). Never rotated once present.
+const agencyhqSecretsKey = ensureValue(
+  readExistingValue(agencyhqFile, "AGENCYHQ_SECRETS_KEY"),
+  () => randomBytes(32).toString("hex"),
+);
 const agencyhqApiToken = ensureValue(readExistingValue(agencyhqFile, "AGENCYHQ_API_TOKEN"), () =>
   hex(32),
 );
@@ -258,6 +264,7 @@ const agencyhqEnv = [
   `AGENCYHQ_POSTGRES_PASSWORD=${agencyhqPostgresPassword}`,
   `DATABASE_URL=postgresql://agencyhq:${agencyhqPostgresPassword}@agencyhq-postgres:5432/agencyhq?sslmode=disable`,
   `AGENCYHQ_API_TOKEN=${agencyhqApiToken}`,
+  `AGENCYHQ_SECRETS_KEY=${agencyhqSecretsKey}`,
   "# TRIGGER_SECRET_KEY is set by bootstrap after the Trigger project is created",
   "# and written to the agencyhq-state volume. The coordinator reads it from there.",
   "",
@@ -267,7 +274,7 @@ const agencyhqExists = existsSync(agencyhqFile);
 await writeSecret(agencyhqFile, agencyhqEnv);
 if (!agencyhqExists) {
   console.log(
-    "[secrets-init] generated: agencyhq.env (keys: AGENCYHQ_POSTGRES_PASSWORD DATABASE_URL AGENCYHQ_API_TOKEN)",
+    "[secrets-init] generated: agencyhq.env (keys: AGENCYHQ_POSTGRES_PASSWORD DATABASE_URL AGENCYHQ_API_TOKEN AGENCYHQ_SECRETS_KEY)",
   );
 } else {
   console.log(

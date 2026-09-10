@@ -280,6 +280,43 @@ port.
 
 **Note**: Compose `include` interpolates this vendored file with `infra/trigger/.env` (the host profile's env file), so a host-profile `API_ORIGIN=http://localhost:8030` would leak into the container profile; `infra/agencyhq/trigger-overrides.yaml` therefore pins `API_ORIGIN: http://webapp:3000` for the webapp service, and `tests/compose-config.test.mjs` asserts the rendered value.
 
+## Provider compatibility (container profile)
+
+The following providers are used by AgencyHQ task containers via the OpenCode
+auth.json snapshot delivered by the coordinator lease broker. Each provider
+requires a one-time login in the `opencode` setup container; the login state
+persists in the `opencode-data` Docker volume and is delivered to every task
+container via the `provider` lease at task start.
+
+Login command (run once, in the `opencode` container):
+
+```sh
+docker compose exec opencode opencode auth login
+```
+
+OpenCode will print an interactive login prompt or a URL; follow the
+provider-specific flow. State is written to the `opencode-data` volume under
+the container's OpenCode data directory and persists across container
+recreation.
+
+Readiness: The coordinator reads `auth.json` from `AGENCYHQ_OPENCODE_DATA_DIR`
+and derives a `ProviderStatus` (`apps/coordinator/src/provider/state.ts`):
+- `login_required` — auth.json absent, empty, or missing the required provider.
+- `expired` — OAuth token within the expiry window, or recent `down` capacity row.
+- `ready` — all required providers present and valid.
+- `unavailable` — data directory not configured or unreadable.
+
+| Provider | Flow | State persists in | Readiness when logged in | L2 trial status |
+| --- | --- | --- | --- | --- |
+| OpenCode Zen API key | API key entry via `opencode auth login` | `opencode-data` volume (`auth.json`) | `ready` | pending trial |
+| OpenRouter API key | API key entry via `opencode auth login` | `opencode-data` volume (`auth.json`) | `ready` | pending trial |
+| OpenAI OAuth | OAuth browser flow via `opencode auth login` | `opencode-data` volume (`auth.json`) | `ready` (expires after OAuth token TTL → `expired`) | pending trial |
+| Anthropic API key | API key entry via `opencode auth login` | `opencode-data` volume (`auth.json`) | `ready` | pending trial |
+
+None of the above flows has been exercised with the container-profile lease
+broker. All rows are "pending trial"; L2 trial evidence is required before any
+row can be marked ready.
+
 ## Registry security note
 
 The local task image registry (`registry:2`) runs without authentication and is accessible to any service on the `webapp` network, including runner containers; peers on `webapp` can push to it. On a single host, the registry is currently unused (the Trigger CLI loads localhost-tagged images directly into the daemon). A multi-host setup (issue #19) must add authentication or move the registry to a dedicated network.

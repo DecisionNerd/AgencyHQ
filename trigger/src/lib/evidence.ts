@@ -1,0 +1,205 @@
+// Stop-sequence evidence collection and upload (epic #14, P18.3).
+//
+// On the container profile, the stop sequence is uploaded to the coordinator
+// via the /internal/attempts/:id/stop-evidence route alongside (or instead of)
+// writing stop.ndjson to disk. On the host profile, stop.ndjson is still written.
+//
+// collectStopEvidence: reads the local stop.ndjson file and converts each
+//   JSON-line entry into a StopEvidenceUpload step. Lines that don't match the
+//   known step names are silently dropped (best-effort).
+//
+// uploadStopEvidence: calls collectStopEvidence then posts to the coordinator.
+//   Never throws; returns an upload status string.
+//
+// No Trigger SDK usage.
+
+import { readFile } from "node:fs/promises";
+
+import type { StopEvidenceUpload } from "@agencyhq/contracts";
+
+import type { Broker } from "./broker.ts";
+
+// ---------------------------------------------------------------------------
+// Known stop step names (D6 / W-8: extended to include all worker-written names)
+// ---------------------------------------------------------------------------
+
+const KNOWN_STEPS = new Set([
+  // canonical upload names
+  "signal_sent",
+  "process_exited",
+  "survivor_scan",
+  "checkpoint_committed",
+  "upload_done",
+  "aborted",
+  // additional worker-written names (worker-attempt-core.ts / worker-attempt.ts)
+  "abort_signal",
+  "soft_deadline",
+  "on_cancel_entered",
+  "stop_start",
+  "killed",
+  "checkpoint",
+  "checkpoint_failed",
+  "stop_done",
+]);
+
+/**
+ * Translate worker-side step names to canonical upload names (D6).
+ *
+ * Some worker-written step names differ from the canonical names accepted by
+ * the evidence upload schema. This map translates them; unmapped names pass
+ * through unchanged.
+ */
+const STEP_TRANSLATIONS: Record<string, string> = {
+  checkpoint: "checkpoint_committed",
+};
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+// All step names from StopEvidenceUploadSchema (extended per D6 / W-8).
+type StopStep = {
+  at: string;
+  step:
+    | "signal_sent"
+    | "process_exited"
+    | "survivor_scan"
+    | "checkpoint_committed"
+    | "upload_done"
+    | "aborted"
+    | "abort_signal"
+    | "soft_deadline"
+    | "on_cancel_entered"
+    | "stop_start"
+    | "killed"
+    | "checkpoint"
+    | "checkpoint_failed"
+    | "stop_done";
+  detail?: string;
+  /** PIDs that survived the kill scan (forwarded 1:1 from stop.ndjson, E4). */
+  survivors?: number[];
+  /** Git SHA of the checkpoint commit (forwarded 1:1 from stop.ndjson, E4). */
+  checkpointCommit?: string;
+};
+
+export type CollectStopEvidenceResult = {
+  steps: StopStep[];
+};
+
+// ---------------------------------------------------------------------------
+// collectStopEvidence
+// ---------------------------------------------------------------------------
+
+/**
+ * Read stop.ndjson from the run directory and convert to structured steps.
+ *
+ * Each line is expected to be a JSON object with at least `{ at: string, step: string }`.
+ * Lines with unrecognised step names are dropped (best-effort sink).
+ * If the file does not exist or cannot be read, returns an empty step list.
+ *
+ * The schema requires at least 1 step; callers must decide whether to upload
+ * when the result is empty.
+ */
+export async function collectStopEvidence(runDir: string): Promise<CollectStopEvidenceResult> {
+  const filePath = `${runDir}/stop.ndjson`;
+  let text: string;
+  try {
+    text = await readFile(filePath, "utf8");
+  } catch {
+    return { steps: [] };
+  }
+
+  const steps: StopStep[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+
+    const obj = parsed as Record<string, unknown>;
+    const at = typeof obj.at === "string" ? obj.at : new Date().toISOString();
+    const stepName = typeof obj.step === "string" ? obj.step : "";
+
+    if (!KNOWN_STEPS.has(stepName)) {
+      continue;
+    }
+
+    // Apply translation (D6): e.g. "checkpoint" → "checkpoint_committed"
+    const translatedStep = STEP_TRANSLATIONS[stepName] ?? stepName;
+    const step = translatedStep as StopStep["step"];
+    const rawDetail = typeof obj.detail === "string" ? obj.detail : undefined;
+    // detail must be ≤ 2000 chars and contain no newlines.
+    const detail =
+      rawDetail !== undefined ? rawDetail.replace(/\n/g, " ").slice(0, 2000) : undefined;
+
+    // Forward survivors and checkpointCommit 1:1 from stop.ndjson (E4).
+    const survivors = Array.isArray(obj.survivors)
+      ? (obj.survivors as unknown[]).filter((x): x is number => typeof x === "number")
+      : undefined;
+    const checkpointCommit =
+      typeof obj.checkpointCommit === "string" ? obj.checkpointCommit : undefined;
+
+    const entry: StopStep = { at, step };
+    if (detail !== undefined) entry.detail = detail;
+    if (survivors !== undefined) entry.survivors = survivors;
+    if (checkpointCommit !== undefined) entry.checkpointCommit = checkpointCommit;
+    steps.push(entry);
+  }
+
+  return { steps };
+}
+
+// ---------------------------------------------------------------------------
+// uploadStopEvidence
+// ---------------------------------------------------------------------------
+
+export type UploadStopEvidenceResult = {
+  uploadStatus: "uploaded" | "skipped" | "failed";
+  failureReason?: string;
+};
+
+/**
+ * Collect stop evidence from stop.ndjson and upload it to the coordinator.
+ *
+ * Returns { uploadStatus: "skipped" } when no recognised steps are found.
+ * Returns { uploadStatus: "failed", failureReason } on network errors.
+ * Never throws.
+ */
+export async function uploadStopEvidence(args: {
+  runDir: string;
+  attemptId: string;
+  generation: number;
+  broker: Broker;
+  token: string;
+}): Promise<UploadStopEvidenceResult> {
+  const { steps } = await collectStopEvidence(args.runDir);
+
+  if (steps.length === 0) {
+    return { uploadStatus: "skipped" };
+  }
+
+  const evidence: StopEvidenceUpload = {
+    attemptId: args.attemptId,
+    generation: args.generation,
+    steps,
+  };
+
+  try {
+    await args.broker.uploadStopEvidence({
+      attemptId: args.attemptId,
+      token: args.token,
+      evidence,
+    });
+    return { uploadStatus: "uploaded" };
+  } catch (err) {
+    return {
+      uploadStatus: "failed",
+      failureReason: (err as Error).message,
+    };
+  }
+}

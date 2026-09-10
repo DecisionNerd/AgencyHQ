@@ -23,6 +23,145 @@ reads remain a fallback implementation detail; a stopped container's filesystem
 is not durable transport. Existing host records must be imported or retained
 explicitly, never silently interpreted as container-accessible paths.
 
+## Container-profile execution path (wave 2 — not yet exercised; L2 trial pending)
+
+The following describes the code path added in wave 2 (P17.1–P18.4). None of
+this path has run against a live Trigger task container; L2 trial evidence is
+pending.
+
+### Dispatch nonce
+
+When the coordinator dispatches a `worker.attempt` intent for a project whose
+`source_mode = 'mirror'`, it generates a 32-byte cryptographically random
+dispatch nonce (`generateDispatchNonce()`, inlined in `apps/coordinator/src/flow/bounded-repair.ts`),
+stores only its SHA-256 hash (`hashNonce()`) in
+`dispatch_intents.dispatch_nonce_hash`, and embeds the raw nonce in the task
+payload as `leaseNonce` (workers may also read it from `AGENCYHQ_LEASE_NONCE`).
+The raw nonce is never persisted.
+
+### Task start — prepareRuntime
+
+At task start for `worker.attempt` tasks, `trigger/src/lib/runtime.ts` `prepareRuntime()` runs:
+
+1. **Profile check.** Reads `AGENCYHQ_RUNTIME_PROFILE`. On `host` profile (the
+   current default), `HOME` is the process home and cleanup is a no-op. On
+   `container` profile:
+2. **Per-run isolated HOME.** `resolveRunHome()` creates
+   `<AGENCYHQ_RUN_ROOT>/runs/<runId>/home` at mode `0700`, and
+   `<home>/.local/share/opencode/` at `0700` (`trigger/src/lib/runtime-home.ts`).
+3. **Provider lease.** The task requests a `provider` lease from
+   `POST /internal/leases` (the Broker client, `trigger/src/lib/broker.ts`),
+   presenting `{ runId, attemptId, generation, purpose: "provider", nonce }`.
+   The coordinator verifies `sha256(nonce) == dispatch_nonce_hash`. On success,
+   the grant's `material.authJson` is written to `<home>/.local/share/opencode/auth.json`
+   at mode `0600` via `writeFile` + `chmod`. The file is deleted in the cleanup
+   step (see below).
+4. **Upload lease.** The task also requests an `upload` lease (same nonce) from
+   `POST /internal/leases`. The upload token from this grant is used for all
+   subsequent artifact, checkpoint, and stop-evidence uploads.
+5. **Refusal handling.** If the provider lease is refused, `prepareRuntime`
+   returns `{ ok: false, failureKind }` — one of `provider_login_required`,
+   `provider_expired`, or `provider_unavailable`. The caller sets Trigger run
+   metadata and throws `AbortTaskRunError` (no retry for login-required). No
+   secret values appear in the error or metadata.
+6. **Cleanup.** On task completion or error, `rm -rf <home>` removes the per-run
+   HOME tree, including `auth.json`.
+
+**Host profile fallback.** On `host` profile, `prepareRuntime` returns the
+process `HOME` unchanged; no leases are requested, no auth.json is written, and
+cleanup is a no-op. The host's OpenCode installation provides credentials.
+
+**Profile selection per project.** The coordinator picks execution mode per
+project from `projects.source_mode`: `'host_clone'` (default) uses host
+worktrees and local stop.ndjson evidence; `'mirror'` uses the container-profile
+path described here. The column was added in migration
+`packages/db/migrations/0008_container_runtime.sql`.
+
+### Source materialization
+
+For container-profile tasks, the payload carries a `SourceRef` (`projectId`,
+`revision`, `bundlePath`) instead of host-path fields. The task calls
+`trigger/src/lib/source.ts` `materializeSource()`:
+
+1. Download the bundle from `GET /internal/source/<projectId>?rev=<sha>`,
+   authenticated with the upload or git-read lease token. The coordinator
+   verifies the token against the lease table and that the lease covers the
+   project.
+2. Write the bundle bytes to a temporary file; verify SHA-256 against the
+   `X-AgencyHQ-Bundle-Sha256` header.
+3. `git clone <bundleFile> <dir>` — creates a local clone.
+4. `git checkout --detach <source.revision>` — detached HEAD at the requested SHA.
+5. Verify `git rev-parse HEAD == source.revision`; a mismatch is a
+   `revision_mismatch` failure (no partial clone left on disk).
+6. Delete the temporary bundle file.
+
+### Work and artifact upload
+
+The coding agent (OpenCode) runs with `HOME` pointing to the per-run isolated
+directory. On completion, the task exports a thin git bundle of the worker's
+commit against the source revision (`trigger/src/lib/artifact-upload.ts`
+`exportAttemptBundle()`), then uploads it via `POST /internal/attempts/:id/artifacts`
+with the upload lease token and `ArtifactUploadMeta` in the `X-AgencyHQ-Meta`
+header. Checkpoint bundles use `POST /internal/attempts/:id/checkpoints`. Stop
+evidence is uploaded via `POST /internal/attempts/:id/stop-evidence` with the
+structured step list (`trigger/src/lib/evidence.ts`).
+
+### Coordinator admission
+
+When the coordinator receives an artifact upload at
+`apps/coordinator/src/internal/artifacts-router.ts`:
+
+1. **Lease lookup.** The upload token (SHA-256 of it, stored as `token_hash`) is
+   looked up against the `leases` table to find a valid `upload` lease for the
+   attempt.
+2. **Generation check.** The claimed generation is compared to the attempt's
+   current generation; stale (lower) or future (higher) generations are rejected.
+3. **Project path verification.** `validateArtifactAdmission()`
+   (`packages/domain/src/admission/artifact.ts`) runs all checks in order:
+   lease present, not revoked, not expired, purpose = upload or provider (upload route),
+   attempt matches, lease-generation matches claimed generation (LEASE_GENERATION_MISMATCH),
+   claimed generation matches attempt current generation (STALE_GENERATION / FUTURE_GENERATION),
+   attempt not in terminal or stopping status, bundle size within limit, paths safe,
+   commit in mirror, digest matches.
+4. **Bundle import.** `importBundle()` writes the bundle into the git bare mirror
+   at `AGENCYHQ_GIT_ROOT/<projectId>.git`. The coordinator recomputes the diff
+   digest from the mirror and sets `verified = true` when both bundle SHA and diff
+   digest match.
+5. **Persistence.** `insertAttemptArtifact()` stores the row (idempotent via ON
+   CONFLICT DO NOTHING).
+
+**Stop evidence.** `validateStopEvidenceAdmission()`
+(`packages/domain/src/admission/evidence.ts`) checks lease validity and
+generation. `upsertAttemptStopEvidence()` stores the step list; later submissions
+overwrite earlier ones (idempotent by `(attempt_id, generation)`).
+
+### Verification, review, and accept from the mirror
+
+Verify, review, and accept tasks running on the container profile fetch source
+from `GET /internal/source` and artifacts from
+`GET /internal/attempts/:id/artifacts/:generation/bundle` (authenticated with
+an upload lease; no git-read lease is used). The trusted mirror serves as the
+durable artifact store across container lifetimes.
+
+### Integrate with the integrate lease
+
+The `integrate.merge` task requests an `integrate` lease (TTL: 5 minutes,
+configurable via `AGENCYHQ_INTEGRATE_LEASE_TTL_MS`) from the coordinator. The
+grant's `material.askpassToken` is used as a git credential helper token for
+`git push` to the remote. The integrate lease is operation-scoped: it is issued
+only for the exact attempt/generation pair. (`markLeaseUsed` exists but has no
+callers; the lease is revoked by `revokeLeasesBelowGeneration` on generation advance.)
+
+### Host profile stop evidence (current fallback)
+
+On the host profile (`source_mode = 'host_clone'`), stop evidence is still
+read from the run directory's `stop.ndjson` file by the coordinator's
+`confirmStop` path. The host adapter writes this file before exit.
+`dispatch_intents.dispatch_nonce_hash` is populated for mirror-mode dispatches
+(`source_mode = 'mirror'`). Host-clone dispatches (`source_mode = 'host_clone'`)
+leave `dispatch_nonce_hash` null; the lease broker rejects mirror-mode lease
+requests that present a null hash (no null bypass).
+
 ## Lifecycle of one step
 
 1. **Plan.** The coordinator dispatches `lead.plan` for the WorkItem, tagged

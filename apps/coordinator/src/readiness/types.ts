@@ -76,9 +76,23 @@ export type ImageReadiness = {
   at: string;
 } | null;
 
+export type ProviderReadinessStatus =
+  | "ready"
+  | "login_required"
+  | "expired"
+  | "unavailable"
+  | "unknown";
+
+export type WorkerReadinessStatus =
+  | "ready"
+  | "login_required"
+  | "expired"
+  | "unavailable"
+  | "unknown";
+
 /**
  * The full readiness response.
- * provider and worker are "unknown" until issues #17/#19 supply real data.
+ * provider and worker reflect OpenCode auth and image registration state.
  */
 export type ReadinessResponse = {
   services: {
@@ -87,8 +101,8 @@ export type ReadinessResponse = {
   };
   bootstrap: BootstrapReadiness;
   image: ImageReadiness;
-  provider: "unknown";
-  worker: "unknown";
+  provider: ProviderReadinessStatus;
+  worker: WorkerReadinessStatus;
   nextAction: string;
 };
 
@@ -105,4 +119,10 @@ export type ReadinessInputs = {
   bootstrapJson: BootstrapJson | null;
   /** Contents of deployment.json, or null if the file is absent. */
   deploymentJson: DeploymentJson | null;
+  /**
+   * Provider auth state derived from reading the OpenCode auth.json.
+   * Absent on the host profile where no dataDir is configured.
+   * When absent, provider and worker fields in the response are "unknown".
+   */
+  providerStatus?: import("../provider/state.ts").ProviderStatus | undefined;
 };

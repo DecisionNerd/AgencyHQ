@@ -102,13 +102,17 @@ export async function runLeadPlanCore(args: {
   parseOutput: (raw: unknown) => LeadPlanOutput;
   onPhase?: (phase: string) => void;
   timeoutMs: number;
+  /** Optional: override the computed worktree path. Used by the v2 adapter. */
+  worktreePath?: string;
 }): Promise<LeadPlanOutput> {
   const { payload, runId } = args;
-  const worktreePath = resolveLeadWorktreePath({
-    worktreeBase: payload.worktreeBase,
-    workItemId: payload.workItemId,
-    runId,
-  });
+  const worktreePath =
+    args.worktreePath ??
+    resolveLeadWorktreePath({
+      worktreeBase: payload.worktreeBase,
+      workItemId: payload.workItemId,
+      runId,
+    });
   const runDir = resolveLeadRunDir({
     worktreeBase: payload.worktreeBase,
     workItemId: payload.workItemId,

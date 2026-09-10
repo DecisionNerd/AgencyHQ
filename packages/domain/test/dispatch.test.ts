@@ -334,3 +334,45 @@ test("slot accounting (d): dispatched.length + activeAttempts.length <= slots fo
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// intentSeq tie-break tests (deflake admission-N2)
+// ---------------------------------------------------------------------------
+
+test("intentSeq breaks ties when rank and createdAt compare equal", () => {
+  // Same rank, same createdAt.  Ids chosen so that "w-z" > "w-a" lexicographically
+  // — without intentSeq the id comparison would dispatch w-a first.  With intentSeq,
+  // w-z (seq=1) sorts before w-a (seq=2) because intentSeq precedes id in the sort.
+  const TS = "2026-01-01T00:00:00.000Z";
+  const result = selectDispatch({
+    workItems: [
+      item("w-a", 1, "repo-a", { createdAt: TS, intentSeq: 2 }),
+      item("w-z", 1, "repo-z", { createdAt: TS, intentSeq: 1 }),
+    ],
+    activeAttempts: [],
+    slots: 1,
+    uncertainRepositories: [],
+  });
+  assert.deepEqual(result.dispatch, [{ workItemId: "w-z", repositoryId: "repo-z" }]);
+  assert.equal(result.skipped[0]?.workItemId, "w-a");
+  assert.equal(result.skipped[0]?.reason, "no_slot");
+});
+
+test("intentSeq absent items sort after items that carry an intentSeq", () => {
+  // w-z: intentSeq=1 (lower seq → higher priority).  w-a: no intentSeq (MAX_SAFE_INTEGER).
+  // Same rank, same createdAt.  Without intentSeq, id comparison dispatches w-a first
+  // ("w-a" < "w-z").  With intentSeq before id in the sort, w-z is dispatched first.
+  const TS = "2026-01-01T00:00:00.000Z";
+  const result = selectDispatch({
+    workItems: [
+      item("w-a", 1, "repo-a", { createdAt: TS }),
+      item("w-z", 1, "repo-z", { createdAt: TS, intentSeq: 1 }),
+    ],
+    activeAttempts: [],
+    slots: 1,
+    uncertainRepositories: [],
+  });
+  assert.deepEqual(result.dispatch, [{ workItemId: "w-z", repositoryId: "repo-z" }]);
+  assert.equal(result.skipped[0]?.workItemId, "w-a");
+  assert.equal(result.skipped[0]?.reason, "no_slot");
+});

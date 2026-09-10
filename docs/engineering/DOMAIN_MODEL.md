@@ -28,6 +28,196 @@ Concepts marked *deferred* are vocabulary now and code later.
 
 *Implementation: all Slice 2 aggregates in `packages/domain/src/aggregates/`; lifecycle transitions namespaced per aggregate in `packages/domain/src/transitions/`.*
 
+## Container execution records (wave 2 — P17.1/P18.1–P18.4)
+
+The following records were added for the portable container execution model.
+None has been exercised in a live Trigger task container; L2 trial evidence is
+pending.
+
+### `projects.source_mode`
+
+Column on the `projects` table (migration `0008_container_runtime.sql`). Values:
+`'host_clone'` (default) — use host worktrees and local stop.ndjson; `'mirror'`
+— use the coordinator bundle mirror and internal API for source and artifacts.
+`setProjectSourceMode(client, projectId, mode)` switches the value.
+
+### `dispatch_intents.dispatch_nonce_hash`
+
+Nullable `text` column (migration `0009_dispatch_nonce.sql`). Stores the
+SHA-256 hex hash of the 32-byte random dispatch nonce generated at dispatch time
+for mirror-mode projects. The raw nonce is passed to the task container and never
+persisted. The broker verifies `sha256(presented_nonce) == dispatch_nonce_hash`
+(timing-safe) before issuing any lease. Null for host-clone dispatches;
+the broker rejects any request where the hash is null (no null bypass).
+
+### `dispatch_intents.seq`
+
+`BIGSERIAL` column (migration `0010_dispatch_seq.sql`). Monotonically increasing
+insertion order. Used as the final tiebreaker in `selectDispatch` when rank,
+`createdAt`, and id all compare equal — guarantees a stable sort when two intents
+are inserted within the same microsecond (fast test environments). Absent or
+null items sort last (`Number.MAX_SAFE_INTEGER`).
+
+### `leases`
+
+Time-bounded credential grants issued to worker containers (migration
+`0008_container_runtime.sql`). Fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | text PK | Random `lease_<32hex>`. |
+| `attempt_id` | text FK → `attempts` | The attempt this lease is scoped to. |
+| `generation` | int | The authority generation for which the lease was issued. |
+| `run_id` | text | Trigger run id of the requesting container. |
+| `purpose` | enum | `provider`, `git-read`, `integrate`, `upload`, `review`. |
+| `nonce_hash` | text | SHA-256 hex of the worker's lease request nonce. |
+| `token_hash` | text | SHA-256 hex of the bearer token handed out with `upload` and `review` leases. |
+| `issued_at` | timestamptz | Insertion timestamp. |
+| `expires_at` | timestamptz | Hard expiry; not renewable. |
+| `used_at` | timestamptz | Reserved; `markLeaseUsed` has no callers (not set in current code). |
+| `revoked_at` | timestamptz | Set by the coordinator on generation advance or stop. |
+
+**Invariants:** Each `(attempt_id, generation, purpose, nonce_hash)` is unique
+(idempotent re-request returns the same lease). Leases below the current
+generation are revoked by `revokeLeasesBelowGeneration()` when a new generation
+starts. The raw nonce is never stored; only its SHA-256 hash.
+
+**Purposes and material:**
+
+- `provider` — `authJson`: serialized OpenCode auth.json. Read from
+  `AGENCYHQ_OPENCODE_DATA_DIR/auth.json` on the coordinator; written to the
+  per-run HOME at `0600` inside the container.
+- `git-read` — `remote` (HTTPS URL, no userinfo), `tokenRef`, `askpassToken`:
+  decrypted from `project_credentials` (AES-256-GCM) for reading the source
+  repository.
+- `integrate` — same shape as `git-read`, TTL is `AGENCYHQ_INTEGRATE_LEASE_TTL_MS`
+  (default 5 min) rather than the standard TTL.
+- `review` — `token`: random 32-byte hex (download only: source bundles and
+  verified attempt bundles). Issued to lead.plan (attempt-less intents, keyed by
+  the dispatch intent id), lead.review and integrate. No provider or git material.
+- `upload` — `token`: random 32-byte hex; SHA-256 stored in `token_hash` for
+  bearer-token lookup on artifact/stop-evidence routes.
+
+**Revocation policy.** Leases are not hard-deleted; `revoked_at` is set instead.
+Logout blocks new leases (the provider state check returns `login_required`
+before issuing). In-flight leases run to expiry.
+
+**Repository:** `packages/db/src/repos/leases.ts` — `issueLease`,
+`findLeasesByAttemptGeneration`, `markLeaseUsed`, `revokeLeasesBelowGeneration`,
+`revokeExpiredLeases`.
+
+### `attempt_artifacts`
+
+Coordinator-persisted artifact bundle metadata from worker containers (migration
+`0008_container_runtime.sql`). Fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | text PK | Random UUID. |
+| `attempt_id` | text FK → `attempts` | |
+| `generation` | int | Authority generation at upload time. |
+| `kind` | enum | `attempt` or `checkpoint`. |
+| `commit_id` | text | 40-hex git SHA produced by the worker. |
+| `diff_digest` | text | `sha256:<hex>` recomputed from the mirror after import. |
+| `changed_paths` | jsonb | Array of repo-relative paths changed. |
+| `quarantine_patch` | text | Optional patch when path violations detected. |
+| `bundle_sha256` | text | 64-hex SHA-256 of the uploaded bundle. |
+| `bundle_bytes` | bigint | Bundle byte length. |
+| `verified` | boolean | `true` when SHA and diff digest both match. |
+| `received_at` | timestamptz | Insertion timestamp. |
+
+**Invariants.** Unique on `(attempt_id, generation, kind, commit_id)`. Insert is
+idempotent (ON CONFLICT DO NOTHING); caller detects duplicates via the
+`"inserted" | "duplicate"` discriminant from `insertAttemptArtifact()`. The
+`verified` flag reflects coordinator-side bundle import and digest recomputation.
+
+**Repository:** `packages/db/src/repos/attempt-artifacts.ts` —
+`insertAttemptArtifact`, `listArtifactsForAttempt`, `markArtifactVerified`.
+
+### `attempt_stop_evidence`
+
+Structured stop-sequence evidence uploaded by worker containers on graceful
+shutdown (migration `0008_container_runtime.sql`). Fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | text PK | Random UUID. |
+| `attempt_id` | text FK → `attempts` | |
+| `generation` | int | Authority generation at upload time. |
+| `steps` | jsonb | Ordered `{ at (ISO), step (enum), detail?, survivors? (number[]), checkpointCommit? }` array. |
+| `received_at` | timestamptz | Last upsert timestamp. |
+
+**Invariants.** Unique on `(attempt_id, generation)`. Upserted idempotently;
+later uploads overwrite the `steps` and refresh `received_at`. Steps are one of:
+`signal_sent`, `process_exited`, `survivor_scan`, `checkpoint_committed`,
+`upload_done`, `aborted`, `abort_signal`, `soft_deadline`, `on_cancel_entered`,
+`stop_start`, `killed`, `checkpoint`, `checkpoint_failed`, `stop_done`.
+`stop_done` may carry `survivors` (surviving PIDs). `checkpoint` and
+`checkpoint_committed` may carry `checkpointCommit` (git SHA).
+
+**Repository:** `packages/db/src/repos/attempt-stop-evidence.ts` —
+`upsertAttemptStopEvidence`, `listStopEvidenceForAttempt`.
+
+### `project_credentials`
+
+AES-256-GCM encrypted project-level credentials for git operations (migration
+`0008_container_runtime.sql`). Keyed by `(project_id, purpose)`.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `project_id` | text FK → `projects` | |
+| `purpose` | enum | `git-read` or `integrate`. |
+| `ciphertext` | bytea | AES-256-GCM ciphertext of the plaintext credential. |
+| `iv` | bytea | 12-byte random IV. |
+| `tag` | bytea | 16-byte GCM authentication tag. |
+| `key_version` | int | Key version (for rotation; default 1). |
+| `created_at` / `updated_at` | timestamptz | Timestamps. |
+
+**Invariants.** Primary key `(project_id, purpose)`. Upserted via `putProjectCredential`
+(ON CONFLICT UPDATE). The 64-hex encryption key is read from
+`AGENCYHQ_SECRETS_KEY` on the coordinator; it never appears in logs, errors, or
+test snapshots. Decryption via `decryptSecret()` (`packages/db/src/crypto.ts`)
+throws `"authentication failed"` on tamper or wrong key, never revealing the key
+or plaintext.
+
+**Repository:** `packages/db/src/repos/project-credentials.ts` —
+`putProjectCredential`, `getProjectCredential`, `deleteProjectCredential`.
+
+### Admission reason codes
+
+The domain admission layer (`packages/domain/src/admission/`) exposes the
+following failure codes. Each code is returned by `validateArtifactAdmission`
+or `validateStopEvidenceAdmission` as the first failing condition (fail-fast,
+deterministic):
+
+**Artifact admission** (`artifact.ts`):
+
+| Code | Condition |
+| --- | --- |
+| `LEASE_MISSING` | No upload lease found for the attempt. |
+| `LEASE_REVOKED` | Lease `revoked_at` is set. |
+| `LEASE_EXPIRED` | Lease `expires_at` ≤ now. |
+| `LEASE_PURPOSE_MISMATCH` | Lease purpose is not `upload`. |
+| `ATTEMPT_MISMATCH` | Lease `attemptId` ≠ claimed `attemptId`. |
+| `STALE_GENERATION` | Claimed generation < attempt's current generation. |
+| `FUTURE_GENERATION` | Claimed generation > attempt's current generation. |
+| `ATTEMPT_TERMINAL` | Attempt status is `completed`, `quarantined`, `failed`, or `stopped`. |
+| `BUNDLE_TOO_LARGE` | `bundleBytes` > `maxBundleBytes`. |
+| `PATH_UNSAFE` | A changed path contains `..` or fails the path-safety check. |
+| `COMMIT_NOT_IN_MIRROR` | The claimed `commitId` is not present in the git mirror. |
+| `DIGEST_MISMATCH` | Recomputed diff digest ≠ claimed `diffDigest`. |
+
+**Stop evidence admission** (`evidence.ts`):
+
+| Code | Condition |
+| --- | --- |
+| `LEASE_MISSING` | No upload lease found. |
+| `LEASE_REVOKED` | Lease revoked. |
+| `LEASE_EXPIRED` | Lease expired. |
+| `LEASE_PURPOSE_MISMATCH` | Lease purpose is not `upload`. |
+| `ATTEMPT_MISMATCH` | Lease `attemptId` ≠ claimed `attemptId`. |
+| `GENERATION_MISMATCH` | Claimed generation ≠ attempt's current generation. |
+
 ## Relationships
 
 - A WorkItem belongs to one or more Projects via a RevisionManifest (one

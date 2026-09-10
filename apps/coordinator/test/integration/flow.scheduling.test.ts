@@ -187,6 +187,8 @@ function makeFakeCommands(): import("../../src/app.ts").CommandsLike {
     setMainEffort: noop,
     setWorkItemRank: noop,
     updateAuthority: noop,
+    importHostProject: noop,
+    revertImport: noop,
   };
 }
 

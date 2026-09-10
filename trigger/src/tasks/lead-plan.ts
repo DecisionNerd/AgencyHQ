@@ -14,23 +14,35 @@
 //  - Task NEVER calls the authority subset check and NEVER writes a Decision.
 //  - Lead worktree removed in finally (read-only and disposable).
 //  - Run dir is KEPT after the run for evidence/debugging.
+//
+// v2 path (payloadVersion: 2): source is materialized from a coordinator bundle
+// (SourceRef); the clone is the lead worktree and is deleted in a finally block.
 import { execFile as execFileCb } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
+import type { LeadPlanOutput, LeadPlanPayload, LeadPlanPayloadV2 } from "@agencyhq/contracts";
 import {
+  isV2LeadPlanPayload,
   LEAD_OUTPUT_JSON_SCHEMAS,
   LeadPlanOutputSchema,
-  LeadPlanPayloadSchema,
+  LeadPlanPayloadAnySchema,
   leadAgentPermissions,
 } from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
+import type { Broker } from "../lib/broker.ts";
+import { createBroker } from "../lib/broker.ts";
 import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
 import { scrubbedChildEnv } from "../lib/env.ts";
 import { worktreeAdd, worktreeRemove } from "../lib/git.ts";
+import { materializeSource } from "../lib/source.ts";
 import { buildLeadPlanPrompt } from "../opencode/lead-prompt.ts";
 import { leadPrompt } from "../opencode/sdk.ts";
 import { parseWithSchema } from "../opencode/structured.ts";
+import type { LeadPromptFn } from "./lead-plan-core.ts";
 import { resolveLeadRunDir, resolveLeadWorktreePath, runLeadPlanCore } from "./lead-plan-core.ts";
+
+const execFileAsync = promisify(execFileCb);
 
 export const leadPlan = task({
   id: "lead.plan",
@@ -45,30 +57,19 @@ export const leadPlan = task({
   queue: { name: "lead", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },
 
-  run: async (rawPayload: unknown, { ctx }) => {
-    // --- Payload validation ---
-    const parsed = LeadPlanPayloadSchema.safeParse(rawPayload);
+  // biome-ignore lint/suspicious/noExplicitAny: ctx shape is opaque from Trigger SDK
+  run: async (rawPayload: unknown, { ctx }: any) => {
+    // Validate with the union schema (accepts v1 and v2).
+    const parsed = LeadPlanPayloadAnySchema.safeParse(rawPayload);
     if (!parsed.success) {
       throw new AbortTaskRunError(`lead.plan: invalid payload: ${parsed.error.message}`);
     }
     const payload = parsed.data;
 
-    const runId = ctx.run.id;
+    const runId = ctx.run.id as string;
 
-    // Worktree and run dir paths (for logging)
-    const worktreePath = resolveLeadWorktreePath({
-      worktreeBase: payload.worktreeBase,
-      workItemId: payload.workItemId,
-      runId,
-    });
-    const runDir = resolveLeadRunDir({
-      worktreeBase: payload.worktreeBase,
-      workItemId: payload.workItemId,
-      runId,
-    });
-
-    metadata.set("worktreePath", worktreePath);
-    metadata.set("runDir", runDir);
+    metadata.set("workItemId", payload.workItemId);
+    metadata.set("model", payload.model);
 
     const env = scrubbedChildEnv({ attemptId: `lead-${payload.workItemId}` });
     const ruleset = leadAgentPermissions();
@@ -79,9 +80,62 @@ export const leadPlan = task({
       process.env.AGENCYHQ_LEAD_VARIANT ??
       "low";
 
+    // v2 path: materialize source from coordinator bundle.
+    // Delegates to runLeadPlanV2WithBroker (single code path — X4-2).
+    if (isV2LeadPlanPayload(payload)) {
+      const coordinatorUrl =
+        process.env.AGENCYHQ_COORDINATOR_INTERNAL_URL ??
+        (() => {
+          throw new AbortTaskRunError("missing AGENCYHQ_COORDINATOR_INTERNAL_URL");
+        })();
+      const runRoot =
+        process.env.AGENCYHQ_RUN_ROOT ??
+        (() => {
+          throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
+        })();
+      const broker = createBroker(coordinatorUrl);
+
+      const output = await runLeadPlanV2WithBroker(payload, runId, broker, runRoot, {
+        variant,
+        onPhase: (phase) => metadata.set("phase", phase),
+      });
+
+      if (output.kind === "invalid_output") {
+        const syntheticEvent = { type: "error", error: { message: output.reason } };
+        const capacity = classifyCapacity([syntheticEvent], {
+          provider: providerFromModel(payload.model),
+          model: payload.model,
+          now: new Date(),
+        });
+        if (capacity !== null) {
+          metadata.set("capacity", capacity);
+        }
+      }
+
+      return output;
+    }
+
+    // v1 path: host filesystem paths.
+    const v1Payload = payload as LeadPlanPayload;
+
+    // Worktree and run dir paths (for logging)
+    const worktreePath = resolveLeadWorktreePath({
+      worktreeBase: v1Payload.worktreeBase,
+      workItemId: v1Payload.workItemId,
+      runId,
+    });
+    const runDir = resolveLeadRunDir({
+      worktreeBase: v1Payload.worktreeBase,
+      workItemId: v1Payload.workItemId,
+      runId,
+    });
+
+    metadata.set("worktreePath", worktreePath);
+    metadata.set("runDir", runDir);
+
     // Core run with injected dependencies
     const output = await runLeadPlanCore({
-      payload,
+      payload: v1Payload,
       runId,
       env,
       ruleset,
@@ -94,7 +148,6 @@ export const leadPlan = task({
       worktreeAdd: (args) => worktreeAdd(args),
       worktreeRemove: (args) => worktreeRemove(args),
       gitLsFiles: async ({ worktreePath: wt, limit }) => {
-        const execFileAsync = promisify(execFileCb);
         const { stdout } = await execFileAsync("git", ["ls-files"], {
           cwd: wt,
           maxBuffer: 16 * 1024 * 1024,
@@ -124,8 +177,8 @@ export const leadPlan = task({
     if (output.kind === "invalid_output") {
       const syntheticEvent = { type: "error", error: { message: output.reason } };
       const capacity = classifyCapacity([syntheticEvent], {
-        provider: providerFromModel(payload.model),
-        model: payload.model,
+        provider: providerFromModel(v1Payload.model),
+        model: v1Payload.model,
         now: new Date(),
       });
       if (capacity !== null) {
@@ -136,3 +189,117 @@ export const leadPlan = task({
     return output;
   },
 });
+
+// ---------------------------------------------------------------------------
+// runLeadPlanV2WithBroker: broker-injectable entry point for the v2 plan path.
+// Exported so tests can exercise the lease + source materialization + core
+// pipeline with FakeBroker and a stub leadPromptFn, without needing env vars.
+// X3-6: throws loudly on lease refusal (no silent empty token).
+// ---------------------------------------------------------------------------
+
+export async function runLeadPlanV2WithBroker(
+  payload: LeadPlanPayloadV2,
+  runId: string,
+  broker: Broker,
+  runRoot: string,
+  opts?: {
+    variant?: string;
+    onPhase?: (phase: string) => void;
+    deps?: { leadPromptFn?: LeadPromptFn };
+  },
+): Promise<LeadPlanOutput> {
+  const variant = opts?.variant ?? process.env.AGENCYHQ_LEAD_VARIANT ?? "low";
+  const env = scrubbedChildEnv({ attemptId: `lead-${payload.workItemId}` });
+  const ruleset = leadAgentPermissions();
+  const schema = LEAD_OUTPUT_JSON_SCHEMAS.leadPlanOutput;
+
+  let uploadToken = "";
+  if (payload.leaseNonce) {
+    const leaseResult = await broker.requestLease({
+      runId,
+      workItemId: payload.workItemId,
+      generation: 0,
+      purpose: "review",
+      nonce: payload.leaseNonce,
+    });
+    if (!leaseResult.ok) {
+      throw new AbortTaskRunError(
+        `lead.plan: lease refused: ${leaseResult.refusal.reason} — cannot proceed without source access`,
+      );
+    }
+    if (leaseResult.grant.material.purpose === "review") {
+      uploadToken = leaseResult.grant.material.token;
+    }
+  }
+
+  const tempParent = join(runRoot, "runs", `lead-${payload.workItemId}-${runId}`);
+  const cloneDir = join(tempParent, "src");
+
+  const sourceResult = await materializeSource({
+    source: payload.source,
+    dir: cloneDir,
+    broker,
+    token: uploadToken,
+  });
+
+  if (!sourceResult.ok) {
+    throw new AbortTaskRunError(
+      `lead.plan source materialization failed: ${sourceResult.failureKind}`,
+    );
+  }
+
+  const clonedDir = sourceResult.clonedDir;
+  opts?.onPhase?.("source_materialized");
+
+  const v1Payload: LeadPlanPayload = {
+    ...payload,
+    payloadVersion: 1 as const,
+    repoPath: clonedDir,
+    worktreeBase: tempParent,
+  };
+
+  try {
+    const output = await runLeadPlanCore({
+      payload: v1Payload,
+      runId,
+      env,
+      ruleset,
+      schema,
+      leadPromptFn:
+        opts?.deps?.leadPromptFn ??
+        ((input) =>
+          leadPrompt({
+            ...input,
+            variant: typeof variant === "string" ? variant : undefined,
+          })),
+      worktreeAdd: async () => {},
+      worktreeRemove: async () => {},
+      gitLsFiles: async ({ limit }) => {
+        const { stdout } = await execFileAsync("git", ["ls-files"], {
+          cwd: clonedDir,
+          maxBuffer: 16 * 1024 * 1024,
+        });
+        return stdout.trim().split("\n").filter(Boolean).slice(0, limit);
+      },
+      readFile: async (path) => {
+        try {
+          return await readFile(path, "utf8");
+        } catch {
+          return undefined;
+        }
+      },
+      buildPrompt: (p, repoContext) => buildLeadPlanPrompt(p, repoContext),
+      parseOutput: (raw) => {
+        const result = parseWithSchema(LeadPlanOutputSchema, raw);
+        if (result.ok) return result.value;
+        throw new Error(`LeadPlanOutputSchema parse failed: ${result.reason}`);
+      },
+      onPhase: opts?.onPhase ?? (() => {}),
+      timeoutMs: 270_000,
+      worktreePath: clonedDir,
+    });
+    return output;
+  } finally {
+    await rm(tempParent, { recursive: true, force: true }).catch(() => undefined);
+  }
+}

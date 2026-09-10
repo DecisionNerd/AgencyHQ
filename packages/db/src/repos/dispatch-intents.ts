@@ -92,6 +92,8 @@ export type QueuedWorkerIntentRow = {
   wi_created_at: Date | null;
   bounds: Record<string, unknown>;
   has_open_integrate_intent: boolean;
+  /** Monotonically increasing insertion-order column — stable sort tiebreaker. */
+  di_seq: number;
 };
 
 /**
@@ -120,6 +122,7 @@ export async function listQueuedWorkerIntents(
     wi_created_at: Date | null;
     bounds: Record<string, unknown>;
     has_open_integrate_intent: boolean;
+    di_seq: number;
   }>(`
     SELECT
       di.id                            AS intent_id,
@@ -143,14 +146,15 @@ export async function listQueuedWorkerIntents(
         WHERE s2.work_item_id = sc.work_item_id
           AND di2.task        = 'integrate.merge'
           AND di2.status      = 'triggered'
-      )                                AS has_open_integrate_intent
+      )                                AS has_open_integrate_intent,
+      di.seq                           AS di_seq
     FROM dispatch_intents di
     JOIN attempts       a  ON a.id  = di.attempt_id
     JOIN step_contracts sc ON sc.id = a.contract_id
     JOIN work_items     wi ON wi.id = sc.work_item_id
     WHERE di.status = 'queued'
       AND di.task   = 'worker.attempt'
-    ORDER BY di.created_at
+    ORDER BY di.created_at, di.seq
   `);
   return rows as QueuedWorkerIntentRow[];
 }
@@ -288,4 +292,51 @@ export async function updateDispatchIntentStatus(
   });
 
   return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch nonce hash (0009)
+// ---------------------------------------------------------------------------
+
+/**
+ * Store the sha256 hash of the dispatch nonce on an intent.
+ * Idempotent: replaces any existing hash (a new dispatch generates a new nonce).
+ * Never stores the raw nonce value.
+ *
+ * Returns the updated row, or null if the intent was not found.
+ */
+export async function setDispatchNonceHash(
+  client: pg.PoolClient,
+  intentId: string,
+  nonceHash: string,
+): Promise<DispatchIntentRow | null> {
+  const { rows } = await client.query<DispatchIntentRow>(
+    `UPDATE dispatch_intents
+     SET dispatch_nonce_hash = $2, updated_at = now()
+     WHERE id = $1
+     RETURNING *`,
+    [intentId, nonceHash],
+  );
+  const first = rows[0];
+  if (!first) return null;
+  return DispatchIntentRowSchema.parse(first);
+}
+
+/**
+ * Get the dispatch nonce hash for an intent by attempt_id and run_id.
+ * Returns null when no matching open intent (status='triggered') is found.
+ */
+export async function getDispatchNonceHash(
+  client: pg.PoolClient,
+  attemptId: string,
+  runId: string,
+): Promise<string | null> {
+  const { rows } = await client.query<{ dispatch_nonce_hash: string | null }>(
+    `SELECT dispatch_nonce_hash FROM dispatch_intents
+     WHERE attempt_id = $1 AND run_id = $2 AND status = 'triggered'
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [attemptId, runId],
+  );
+  return rows[0]?.dispatch_nonce_hash ?? null;
 }

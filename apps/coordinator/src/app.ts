@@ -31,6 +31,9 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { createBearerAuthMiddleware } from "./auth.ts";
 import type { CoordinatorConfig } from "./config.ts";
+import { mountArtifactRoutes } from "./internal/artifacts-router.ts";
+import type { InternalRouterDeps } from "./internal/router.ts";
+import { mountInternalRoutes } from "./internal/router.ts";
 import { buildReadiness } from "./readiness/build.ts";
 import type { ReadinessInputs, ReadinessResponse } from "./readiness/types.ts";
 import { buildAuthorityView } from "./views/authority-view.ts";
@@ -157,6 +160,9 @@ export type CommandsLike = {
     authority: unknown;
     actor: string;
   }): Promise<unknown>;
+  // W-15 / E9: import_host_project and revert_import
+  importHostProject(input: { commandId: string; projectId: string }): Promise<unknown>;
+  revertImport(input: { commandId: string; projectId: string }): Promise<unknown>;
 };
 
 // ---------------------------------------------------------------------------
@@ -344,6 +350,11 @@ export type AppDeps = {
   commands?: CommandsLike;
   /** Readiness loader — probes services and reads state files. Injectable for tests. */
   loadReadiness?: ReadinessLoaderFn;
+  /**
+   * Dependencies for the /internal/* routes (lease broker and future container APIs).
+   * When absent, /internal/* routes are not mounted (test environments that don't need them).
+   */
+  internalDeps?: InternalRouterDeps;
 };
 
 // ---------------------------------------------------------------------------
@@ -361,14 +372,35 @@ export function createApp(deps: AppDeps): Hono {
     loadSnapshot = defaultLoadSnapshot,
     commands,
     loadReadiness,
+    internalDeps,
   } = deps;
 
   const app = new Hono();
 
   // ------------------------------------------------------------------
+  // Internal API routes (no bearer auth — nonce-authenticated)
+  // Mounted before bearer middleware so /internal/* is never subject to
+  // the operator bearer token check.
+  // ------------------------------------------------------------------
+  if (internalDeps) {
+    mountInternalRoutes(app, internalDeps);
+  }
+
+  // ------------------------------------------------------------------
   // Bearer-token auth middleware (guards /api/* except /api/health)
   // ------------------------------------------------------------------
   app.use("/api/*", createBearerAuthMiddleware(config.apiToken));
+
+  // ------------------------------------------------------------------
+  // Internal routes — artifact admission and source bundle download.
+  // Mounted at /internal; validated by upload lease bearer tokens.
+  // ------------------------------------------------------------------
+  mountArtifactRoutes(app, {
+    pool: pool as Parameters<typeof mountArtifactRoutes>[1]["pool"],
+    gitRoot: config.gitRoot ?? `${config.worktreeBase}/git`,
+    maxBundleBytes: config.maxBundleBytes ?? 200 * 1024 * 1024,
+    clock,
+  });
 
   // ------------------------------------------------------------------
   // GET /api/health — infra-only, unauthenticated (see auth.ts)
@@ -892,7 +924,7 @@ export function createApp(deps: AppDeps): Hono {
     let sinceDate: Date | null = null;
     if (sinceParam) {
       const d = new Date(sinceParam);
-      if (isNaN(d.getTime())) {
+      if (Number.isNaN(d.getTime())) {
         return c.json({ error: "Invalid since parameter — expected ISO 8601" }, 400);
       }
       sinceDate = d;
@@ -1855,6 +1887,25 @@ export function createApp(deps: AppDeps): Hono {
         return c.json({ commandId, result }, 200);
       }
 
+      // W-15 / E9: import_host_project and revert_import
+      if (kind === "import_host_project") {
+        const projectId = body.projectId;
+        if (!projectId || typeof projectId !== "string") {
+          return c.json({ error: "projectId required for import_host_project" }, 400);
+        }
+        const result = await commands.importHostProject({ commandId, projectId });
+        return c.json({ commandId, result }, 200);
+      }
+
+      if (kind === "revert_import") {
+        const projectId = body.projectId;
+        if (!projectId || typeof projectId !== "string") {
+          return c.json({ error: "projectId required for revert_import" }, 400);
+        }
+        const result = await commands.revertImport({ commandId, projectId });
+        return c.json({ commandId, result }, 200);
+      }
+
       // Design 2: set_capacity — operator-sourced provider capacity override.
       // Idempotent by commandId (via claimCommand), decision row kind='capacity'.
       if (kind === "set_capacity") {
@@ -1875,7 +1926,7 @@ export function createApp(deps: AppDeps): Hono {
           return c.json({ error: "validUntil (ISO 8601) required for set_capacity" }, 400);
         }
         const validUntilDate = new Date(setCapValidUntil);
-        if (isNaN(validUntilDate.getTime())) {
+        if (Number.isNaN(validUntilDate.getTime())) {
           return c.json({ error: "validUntil is not a valid ISO 8601 timestamp" }, 400);
         }
         const setCapClient = await pool.connect();

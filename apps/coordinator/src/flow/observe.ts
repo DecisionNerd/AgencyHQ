@@ -18,9 +18,9 @@ import type { LeadPlanOutput } from "@agencyhq/contracts";
 import { LeadPlanOutputSchema, TASK_IDS } from "@agencyhq/contracts";
 import { applyObservation, listOpenDispatchIntents, recordCapacity } from "@agencyhq/db";
 import type { CommandId, RunObservation } from "@agencyhq/domain";
-import { effectiveCapacity, FINAL_RUN_STATUSES } from "@agencyhq/domain";
+import { FINAL_RUN_STATUSES } from "@agencyhq/domain";
 import type pg from "pg";
-import { confirmStop, readStopEvidence } from "../commands/confirm-stop.ts";
+import { confirmStop, readStopEvidenceDbFirst } from "../commands/confirm-stop.ts";
 import { stopAttempt } from "../commands/stop.ts";
 import type { BoundedRepairFlow, LeadHandlerResult } from "./bounded-repair.ts";
 import { generationOfIntent as getIntentGen } from "./bounded-repair.ts";
@@ -287,7 +287,9 @@ export class Reconciler {
    */
   async scheduleOnce(): Promise<void> {
     try {
-      await scheduleQueuedIntents(this.deps, (id) => this.flow.retryDispatch(id));
+      // D9 / W-11: pass provider status so the dispatch gate applies.
+      const providerStatus = this.deps.providerState?.();
+      await scheduleQueuedIntents(this.deps, (id) => this.flow.retryDispatch(id), providerStatus);
     } catch (err) {
       // Non-fatal in poll context: log and continue.  The intent remains queued
       // and the next poll will retry dispatch.
@@ -363,14 +365,16 @@ export class Reconciler {
     if (!this._realtimeWakeup || !this.deps.runtime.subscribe) return;
 
     this._wakeupAbort = new AbortController();
+    // Capture locally so TypeScript keeps the non-null type across the await.
+    const wakeupAbort = this._wakeupAbort;
 
     // Initial subscription attempt (cheap; no-op when no open work yet).
     await this._refreshWakeupSubscription();
 
     // Resolve only when stopWakeup() aborts the global controller.
-    if (this._wakeupAbort.signal.aborted) return;
+    if (wakeupAbort.signal.aborted) return;
     return new Promise<void>((resolve) => {
-      this._wakeupAbort!.signal.addEventListener("abort", () => resolve(), { once: true });
+      wakeupAbort.signal.addEventListener("abort", () => resolve(), { once: true });
     });
   }
 
@@ -520,14 +524,25 @@ export class Reconciler {
       );
       const finalObservedAt = obsRows[0]?.observed_at?.toISOString() ?? obs.observedAt;
 
-      // G-7: Evidence order — metadata first; fall back to stop.ndjson.
+      // G-7 / W-8: Evidence order — metadata first; then DB-first (mirror) or file (host).
       let stopEvidence: { survivors: number[]; checkpointCommit?: string } | undefined;
       const hasMetadataSurvivors = obs.metadata !== undefined && "survivors" in obs.metadata;
-      if (!hasMetadataSurvivors && this.deps.config.worktreeBase) {
-        const runDir = `${this.deps.config.worktreeBase}/runs/${intent.attempt_id}`;
-        const fileEvidence = await readStopEvidence(runDir);
-        if (fileEvidence !== null) {
-          stopEvidence = fileEvidence;
+      if (!hasMetadataSurvivors) {
+        // Use DB-first evidence reader for mirror runtime; file fallback for host.
+        const sourceMode = this.deps.profile.id === "container" ? "mirror" : "host_clone";
+        const runDir =
+          sourceMode === "host_clone" && this.deps.config.worktreeBase
+            ? `${this.deps.config.worktreeBase}/runs/${intent.attempt_id}`
+            : undefined;
+        const dbEvidence = await readStopEvidenceDbFirst(
+          client,
+          intent.attempt_id,
+          dispatchedGen,
+          sourceMode,
+          runDir,
+        );
+        if (dbEvidence !== null) {
+          stopEvidence = dbEvidence;
         }
       }
 
