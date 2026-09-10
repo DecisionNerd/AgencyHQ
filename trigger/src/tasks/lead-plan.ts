@@ -39,6 +39,7 @@ import { materializeSource } from "../lib/source.ts";
 import { buildLeadPlanPrompt } from "../opencode/lead-prompt.ts";
 import { leadPrompt } from "../opencode/sdk.ts";
 import { parseWithSchema } from "../opencode/structured.ts";
+import type { LeadPromptFn } from "./lead-plan-core.ts";
 import { resolveLeadRunDir, resolveLeadWorktreePath, runLeadPlanCore } from "./lead-plan-core.ts";
 
 const execFileAsync = promisify(execFileCb);
@@ -201,7 +202,11 @@ export async function runLeadPlanV2WithBroker(
   runId: string,
   broker: Broker,
   runRoot: string,
-  opts?: { variant?: string; onPhase?: (phase: string) => void },
+  opts?: {
+    variant?: string;
+    onPhase?: (phase: string) => void;
+    deps?: { leadPromptFn?: LeadPromptFn };
+  },
 ): Promise<LeadPlanOutput> {
   const variant = opts?.variant ?? process.env.AGENCYHQ_LEAD_VARIANT ?? "low";
   const env = scrubbedChildEnv({ attemptId: `lead-${payload.workItemId}` });
@@ -260,11 +265,13 @@ export async function runLeadPlanV2WithBroker(
       env,
       ruleset,
       schema,
-      leadPromptFn: (input) =>
-        leadPrompt({
-          ...input,
-          variant: typeof variant === "string" ? variant : undefined,
-        }),
+      leadPromptFn:
+        opts?.deps?.leadPromptFn ??
+        ((input) =>
+          leadPrompt({
+            ...input,
+            variant: typeof variant === "string" ? variant : undefined,
+          })),
       worktreeAdd: async () => {},
       worktreeRemove: async () => {},
       gitLsFiles: async ({ limit }) => {

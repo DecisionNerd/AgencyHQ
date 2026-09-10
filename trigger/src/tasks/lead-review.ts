@@ -26,7 +26,7 @@ import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
 import { worktreeAdd, worktreeRemove } from "../lib/git.ts";
 import { materializeSource } from "../lib/source.ts";
 import { leadPrompt } from "../opencode/sdk.ts";
-import type { ReviewTaskOutput } from "../types.ts";
+import type { LeadSession, ReviewTaskOutput } from "../types.ts";
 import { runReview } from "./lead-review-core.ts";
 
 const DEFAULT_LEAD_VARIANT = "low";
@@ -166,6 +166,7 @@ export async function runReviewV2WithBroker(
   runId: string,
   broker: Broker,
   runRoot: string,
+  opts?: { deps?: { leadSession?: LeadSession } },
 ): Promise<ReviewTaskOutput & { reviewerModel: string }> {
   // E2 / X2-2: use ctx.run.id (passed as runId) to request the review lease.
   // E7 / W-10: request a review-purpose lease (not upload) — the review task
@@ -251,11 +252,13 @@ export async function runReviewV2WithBroker(
       worktreeRemove: async () => {},
       // gitDiff uses the clone dir where both base and attempt commits exist.
       gitDiff: (_repoPath, base, attempt) => gitDiff(clonedDir, base, attempt),
-      leadSession: (input) =>
-        leadPrompt({
-          ...input,
-          variant: input.variant ?? variant,
-        }),
+      leadSession:
+        opts?.deps?.leadSession ??
+        ((input) =>
+          leadPrompt({
+            ...input,
+            variant: input.variant ?? variant,
+          })),
       now: () => new Date(),
       // Override worktree path: the lead session runs in the clone dir.
       worktreePath: clonedDir,

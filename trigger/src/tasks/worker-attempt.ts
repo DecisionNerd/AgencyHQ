@@ -49,6 +49,7 @@ import {
 import { parseEvents, spawnOpenCode, summarize, writeRunConfig } from "../lib/opencode.ts";
 import { classifyPaths, quarantinePatch } from "../lib/paths.ts";
 import { killTree, survivorScan } from "../lib/procs.ts";
+import type { PrepareRuntimeArgs, PrepareRuntimeResult } from "../lib/runtime.ts";
 import { prepareRuntime } from "../lib/runtime.ts";
 import { materializeSource } from "../lib/source.ts";
 import type { WorkerAttemptOutput, WorkerAttemptPayload } from "../types.ts";
@@ -527,15 +528,25 @@ export async function runWorkerAttemptV2WithBroker(
   broker: Broker,
   runRoot: string,
   nonceOverride?: string,
-  opts: { maxDurationSeconds?: number } = {},
+  opts: {
+    maxDurationSeconds?: number;
+    deps?: {
+      spawnOpenCode?: typeof spawnOpenCode;
+      prepareRuntime?: (args: PrepareRuntimeArgs) => Promise<PrepareRuntimeResult>;
+      metadataSet?: (key: string, value: unknown) => void;
+    };
+  } = {},
 ): Promise<WorkerAttemptOutput> {
+  // biome-ignore lint/suspicious/noExplicitAny: metadata.set requires DeserializedJson; cast is safe for best-effort writes
+  const metaSet = opts.deps?.metadataSet ?? ((k: string, v: unknown) => metadata.set(k, v as any));
   const nonce = nonceOverride ?? payload.leaseNonce;
   if (nonce === undefined) {
     throw new AbortTaskRunError("v2 payload without leaseNonce: dispatch did not record a nonce");
   }
 
   // Step 1: prepareRuntime — provider auth + per-run HOME
-  const runtimeResult = await prepareRuntime({
+  const runtimeFn = opts.deps?.prepareRuntime ?? prepareRuntime;
+  const runtimeResult = await runtimeFn({
     runId,
     attemptId: payload.attemptId,
     generation: payload.generation,
@@ -575,7 +586,7 @@ export async function runWorkerAttemptV2WithBroker(
     }
 
     const clonedDir = sourceResult.clonedDir;
-    metadata.set("phase", "worktree_ready");
+    metaSet("phase", "worktree_ready");
 
     // Step 3: model + ruleset
     let model: string;
@@ -602,13 +613,14 @@ export async function runWorkerAttemptV2WithBroker(
     }
 
     await writeRunConfig({ runDir, model, ruleset });
-    metadata.set("permissionSource", permissionSource);
+    metaSet("permissionSource", permissionSource);
 
     // Step 4: spawn OpenCode in clone dir with per-run HOME
     const baseEnv = scrubbedChildEnv({ attemptId: payload.attemptId });
     const childEnv: Record<string, string> = { ...baseEnv, HOME: home, ...envAdditions };
 
-    const { child, pid, pgid } = await spawnOpenCode({
+    const spawnFn = opts.deps?.spawnOpenCode ?? spawnOpenCode;
+    const { child, pid, pgid } = await spawnFn({
       worktreePath: clonedDir,
       runDir,
       prompt: payload.prompt,
@@ -629,10 +641,10 @@ export async function runWorkerAttemptV2WithBroker(
     const stopDeps = stopDepsFor(runDir);
     installSigtermHold(RUN_STATES);
 
-    metadata.set("phase", "opencode_running");
-    metadata.set("pid", pid);
-    metadata.set("pgid", pgid);
-    watchForSessionId(child.stdout, (sessionID) => metadata.set("sessionID", sessionID));
+    metaSet("phase", "opencode_running");
+    metaSet("pid", pid);
+    metaSet("pgid", pgid);
+    watchForSessionId(child.stdout, (sessionID) => metaSet("sessionID", sessionID));
 
     const abortState: {
       stopPromise: ReturnType<typeof checkpointAndKill> | null;
@@ -702,7 +714,7 @@ export async function runWorkerAttemptV2WithBroker(
         token: uploadToken,
       });
 
-      metadata.set("phase", abortState.softTimedOut ? "timed_out" : "cancelled");
+      metaSet("phase", abortState.softTimedOut ? "timed_out" : "cancelled");
       return buildOutput({
         attemptId: payload.attemptId,
         outcome: abortState.softTimedOut ? "timed_out" : "cancelled",
@@ -724,7 +736,7 @@ export async function runWorkerAttemptV2WithBroker(
       });
     }
 
-    metadata.set("phase", "diffing");
+    metaSet("phase", "diffing");
 
     // Step 5: summarize OpenCode events
     let sessionID: string | null = null;
@@ -746,10 +758,10 @@ export async function runWorkerAttemptV2WithBroker(
         now: new Date(),
       });
       if (capacity !== null) {
-        metadata.set("capacity", capacity);
+        metaSet("capacity", capacity);
       }
     } catch (error: unknown) {
-      metadata.set("phase", "opencode_error");
+      metaSet("phase", "opencode_error");
       const message = error instanceof Error ? error.message : String(error);
       return buildOutput({
         attemptId: payload.attemptId,
@@ -825,7 +837,7 @@ export async function runWorkerAttemptV2WithBroker(
       token: uploadToken,
     });
 
-    metadata.set("phase", outcome === "path_violation" ? "path_violation" : "committed");
+    metaSet("phase", outcome === "path_violation" ? "path_violation" : "committed");
 
     return buildOutput({
       attemptId: payload.attemptId,

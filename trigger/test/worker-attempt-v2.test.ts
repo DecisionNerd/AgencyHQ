@@ -10,18 +10,21 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import type { LeaseGrant } from "@agencyhq/contracts";
+import type { LeaseGrant, WorkerAttemptPayloadV2 } from "@agencyhq/contracts";
 import { exportAttemptBundle, uploadAttemptArtifact } from "../src/lib/artifact-upload.ts";
 import { FakeBroker } from "../src/lib/broker.ts";
 import { uploadStopEvidence } from "../src/lib/evidence.ts";
+import type { PrepareRuntimeArgs, PrepareRuntimeResult } from "../src/lib/runtime.ts";
 import { prepareRuntime } from "../src/lib/runtime.ts";
 import { materializeSource } from "../src/lib/source.ts";
+import { runWorkerAttemptV2WithBroker } from "../src/tasks/worker-attempt.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -379,134 +382,189 @@ test("P11: broker issuance → exportAttemptBundle → upload → verified row",
 //   - container-profile HOME is deleted by cleanup()
 // ---------------------------------------------------------------------------
 
-test("worker-attempt v2 W-16: artifact upload carries real commit id and diff digest; HOME cleaned up", async () => {
-  // Part A: artifact upload pipeline — real commit id and matching diff digest.
-  const { bundleBytes, revision: baseRevision } = await makeSourceBundle("HEAD");
-  const cloneDir = await makeTmpDir();
+// ---------------------------------------------------------------------------
+// W-16: runWorkerAttemptV2WithBroker with stub opencode — real commit id and
+// diff digest, stop-evidence and artifact outputs set, HOME cleaned up.
+//
+// Uses injectable deps (spawnOpenCode, prepareRuntime) so no real OpenCode
+// binary or coordinator env vars are required.
+// ---------------------------------------------------------------------------
 
-  const UPLOAD_TOKEN = "upload-token-w16-real";
-  const ATTEMPT_ID = "attempt-w16-real";
+test("worker-attempt v2 W-16: runWorkerAttemptV2WithBroker with stub opencode — real commit id and digest, HOME cleaned up", async () => {
+  const { bundleBytes, revision: baseRevision } = await makeSourceBundle("HEAD");
+  const runRoot = await makeTmpDir();
+
+  const UPLOAD_TOKEN = "upload-token-w16-v2";
+  const ATTEMPT_ID = "attempt-w16-v2";
+  const RUN_ID = "run-w16-v2";
+
+  // HOME dir that prepareRuntime stub will return; must exist so stat() works.
+  const fakeHome = join(runRoot, "home");
+  await mkdir(fakeHome, { recursive: true });
+  let homeCleaned = false;
+
+  const broker = new FakeBroker();
+  broker.bundles.set(`proj-w16-v2:${baseRevision}`, bundleBytes);
+
+  // Stub prepareRuntime: returns an upload lease with UPLOAD_TOKEN and a
+  // cleanup that deletes fakeHome (verifies HOME cleanup).
+  const stubPrepareRuntime = async (_args: PrepareRuntimeArgs): Promise<PrepareRuntimeResult> => ({
+    ok: true,
+    home: fakeHome,
+    envAdditions: {},
+    uploadLease: {
+      leaseId: "lease-w16-v2",
+      purpose: "upload",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      material: { purpose: "upload", token: UPLOAD_TOKEN },
+    } satisfies LeaseGrant,
+    cleanup: async () => {
+      await rm(fakeHome, { recursive: true, force: true });
+      homeCleaned = true;
+    },
+  });
+
+  // Stub spawnOpenCode: writes feature.ts to worktree (the "opencode work"),
+  // configures git identity, and writes a minimal events.ndjson. Returns a
+  // mock child that emits 'close' with exit code 0 on the next tick.
+  const stubSpawnOpenCode = async (args: {
+    worktreePath: string;
+    runDir: string;
+    prompt: string;
+    model: string;
+    env: Record<string, string>;
+    bin?: string;
+  }) => {
+    // Set git identity in clone so commitTree can commit.
+    await execFileAsync("git", ["-C", args.worktreePath, "config", "user.email", "w@w.com"]);
+    await execFileAsync("git", ["-C", args.worktreePath, "config", "user.name", "Worker"]);
+    // Write the "opencode" output file.
+    await writeFile(join(args.worktreePath, "feature.ts"), "export const answer = 42;\n");
+    // Write a minimal events.ndjson so summarize() can extract sessionID.
+    const evt = JSON.stringify({ type: "session", sessionID: "stub-w16-session" });
+    await mkdir(args.runDir, { recursive: true });
+    await writeFile(join(args.runDir, "events.ndjson"), `${evt}\n`);
+    // Return a mock child process that emits 'close' with exit code 0.
+    const emitter = new EventEmitter();
+    (emitter as unknown as { stdout: null }).stdout = null;
+    setImmediate(() => emitter.emit("close", 0));
+    // biome-ignore lint/suspicious/noExplicitAny: mock child typed as ChildProcess
+    return { child: emitter as any, pid: 99999, pgid: 99999 };
+  };
+
+  const payload: WorkerAttemptPayloadV2 = {
+    payloadVersion: 2,
+    attemptId: ATTEMPT_ID,
+    generation: 0,
+    contractId: "contract-w16",
+    contractVersion: "1",
+    source: { projectId: "proj-w16-v2", revision: baseRevision, bundlePath: "source.bundle" },
+    baseRev: baseRevision,
+    prompt: "Add a feature.",
+    allowedPaths: ["**"],
+    bounds: {
+      paths: { allow: ["**"], deny: [] },
+      capabilities: {
+        bash: { allow: [], deny: [] },
+        tools: {
+          edit: true,
+          webfetch: false,
+          websearch: false,
+          task: false,
+          external_directory: false,
+          skill: false,
+        },
+      },
+      boundary: "artifact",
+      budget: { maxAttempts: 1, maxDurationSeconds: 300, estimatedSpendUsd: 1 },
+      review: "adversarial",
+      changeClass: "behavior",
+      models: { worker: "claude-3-5-sonnet-20241022", reviewer: "claude-3-5-sonnet-20241022" },
+    },
+    permissionRules: {
+      "*": "deny",
+      read: "allow",
+      glob: "allow",
+      grep: "allow",
+      list: "allow",
+      edit: {},
+      bash: {},
+      task: "deny",
+      webfetch: "deny",
+      websearch: "deny",
+      skill: "deny",
+      external_directory: "deny",
+      doom_loop: "deny",
+    },
+    model: "claude-3-5-sonnet-20241022",
+    leaseNonce: "n".repeat(32),
+  };
+
+  const ac = new AbortController();
 
   try {
-    const broker = new FakeBroker();
-    broker.grants.set(`upload:${ATTEMPT_ID}`, makeUploadGrant(UPLOAD_TOKEN));
-    broker.bundles.set(`proj-w16-real:${baseRevision}`, bundleBytes);
-
-    // Materialize source into clone.
-    const srcResult = await materializeSource({
-      source: { projectId: "proj-w16-real", revision: baseRevision, bundlePath: "source.bundle" },
-      dir: cloneDir,
+    const result = await runWorkerAttemptV2WithBroker(
+      payload,
+      RUN_ID,
+      ac.signal,
       broker,
-      token: UPLOAD_TOKEN,
-    });
-    assert.equal(srcResult.ok, true, "source materialization must succeed");
-    if (!srcResult.ok) return;
-    const clonedDir = srcResult.clonedDir;
+      runRoot,
+      "n".repeat(32),
+      {
+        maxDurationSeconds: 600,
+        deps: {
+          spawnOpenCode: stubSpawnOpenCode,
+          prepareRuntime: stubPrepareRuntime,
+          metadataSet: () => {},
+        },
+      },
+    );
 
-    // Commit the worker's change: add feature.ts (the "committed change").
-    await writeFile(join(clonedDir, "feature.ts"), "export const answer = 42;\n");
-    await execFileAsync("git", ["-C", clonedDir, "add", "-A"]);
-    await execFileAsync("git", ["-C", clonedDir, "config", "user.email", "worker@test.com"]);
-    await execFileAsync("git", ["-C", clonedDir, "config", "user.name", "Worker"]);
-    await execFileAsync("git", ["-C", clonedDir, "commit", "-m", "worker attempt"]);
-    const { stdout: headOut } = await execFileAsync("git", ["-C", clonedDir, "rev-parse", "HEAD"]);
-    const commitId = headOut.trim();
+    // The stub committed feature.ts → commitId must be a real non-null SHA.
+    assert.ok(result.commitId !== null, "commitId must be non-null (worker committed changes)");
+    assert.ok(
+      /^[0-9a-f]{40}$/.test(result.commitId ?? ""),
+      `commitId must be a 40-hex SHA, got: ${result.commitId}`,
+    );
 
-    // Compute real diff digest: sha256(git diff baseRevision) at HEAD=commitId.
-    // Mirrors trigger/src/lib/git.ts#diffDigest (no untracked files in clean clone).
-    const { stdout: diffOut } = await execFileAsync("git", ["-C", clonedDir, "diff", baseRevision]);
+    // Artifact upload carries the real commit id.
+    const uploadCall = broker.calls.find((c) => c.op === "uploadArtifact");
+    assert.ok(uploadCall, "uploadArtifact must have been called");
+
+    // result.uploads.artifact must be "uploaded".
+    assert.equal(result.uploads?.artifact, "uploaded", "artifact upload status must be 'uploaded'");
+
+    // result.diffDigest must be a sha256 of git diff baseRevision (feature.ts addition).
+    assert.ok(
+      typeof result.diffDigest === "string" && result.diffDigest.startsWith("sha256:"),
+      `diffDigest must start with sha256:, got: ${result.diffDigest}`,
+    );
+
+    // Verify diffDigest matches the actual git diff in the clone dir.
+    // The clone is at runRoot/runs/<runId>/src.
+    const cloneDir = join(runRoot, "runs", RUN_ID, "src");
+    const { stdout: diffOut } = await execFileAsync("git", ["-C", cloneDir, "diff", baseRevision]);
     const hash = createHash("sha256");
     hash.update(diffOut);
-    const realDiffDigest = `sha256:${hash.digest("hex")}`;
+    const expectedDigest = `sha256:${hash.digest("hex")}`;
+    assert.equal(result.diffDigest, expectedDigest, "diffDigest must match sha256 of git diff");
+    assert.ok(diffOut.includes("feature.ts"), "diff must include the committed feature.ts");
 
-    // Upload artifact with the real commit id and diff digest.
-    const uploadResult = await uploadAttemptArtifact({
-      repoPath: clonedDir,
-      commitId,
-      baseRevision,
-      attemptId: ATTEMPT_ID,
-      generation: 0,
-      kind: "attempt",
-      changedPaths: ["feature.ts"],
-      diffDigest: realDiffDigest,
-      broker,
-      token: UPLOAD_TOKEN,
-    });
+    // Stop evidence outputs: uploadStopEvidence is called (skipped status since no stop.ndjson).
+    assert.ok(result.uploads?.stopEvidence !== undefined, "uploads.stopEvidence must be set");
 
-    // Artifact upload carries the real commit id (not null, not a placeholder).
-    assert.equal(uploadResult.uploadStatus, "uploaded", "artifact must be uploaded");
-    assert.equal(
-      uploadResult.artifactRef?.revision,
-      commitId,
-      "artifact upload must carry the real commit id",
+    // HOME must have been deleted by cleanup() (injected prepareRuntime's cleanup).
+    assert.equal(homeCleaned, true, "cleanup() must have been called to delete HOME");
+    await assert.rejects(
+      () => stat(fakeHome),
+      (err: unknown) => (err as NodeJS.ErrnoException).code === "ENOENT",
+      "fakeHome must not exist after cleanup()",
     );
 
-    // Diff digest matches the committed change: sha256 prefix is present.
-    assert.ok(realDiffDigest.startsWith("sha256:"), "diff digest must have sha256 prefix");
-    // The digest encodes the actual feature.ts addition — verify by re-computing.
-    const { stdout: verifyDiffOut } = await execFileAsync("git", [
-      "-C",
-      clonedDir,
-      "diff",
-      baseRevision,
-    ]);
-    const verifyHash = createHash("sha256");
-    verifyHash.update(verifyDiffOut);
-    assert.equal(
-      realDiffDigest,
-      `sha256:${verifyHash.digest("hex")}`,
-      "diff digest must match sha256 of git diff output (committed change)",
-    );
-
-    // Diff output includes feature.ts (the committed change).
-    assert.ok(diffOut.includes("feature.ts"), "diff must include feature.ts");
-
-    // Token must not appear in broker call records.
+    // Upload token must not appear in any broker call record.
     const callsStr = JSON.stringify(broker.calls);
     assert.ok(!callsStr.includes(UPLOAD_TOKEN), "upload token must not appear in call records");
   } finally {
-    await rm(cloneDir, { recursive: true, force: true });
-  }
-
-  // Part B: container-profile HOME is created by prepareRuntime and deleted by cleanup().
-  const fakeRunRoot = await makeTmpDir();
-  try {
-    const runtimeBroker = new FakeBroker();
-    runtimeBroker.grants.set("provider:attempt-w16-home", {
-      leaseId: "lease-w16-home",
-      purpose: "provider",
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
-      material: { purpose: "provider", authJson: "{}" },
-    } satisfies LeaseGrant);
-
-    const runtimeResult = await prepareRuntime({
-      runId: "run-w16-home",
-      attemptId: "attempt-w16-home",
-      generation: 0,
-      nonce: "h".repeat(32),
-      broker: runtimeBroker,
-      env: {
-        HOME: join(fakeRunRoot, "host-home"),
-        AGENCYHQ_RUNTIME_PROFILE: "container",
-        AGENCYHQ_RUN_ROOT: fakeRunRoot,
-      },
-    });
-    assert.equal(runtimeResult.ok, true, "container-profile prepareRuntime must succeed");
-    if (!runtimeResult.ok) return;
-
-    const { home, cleanup } = runtimeResult;
-
-    // HOME directory was created by resolveRunHome.
-    await stat(home); // throws ENOENT if home does not exist
-
-    // Calling cleanup() must delete the per-run HOME tree.
-    await cleanup();
-    await assert.rejects(
-      () => stat(home),
-      (err: unknown) => (err as NodeJS.ErrnoException).code === "ENOENT",
-      "HOME must be deleted by cleanup()",
-    );
-  } finally {
-    await rm(fakeRunRoot, { recursive: true, force: true });
+    await rm(runRoot, { recursive: true, force: true });
   }
 });

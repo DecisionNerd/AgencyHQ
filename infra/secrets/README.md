@@ -39,7 +39,7 @@ through inline `command:`/`entrypoint:` wrappers in `infra/trigger/docker-compos
 | --- | --- | --- |
 | `webapp.env` | `SESSION_SECRET`, `MAGIC_LINK_SECRET`, `ENCRYPTION_KEY`, `PROVIDER_SECRET`, `COORDINATOR_SECRET`, `MANAGED_WORKER_SECRET`, `DATABASE_URL`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_URL`, `RUN_REPLICATION_CLICKHOUSE_URL`, `OBJECT_STORE_SECRET_ACCESS_KEY` | Trigger webapp |
 | `supervisor.env` | `MANAGED_WORKER_SECRET` | Trigger worker stack container (supervisor) |
-| `agencyhq.env` | `AGENCYHQ_POSTGRES_PASSWORD`, `DATABASE_URL`, `AGENCYHQ_API_TOKEN` | AgencyHQ coordinator |
+| `agencyhq.env` | `AGENCYHQ_POSTGRES_PASSWORD`, `DATABASE_URL`, `AGENCYHQ_API_TOKEN`, `AGENCYHQ_SECRETS_KEY` (AES-256-GCM key for project credential rows) | AgencyHQ coordinator |
 | `clickhouse.env` | `CLICKHOUSE_PASSWORD` | Clickhouse |
 | `minio.env` | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `OBJECT_STORE_SECRET_ACCESS_KEY` | MinIO |
 | `trigger-db-password` | (raw password) | Trigger postgres (POSTGRES_PASSWORD_FILE) |
