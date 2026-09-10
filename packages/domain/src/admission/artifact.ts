@@ -25,6 +25,7 @@ export type ArtifactAdmissionCode =
   | "LEASE_EXPIRED"
   | "LEASE_PURPOSE_MISMATCH"
   | "ATTEMPT_MISMATCH"
+  | "LEASE_GENERATION_MISMATCH"
   | "STALE_GENERATION"
   | "FUTURE_GENERATION"
   | "ATTEMPT_TERMINAL"
@@ -75,7 +76,15 @@ export interface ArtifactAdmissionInput {
 // Terminal attempt statuses
 // ---------------------------------------------------------------------------
 
-const TERMINAL_STATUSES = new Set(["completed", "quarantined", "failed", "stopped"]);
+/** Strictly terminal statuses: reject all uploads (attempt and checkpoint). */
+const STRICTLY_TERMINAL_STATUSES = new Set(["completed", "quarantined", "failed"]);
+
+/**
+ * Stopping/uncertain statuses: accept only checkpoint and stop-evidence uploads.
+ * A final "attempt" artifact from a fenced generation must not advance the
+ * attempt while it is shutting down.
+ */
+const STOPPING_STATUSES = new Set(["stopping", "stopped", "uncertain"]);
 
 // ---------------------------------------------------------------------------
 // validateArtifactAdmission
@@ -106,21 +115,37 @@ export function validateArtifactAdmission(
   // 5. Lease must reference the same attempt
   if (lease.attemptId !== attempt.id) return err("ATTEMPT_MISMATCH");
 
-  // 6–7. Generation check (E1 / X2-1):
-  //  - "attempt" (final) artifacts: generation must equal attempt.currentGeneration.
-  //  - "checkpoint" artifacts: generation must equal the lease's generation so
-  //    that a container can still upload a checkpoint after an operator stop bumped
-  //    the generation and revoked provider/integrate leases (upload leases are kept).
+  // 6–8. Generation and status checks (X3-1):
+  //
+  //  "attempt" (final) artifacts: require lease.generation === claimed.generation
+  //  === attempt.currentGeneration. A container must not promote a final artifact
+  //  for a generation other than the one its lease was issued for.
+  //
+  //  "checkpoint" artifacts and stop evidence: require lease.generation ===
+  //  claimed.generation (so an old token cannot poison a future generation) and
+  //  claimed.generation <= attempt.currentGeneration (allow superseded checkpoints
+  //  from a container still uploading after a stop-induced generation advance).
   if (claimed.kind === "attempt") {
+    // 6a. Lease must be for the same generation the container claims.
+    if (claimed.generation !== lease.generation) return err("LEASE_GENERATION_MISMATCH");
+    // 6b–7. Claimed generation must equal the attempt's current generation.
     if (claimed.generation < attempt.currentGeneration) return err("STALE_GENERATION");
     if (claimed.generation > attempt.currentGeneration) return err("FUTURE_GENERATION");
   } else {
-    // checkpoint: must match the lease generation (the lease was issued for that gen)
+    // 6a. Checkpoint: claimed generation must match the lease's generation.
     if (claimed.generation !== lease.generation) return err("STALE_GENERATION");
+    // 6b. Checkpoint generation must not exceed the attempt's current generation.
+    if (claimed.generation > attempt.currentGeneration) return err("FUTURE_GENERATION");
   }
 
-  // 8. Attempt must not be in a terminal state
-  if (TERMINAL_STATUSES.has(attempt.status)) return err("ATTEMPT_TERMINAL");
+  // 8. Attempt must not be in a strictly terminal state (completed/quarantined/failed).
+  if (STRICTLY_TERMINAL_STATUSES.has(attempt.status)) return err("ATTEMPT_TERMINAL");
+
+  // 8b. Attempts in stopping/stopped/uncertain accept only checkpoint uploads,
+  //     not final "attempt" artifacts (those would advance the generation record).
+  if (STOPPING_STATUSES.has(attempt.status) && claimed.kind === "attempt") {
+    return err("ATTEMPT_TERMINAL");
+  }
 
   // 9. Bundle size must not exceed limit
   if (claimed.bundleBytes > limits.maxBundleBytes) return err("BUNDLE_TOO_LARGE");

@@ -33,15 +33,15 @@ pending.
 
 When the coordinator dispatches a `worker.attempt` intent for a project whose
 `source_mode = 'mirror'`, it generates a 32-byte cryptographically random
-dispatch nonce (`apps/coordinator/src/internal/nonce.ts`: `generateNonce()`),
+dispatch nonce (`generateDispatchNonce()`, inlined in `apps/coordinator/src/flow/bounded-repair.ts`),
 stores only its SHA-256 hash (`hashNonce()`) in
-`dispatch_intents.dispatch_nonce_hash`, and passes the raw nonce to the task
-container in the payload environment (read from `AGENCYHQ_DISPATCH_NONCE` inside
-the container). The raw nonce is never persisted.
+`dispatch_intents.dispatch_nonce_hash`, and embeds the raw nonce in the task
+payload as `leaseNonce` (workers may also read it from `AGENCYHQ_LEASE_NONCE`).
+The raw nonce is never persisted.
 
 ### Task start — prepareRuntime
 
-At task start, `trigger/src/lib/runtime.ts` `prepareRuntime()` runs:
+At task start for `worker.attempt` tasks, `trigger/src/lib/runtime.ts` `prepareRuntime()` runs:
 
 1. **Profile check.** Reads `AGENCYHQ_RUNTIME_PROFILE`. On `host` profile (the
    current default), `HOME` is the process home and cleanup is a no-op. On
@@ -111,15 +111,17 @@ structured step list (`trigger/src/lib/evidence.ts`).
 When the coordinator receives an artifact upload at
 `apps/coordinator/src/internal/artifacts-router.ts`:
 
-1. **Lease lookup.** The upload token (SHA-256 of it, stored as `nonce_hash`) is
+1. **Lease lookup.** The upload token (SHA-256 of it, stored as `token_hash`) is
    looked up against the `leases` table to find a valid `upload` lease for the
    attempt.
 2. **Generation check.** The claimed generation is compared to the attempt's
    current generation; stale (lower) or future (higher) generations are rejected.
 3. **Project path verification.** `validateArtifactAdmission()`
-   (`packages/domain/src/admission/artifact.ts`) runs all 12 checks in order:
-   lease present, not revoked, not expired, purpose = upload, attempt matches,
-   generation current, attempt not terminal, bundle size within limit, paths safe,
+   (`packages/domain/src/admission/artifact.ts`) runs all checks in order:
+   lease present, not revoked, not expired, purpose = upload or provider (upload route),
+   attempt matches, lease-generation matches claimed generation (LEASE_GENERATION_MISMATCH),
+   claimed generation matches attempt current generation (STALE_GENERATION / FUTURE_GENERATION),
+   attempt not in terminal or stopping status, bundle size within limit, paths safe,
    commit in mirror, digest matches.
 4. **Bundle import.** `importBundle()` writes the bundle into the git bare mirror
    at `AGENCYHQ_GIT_ROOT/<projectId>.git`. The coordinator recomputes the diff
@@ -136,10 +138,10 @@ overwrite earlier ones (idempotent by `(attempt_id, generation)`).
 ### Verification, review, and accept from the mirror
 
 Verify, review, and accept tasks running on the container profile fetch source
-and artifacts from the coordinator's mirror via the same `GET /internal/source`
-and `GET /internal/attempts/:id/artifacts` routes (authenticated with a
-git-read lease). The trusted mirror serves as the durable artifact store across
-container lifetimes.
+from `GET /internal/source` and artifacts from
+`GET /internal/attempts/:id/artifacts/:generation/bundle` (authenticated with
+an upload lease; no git-read lease is used). The trusted mirror serves as the
+durable artifact store across container lifetimes.
 
 ### Integrate with the integrate lease
 
@@ -147,17 +149,18 @@ The `integrate.merge` task requests an `integrate` lease (TTL: 5 minutes,
 configurable via `AGENCYHQ_INTEGRATE_LEASE_TTL_MS`) from the coordinator. The
 grant's `material.askpassToken` is used as a git credential helper token for
 `git push` to the remote. The integrate lease is operation-scoped: it is issued
-only for the exact attempt/generation pair and expires after use.
+only for the exact attempt/generation pair. (`markLeaseUsed` exists but has no
+callers; the lease is revoked by `revokeLeasesBelowGeneration` on generation advance.)
 
 ### Host profile stop evidence (current fallback)
 
 On the host profile (`source_mode = 'host_clone'`), stop evidence is still
 read from the run directory's `stop.ndjson` file by the coordinator's
 `confirmStop` path. The host adapter writes this file before exit.
-`dispatch_intents.dispatch_nonce_hash` and the `leases` table are populated
-on host-profile dispatches when `source_mode = 'mirror'`; host-profile dispatches
-with `source_mode = 'host_clone'` do not use the nonce (the `dispatch_nonce_hash`
-field remains null and the lease broker allows null for backward compatibility).
+`dispatch_intents.dispatch_nonce_hash` is populated for mirror-mode dispatches
+(`source_mode = 'mirror'`). Host-clone dispatches (`source_mode = 'host_clone'`)
+leave `dispatch_nonce_hash` null; the lease broker rejects mirror-mode lease
+requests that present a null hash (no null bypass).
 
 ## Lifecycle of one step
 

@@ -151,7 +151,7 @@ When a project's `source_mode` is `mirror`, the coordinator owns the authoritati
 
 `POST /internal/attempts/:id/artifacts` and `POST /internal/attempts/:id/checkpoints` accept bundle uploads from worker containers. The coordinator:
 
-1. Authenticates the request by comparing `sha256(bearer token)` against the `nonce_hash` stored in the `leases` table (purpose `upload`).
+1. Authenticates the request by comparing `sha256(bearer token)` against the `token_hash` stored in the `leases` table (purpose `upload`).
 2. Validates the `X-AgencyHQ-Meta` header against `validateArtifactAdmission` (pure domain function): lease freshness, generation match, bundle size, path safety, commit presence in mirror, and diff digest equality.
 3. Imports the bundle into the mirror.
 4. Inserts an `attempt_artifacts` row (`ON CONFLICT DO NOTHING` for idempotency).
@@ -205,21 +205,23 @@ Request:
   "runId": "run_...",
   "attemptId": "attempt_...",
   "generation": 0,
-  "purpose": "provider | git-read | integrate | upload",
-  "nonce": "<64 hex chars — raw nonce matching dispatch_nonce_hash>"
+  "purpose": "provider | review | integrate | upload",
+  "nonce": "<64 hex chars — raw nonce matching dispatch_nonce_hash>",
+  "attemptId": "<optional — omit for lead.plan leases>",
+  "workItemId": "<required when attemptId is omitted — identifies the lead.plan lease>"
 }
 ```
 
-The coordinator verifies `sha256(nonce) == dispatch_intents.dispatch_nonce_hash`. On success it issues a lease with a TTL (default 30 min for provider, 5 min for integrate). Leases are idempotent: same nonce hash returns the same lease id.
+The coordinator verifies `sha256(nonce) == dispatch_intents.dispatch_nonce_hash`. On success it issues a lease with a TTL (default 30 min for provider, 5 min for integrate). Leases are idempotent: same nonce hash returns the same lease id. The broker refuses with `run_pending` (409) when the worker.attempt intent exists but `run_id` is not yet written (race window between insert and trigger response). No null-hash bypass: missing `dispatch_nonce_hash` causes `unknown_run` (403).
 
 Grant material by purpose:
 
 | Purpose | Material |
 |---------|---------|
 | `provider` | `authJson` — raw auth.json content (snapshot at lease time) |
-| `git-read` | decrypted project credential |
+| `review` | same as `provider` (grantable for lead.plan leases only) |
 | `integrate` | decrypted project credential (longer TTL) |
-| `upload` | random upload token |
+| `upload` | random upload token (stored as `token_hash` for bearer-token auth) |
 
 No credential values appear in coordinator logs. All grants are logged via `redactLeaseGrant` before writing to the log.
 

@@ -417,3 +417,279 @@ test("lease response and logs never contain fixture secret values", async (t) =>
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// X3-4: run_pending — intent exists but run_id not yet written
+// ---------------------------------------------------------------------------
+
+test("X3-4: run_pending when intent exists with run_id IS NULL", async (t) => {
+  await withTestSchema(t, async (ctx) => {
+    const { schema } = ctx;
+    const nonce = generateNonce();
+
+    // Seed an attempt with a recorded (not triggered) intent — simulates the race
+    // window between INSERT dispatch_intents and the trigger call writing run_id.
+    const { attemptId, runId } = await seedAttemptForLease(ctx, {
+      nonceHash: hashNonce(nonce),
+      intentStatus: "triggered", // use triggered but run_id IS NULL (simulate by inserting with NULL manually)
+    });
+
+    // Insert a 'recorded' intent with run_id NULL for the same attempt (race window).
+    await ctx.client.query(
+      `INSERT INTO dispatch_intents (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+       VALUES ($1, 'worker.attempt', 'digest', $2, 'recorded', NULL, $3, $4)
+       ON CONFLICT (id) DO NOTHING`,
+      [`di_pending_${crypto.randomUUID()}`, attemptId, `ik-pending-${attemptId}`, hashNonce(nonce)],
+    );
+
+    // The triggered intent above has run_id = runId, so a request with a DIFFERENT runId
+    // that is NOT in any triggered intent will exercise the run_pending path.
+    const unknownRunId = `run_${crypto.randomUUID()}`;
+
+    const schemaPool = makeTestPool(schema);
+    try {
+      const deps = {
+        pool: schemaPool,
+        providerState: async () => "ready" as const,
+        dataDirFn: () => tempDir,
+        secretsKey: () => undefined,
+        log: captureLog,
+      };
+
+      const result = await issueLeaseBroker(deps, {
+        runId: unknownRunId, // not yet in any triggered intent
+        attemptId,
+        generation: 0,
+        purpose: "provider",
+        nonce,
+      });
+
+      assert.ok(!result.ok, "run_pending must be a refusal");
+      assert.equal(result.status, 409, "run_pending must return 409");
+      assert.ok("reason" in result.refusal, "refusal must have reason");
+      assert.equal(result.refusal.reason, "run_pending", "refusal reason must be run_pending");
+    } finally {
+      await schemaPool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// X3-6: lead.plan lease — resolve by runId + workItemId, grant only provider/review
+// ---------------------------------------------------------------------------
+
+/** Seed a lead.plan dispatch intent (attempt_id IS NULL). */
+async function seedLeadPlanIntent(
+  ctx: TestDbContext,
+  opts: {
+    runId: string;
+    workItemId: string;
+    nonceHash?: string;
+  },
+): Promise<{ intentId: string; projectId: string }> {
+  const intentId = newId("di");
+  const projectId = newId("prj");
+  const idempotencyKey = `leadplan:${opts.workItemId}:${intentId}`;
+
+  await ctx.client.query(
+    `INSERT INTO projects (id, authority, authority_version) VALUES ($1, '{}', '0')
+     ON CONFLICT (id) DO NOTHING`,
+    [projectId],
+  );
+
+  await ctx.client.query(
+    `INSERT INTO dispatch_intents (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+     VALUES ($1, 'lead.plan', 'digest', NULL, 'triggered', $2, $3, $4)
+     ON CONFLICT (id) DO NOTHING`,
+    [intentId, opts.runId, idempotencyKey, opts.nonceHash ?? null],
+  );
+
+  return { intentId, projectId };
+}
+
+test("X3-6: lead.plan intent granted provider lease", async (t) => {
+  await withTestSchema(t, async (ctx) => {
+    const { schema } = ctx;
+    const nonce = generateNonce();
+    const runId = `run_${crypto.randomUUID()}`;
+    const workItemId = newId("wi");
+
+    await seedLeadPlanIntent(ctx, { runId, workItemId, nonceHash: hashNonce(nonce) });
+
+    const schemaPool = makeTestPool(schema);
+    try {
+      const deps = {
+        pool: schemaPool,
+        providerState: async () => "ready" as const,
+        dataDirFn: () => tempDir,
+        secretsKey: () => undefined,
+        log: captureLog,
+      };
+
+      const result = await issueLeaseBroker(deps, {
+        runId,
+        workItemId,
+        generation: 0,
+        purpose: "provider",
+        nonce,
+      });
+
+      assert.ok(result.ok, `lead.plan provider lease must succeed: ${JSON.stringify(result)}`);
+      assert.equal(result.grant.purpose, "provider");
+      assertNoSecretsInLogs();
+    } finally {
+      await schemaPool.end();
+    }
+  });
+});
+
+test("X3-6: lead.plan intent granted review lease", async (t) => {
+  await withTestSchema(t, async (ctx) => {
+    const { schema } = ctx;
+    const nonce = generateNonce();
+    const runId = `run_${crypto.randomUUID()}`;
+    const workItemId = newId("wi");
+
+    await seedLeadPlanIntent(ctx, { runId, workItemId, nonceHash: hashNonce(nonce) });
+
+    const schemaPool = makeTestPool(schema);
+    try {
+      const deps = {
+        pool: schemaPool,
+        providerState: async () => "ready" as const,
+        dataDirFn: () => tempDir,
+        secretsKey: () => undefined,
+        log: captureLog,
+      };
+
+      const result = await issueLeaseBroker(deps, {
+        runId,
+        workItemId,
+        generation: 0,
+        purpose: "review",
+        nonce,
+      });
+
+      assert.ok(result.ok, `lead.plan review lease must succeed: ${JSON.stringify(result)}`);
+      assert.equal(result.grant.purpose, "review");
+    } finally {
+      await schemaPool.end();
+    }
+  });
+});
+
+test("X3-6: lead.plan intent refused for upload purpose", async (t) => {
+  await withTestSchema(t, async (ctx) => {
+    const { schema } = ctx;
+    const nonce = generateNonce();
+    const runId = `run_${crypto.randomUUID()}`;
+    const workItemId = newId("wi");
+
+    await seedLeadPlanIntent(ctx, { runId, workItemId, nonceHash: hashNonce(nonce) });
+
+    const schemaPool = makeTestPool(schema);
+    try {
+      const deps = {
+        pool: schemaPool,
+        providerState: async () => "ready" as const,
+        dataDirFn: () => tempDir,
+        secretsKey: () => undefined,
+        log: captureLog,
+      };
+
+      const result = await issueLeaseBroker(deps, {
+        runId,
+        workItemId,
+        generation: 0,
+        purpose: "upload",
+        nonce,
+      });
+
+      assert.ok(!result.ok, "upload must be refused for lead.plan");
+      assert.equal(result.status, 409);
+      assert.ok(!result.ok && "reason" in result.refusal, "refusal must have reason");
+      assert.equal(
+        (!result.ok && "reason" in result.refusal && result.refusal.reason) as string,
+        "unavailable",
+      );
+    } finally {
+      await schemaPool.end();
+    }
+  });
+});
+
+test("X3-6: lead.plan intent refused for integrate purpose", async (t) => {
+  await withTestSchema(t, async (ctx) => {
+    const { schema } = ctx;
+    const nonce = generateNonce();
+    const runId = `run_${crypto.randomUUID()}`;
+    const workItemId = newId("wi");
+
+    await seedLeadPlanIntent(ctx, { runId, workItemId, nonceHash: hashNonce(nonce) });
+
+    const schemaPool = makeTestPool(schema);
+    try {
+      const deps = {
+        pool: schemaPool,
+        providerState: async () => "ready" as const,
+        dataDirFn: () => tempDir,
+        secretsKey: () => undefined,
+        log: captureLog,
+      };
+
+      const result = await issueLeaseBroker(deps, {
+        runId,
+        workItemId,
+        generation: 0,
+        purpose: "integrate",
+        nonce,
+      });
+
+      assert.ok(!result.ok, "integrate must be refused for lead.plan");
+      assert.equal(result.status, 409);
+    } finally {
+      await schemaPool.end();
+    }
+  });
+});
+
+test("X3-6: lead.plan refused when workItemId does not match intent", async (t) => {
+  await withTestSchema(t, async (ctx) => {
+    const { schema } = ctx;
+    const nonce = generateNonce();
+    const runId = `run_${crypto.randomUUID()}`;
+    const workItemId = newId("wi");
+    const wrongWorkItemId = newId("wi");
+
+    await seedLeadPlanIntent(ctx, { runId, workItemId, nonceHash: hashNonce(nonce) });
+
+    const schemaPool = makeTestPool(schema);
+    try {
+      const deps = {
+        pool: schemaPool,
+        providerState: async () => "ready" as const,
+        dataDirFn: () => tempDir,
+        secretsKey: () => undefined,
+        log: captureLog,
+      };
+
+      const result = await issueLeaseBroker(deps, {
+        runId,
+        workItemId: wrongWorkItemId, // wrong work item ID
+        generation: 0,
+        purpose: "provider",
+        nonce,
+      });
+
+      assert.ok(!result.ok, "wrong workItemId must be refused");
+      assert.equal(result.status, 403);
+      assert.ok(!result.ok && "reason" in result.refusal, "refusal must have reason");
+      assert.equal(
+        (!result.ok && "reason" in result.refusal && result.refusal.reason) as string,
+        "unknown_run",
+      );
+    } finally {
+      await schemaPool.end();
+    }
+  });
+});

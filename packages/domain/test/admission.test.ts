@@ -233,6 +233,7 @@ test("validateArtifactAdmission: STALE_GENERATION when claimed.generation < curr
   const r = validateArtifactAdmission(
     baseInput({
       claimed: { ...validUploadMeta, generation: 0 },
+      lease: { ...validLease, generation: 0 }, // lease matches claimed, attempt is ahead
       attempt: { ...validAttempt, currentGeneration: 1 },
     }),
   );
@@ -244,6 +245,7 @@ test("validateArtifactAdmission: FUTURE_GENERATION when claimed.generation > cur
   const r = validateArtifactAdmission(
     baseInput({
       claimed: { ...validUploadMeta, generation: 5 },
+      lease: { ...validLease, generation: 5 }, // lease matches claimed, attempt is behind
       attempt: { ...validAttempt, currentGeneration: 1 },
     }),
   );
@@ -538,4 +540,119 @@ test("validateLeaseRequest: unknown_attempt returned before stale_generation", (
     }),
   );
   assert.equal(!r.ok && r.error, "unknown_attempt");
+});
+
+// ---------------------------------------------------------------------------
+// X3-1: Kind-aware generation checks
+// ---------------------------------------------------------------------------
+
+// attempt kind: lease.generation must equal claimed.generation
+test("validateArtifactAdmission: LEASE_GENERATION_MISMATCH when claimed.generation !== lease.generation for attempt kind", () => {
+  const r = validateArtifactAdmission(
+    baseInput({
+      claimed: { ...validUploadMeta, kind: "attempt", generation: 1 },
+      lease: { ...validLease, generation: 0 }, // lease gen 0, claimed gen 1
+      attempt: { ...validAttempt, currentGeneration: 1 },
+    }),
+  );
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && r.error, "LEASE_GENERATION_MISMATCH");
+});
+
+// attempt kind: valid when all three match
+test("validateArtifactAdmission: accepts attempt when lease.generation === claimed.generation === currentGeneration", () => {
+  const r = validateArtifactAdmission(
+    baseInput({
+      claimed: { ...validUploadMeta, kind: "attempt", generation: 1 },
+      lease: { ...validLease, generation: 1 },
+      attempt: { ...validAttempt, currentGeneration: 1 },
+    }),
+  );
+  assert.equal(r.ok, true);
+});
+
+// attempt kind: fenced — lease gen N, attempt bumped to N+1, container claims N+1 => LEASE_GENERATION_MISMATCH
+test("validateArtifactAdmission: fenced generation: attempt kind with old lease token refused (LEASE_GENERATION_MISMATCH)", () => {
+  // Lease was issued for generation 0; attempt has been stopped and bumped to generation 1.
+  // Container (holding gen-0 token) claims generation 1: must be refused.
+  const r = validateArtifactAdmission(
+    baseInput({
+      claimed: { ...validUploadMeta, kind: "attempt", generation: 1 },
+      lease: { ...validLease, generation: 0 }, // old gen-0 lease
+      attempt: { ...validAttempt, currentGeneration: 1 },
+    }),
+  );
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && r.error, "LEASE_GENERATION_MISMATCH");
+});
+
+// checkpoint kind: superseded checkpoint accepted (claimed.generation < currentGeneration)
+test("validateArtifactAdmission: superseded checkpoint accepted (claimed gen < currentGen, matches lease gen)", () => {
+  // Lease was issued for generation 0; attempt advanced to gen 1; container uploads gen-0 checkpoint.
+  const r = validateArtifactAdmission(
+    baseInput({
+      claimed: { ...validUploadMeta, kind: "checkpoint", generation: 0, changedPaths: [] },
+      lease: { ...validLease, generation: 0 },
+      attempt: { ...validAttempt, currentGeneration: 1 },
+    }),
+  );
+  assert.equal(r.ok, true);
+});
+
+// checkpoint kind: future generation rejected
+test("validateArtifactAdmission: FUTURE_GENERATION when checkpoint.generation > currentGeneration", () => {
+  const r = validateArtifactAdmission(
+    baseInput({
+      claimed: { ...validUploadMeta, kind: "checkpoint", generation: 2, changedPaths: [] },
+      lease: { ...validLease, generation: 2 },
+      attempt: { ...validAttempt, currentGeneration: 1 },
+    }),
+  );
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && r.error, "FUTURE_GENERATION");
+});
+
+// stopping status: attempt kind rejected
+test("validateArtifactAdmission: ATTEMPT_TERMINAL when status is stopping and kind is attempt", () => {
+  const r = validateArtifactAdmission(
+    baseInput({
+      attempt: { ...validAttempt, status: "stopping" },
+    }),
+  );
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && r.error, "ATTEMPT_TERMINAL");
+});
+
+// uncertain status: attempt kind rejected
+test("validateArtifactAdmission: ATTEMPT_TERMINAL when status is uncertain and kind is attempt", () => {
+  const r = validateArtifactAdmission(
+    baseInput({
+      attempt: { ...validAttempt, status: "uncertain" },
+    }),
+  );
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && r.error, "ATTEMPT_TERMINAL");
+});
+
+// stopped status: attempt kind rejected
+test("validateArtifactAdmission: ATTEMPT_TERMINAL when status is stopped and kind is attempt", () => {
+  const r = validateArtifactAdmission(
+    baseInput({
+      attempt: { ...validAttempt, status: "stopped" },
+    }),
+  );
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && r.error, "ATTEMPT_TERMINAL");
+});
+
+// stopping status: checkpoint kind accepted
+test("validateArtifactAdmission: checkpoint accepted when status is stopping", () => {
+  const r = validateArtifactAdmission(
+    baseInput({
+      claimed: { ...validUploadMeta, kind: "checkpoint", generation: 1, changedPaths: [] },
+      lease: { ...validLease, generation: 1 },
+      attempt: { ...validAttempt, status: "stopping", currentGeneration: 1 },
+    }),
+  );
+  assert.equal(r.ok, true);
 });

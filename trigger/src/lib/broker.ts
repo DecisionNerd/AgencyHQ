@@ -19,6 +19,7 @@ import type {
   LeaseGrant,
   LeasePurpose,
   LeaseRefusal,
+  LeaseRequest,
   StopEvidenceUpload,
 } from "@agencyhq/contracts";
 
@@ -36,14 +37,7 @@ import type {
  * Do NOT edit packages/contracts — this is a trigger-local extension that is
  * structurally compatible with the contracts LeaseRequest.
  */
-export type LeaseRequestExtended = {
-  runId: string;
-  attemptId?: string;
-  workItemId?: string;
-  generation: number;
-  purpose: LeasePurpose;
-  nonce: string;
-};
+export type LeaseRequestExtended = LeaseRequest;
 
 /** Result of requestLease: either a grant or a refusal with the HTTP status. */
 export type LeaseResult =

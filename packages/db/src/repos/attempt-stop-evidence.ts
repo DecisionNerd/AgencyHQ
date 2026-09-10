@@ -28,6 +28,10 @@ export interface StopEvidenceStep {
     | "checkpoint_failed"
     | "stop_done";
   detail?: string;
+  /** Survivor PIDs from the post-kill scan (step: "stop_done"). X3-2 / E4. */
+  survivors?: number[];
+  /** Git SHA of the checkpoint commit (step: "checkpoint" / "checkpoint_committed"). X3-2 / E4. */
+  checkpointCommit?: string;
 }
 
 export interface AttemptStopEvidenceInsert {

@@ -178,7 +178,10 @@ test("push-boundary behavioural: pushForceWithLease in lib/git.ts uses force-wit
   );
 
   // The push command must require a remote (not a hard-coded remote).
-  assert.ok(src.includes("args.remote"), "pushForceWithLease must use args.remote (not hard-coded)");
+  assert.ok(
+    src.includes("args.remote"),
+    "pushForceWithLease must use args.remote (not hard-coded)",
+  );
 
   // Structural: the only exported push-capable function is pushForceWithLease.
   const exportedPushFunctions = src

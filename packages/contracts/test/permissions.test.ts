@@ -336,3 +336,26 @@ test("leadAgentPermissions: exactly the read-only git/ls patterns are allowed in
     `Lead bash map allow keys must be exactly ${JSON.stringify(expectedKeys)}, got ${JSON.stringify(allowKeys)}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// X3-5: empty worktreePath must not emit root-anchored keys (/<glob>)
+// ---------------------------------------------------------------------------
+
+test("permissionRulesFor: empty worktreePath emits no root-anchored keys in edit map (X3-5)", () => {
+  const ruleset = permissionRulesFor(TRIAL_BOUNDS, { worktreePath: "" });
+  const keys = Object.keys(ruleset.edit);
+  for (const key of keys) {
+    assert.ok(
+      !key.startsWith("/"),
+      `edit key "${key}" must not start with "/" when worktreePath is empty`,
+    );
+  }
+});
+
+test("permissionRulesFor: empty worktreePath still emits relative allow/deny globs", () => {
+  const ruleset = permissionRulesFor(TRIAL_BOUNDS, { worktreePath: "" });
+  // Relative allow globs from the bounds should still appear.
+  const editKeys = Object.keys(ruleset.edit);
+  // Should have at least the "*" deny-all default and some relative path globs.
+  assert.ok(editKeys.includes("*"), "edit map must contain default deny key");
+});

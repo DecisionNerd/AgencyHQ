@@ -1752,23 +1752,50 @@ export class BoundedRepairFlow {
             );
             if (notAdmittedBudget > 0) {
               const notAdmittedNewAttemptId = ids.next("att") as AttemptId;
-              const notAdmittedWorktreePath = `${config.worktreeBase}/${String(notAdmittedNewAttemptId)}`;
-              const notAdmittedNewPayload = WorkerAttemptPayloadSchema.parse({
-                attemptId: String(notAdmittedNewAttemptId),
-                generation: 1,
-                contractId: contractRow.id,
-                contractVersion: String(contractRow.version),
-                repoPath: projectRow.clone_path ?? config.worktreeBase,
-                baseRev: contractRow.base_revision,
-                prompt: contractRow.inputs?.intent ?? "",
-                allowedPaths: contractRow.bounds.paths.allow,
-                bounds: contractRow.bounds,
-                permissionRules: permissionRulesFor(contractRow.bounds, {
-                  worktreePath: notAdmittedWorktreePath,
-                }),
-                model: config.workerModel,
-                worktreeBase: config.worktreeBase,
-              });
+              // X3-7: build v2 payload for mirror-mode retries (no host path).
+              let notAdmittedNewPayload: unknown;
+              let notAdmittedDispatchNonce: string | undefined;
+              if (isMirrorWorker) {
+                notAdmittedDispatchNonce = generateDispatchNonce();
+                const notAdmittedBundlePath = `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`;
+                notAdmittedNewPayload = WorkerAttemptPayloadV2Schema.parse({
+                  payloadVersion: 2,
+                  attemptId: String(notAdmittedNewAttemptId),
+                  generation: 1,
+                  contractId: contractRow.id,
+                  contractVersion: String(contractRow.version),
+                  source: {
+                    projectId: projectRow.id,
+                    revision: contractRow.base_revision,
+                    bundlePath: notAdmittedBundlePath,
+                  },
+                  baseRev: contractRow.base_revision,
+                  prompt: contractRow.inputs?.intent ?? "",
+                  allowedPaths: contractRow.bounds.paths.allow,
+                  bounds: contractRow.bounds,
+                  permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath: "" }),
+                  model: config.workerModel,
+                  leaseNonce: notAdmittedDispatchNonce,
+                });
+              } else {
+                const notAdmittedWorktreePath = `${config.worktreeBase}/${String(notAdmittedNewAttemptId)}`;
+                notAdmittedNewPayload = WorkerAttemptPayloadSchema.parse({
+                  attemptId: String(notAdmittedNewAttemptId),
+                  generation: 1,
+                  contractId: contractRow.id,
+                  contractVersion: String(contractRow.version),
+                  repoPath: projectRow.clone_path ?? config.worktreeBase,
+                  baseRev: contractRow.base_revision,
+                  prompt: contractRow.inputs?.intent ?? "",
+                  allowedPaths: contractRow.bounds.paths.allow,
+                  bounds: contractRow.bounds,
+                  permissionRules: permissionRulesFor(contractRow.bounds, {
+                    worktreePath: notAdmittedWorktreePath,
+                  }),
+                  model: config.workerModel,
+                  worktreeBase: config.worktreeBase,
+                });
+              }
               const notAdmittedIntentId = ids.next("di") as DispatchIntentId;
               const notAdmittedIntentKey = `${String(notAdmittedIntentId)}:g1`;
               await client.query(
@@ -1784,14 +1811,15 @@ export class BoundedRepairFlow {
               );
               await client.query(
                 `INSERT INTO dispatch_intents
-                   (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-                 VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+                   (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+                 VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
                 [
                   String(notAdmittedIntentId),
                   TASK_IDS.workerAttempt,
                   String(digestOf(notAdmittedNewPayload)),
                   String(notAdmittedNewAttemptId),
                   notAdmittedIntentKey,
+                  notAdmittedDispatchNonce ? hashNonce(notAdmittedDispatchNonce) : null,
                 ],
               );
               await client.query("COMMIT");
@@ -2078,22 +2106,51 @@ export class BoundedRepairFlow {
       } else if (classification.autoNewAttempt) {
         const newAttemptId = ids.next("att") as AttemptId;
         const newBudget = attemptRow.budget_remaining - 1;
-        const worktreePath = `${config.worktreeBase}/${String(newAttemptId)}`;
+        // X3-7: mirror check for autoNewAttempt (same as artifact_not_admitted path).
+        const isMirrorWorker = projectRow.source_mode === "mirror";
 
-        const newWorkerPayload = WorkerAttemptPayloadSchema.parse({
-          attemptId: String(newAttemptId),
-          generation: 1,
-          contractId: contractRow.id,
-          contractVersion: String(contractRow.version),
-          repoPath: projectRow.clone_path ?? config.worktreeBase,
-          baseRev: contractRow.base_revision,
-          prompt: contractRow.inputs?.intent ?? "",
-          allowedPaths: contractRow.bounds.paths.allow,
-          bounds: contractRow.bounds,
-          permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath }),
-          model: config.workerModel,
-          worktreeBase: config.worktreeBase,
-        });
+        // X3-7: build v2 payload for mirror-mode retries (no host path/worktreePath).
+        let newWorkerPayload: unknown;
+        let newDispatchNonce: string | undefined;
+        if (isMirrorWorker) {
+          newDispatchNonce = generateDispatchNonce();
+          const newBundlePath = `/internal/source/${projectRow.id}?rev=${contractRow.base_revision}`;
+          newWorkerPayload = WorkerAttemptPayloadV2Schema.parse({
+            payloadVersion: 2,
+            attemptId: String(newAttemptId),
+            generation: 1,
+            contractId: contractRow.id,
+            contractVersion: String(contractRow.version),
+            source: {
+              projectId: projectRow.id,
+              revision: contractRow.base_revision,
+              bundlePath: newBundlePath,
+            },
+            baseRev: contractRow.base_revision,
+            prompt: contractRow.inputs?.intent ?? "",
+            allowedPaths: contractRow.bounds.paths.allow,
+            bounds: contractRow.bounds,
+            permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath: "" }),
+            model: config.workerModel,
+            leaseNonce: newDispatchNonce,
+          });
+        } else {
+          const worktreePath = `${config.worktreeBase}/${String(newAttemptId)}`;
+          newWorkerPayload = WorkerAttemptPayloadSchema.parse({
+            attemptId: String(newAttemptId),
+            generation: 1,
+            contractId: contractRow.id,
+            contractVersion: String(contractRow.version),
+            repoPath: projectRow.clone_path ?? config.worktreeBase,
+            baseRev: contractRow.base_revision,
+            prompt: contractRow.inputs?.intent ?? "",
+            allowedPaths: contractRow.bounds.paths.allow,
+            bounds: contractRow.bounds,
+            permissionRules: permissionRulesFor(contractRow.bounds, { worktreePath }),
+            model: config.workerModel,
+            worktreeBase: config.worktreeBase,
+          });
+        }
 
         const newIntentId = ids.next("di") as DispatchIntentId;
         // New attempt starts at generation 1; encode it in the idempotency key (F-2).
@@ -2123,14 +2180,15 @@ export class BoundedRepairFlow {
         );
         await client.query(
           `INSERT INTO dispatch_intents
-             (id, task, payload_digest, attempt_id, status, run_id, idempotency_key)
-           VALUES ($1, $2, $3, $4, 'recorded', NULL, $5)`,
+             (id, task, payload_digest, attempt_id, status, run_id, idempotency_key, dispatch_nonce_hash)
+           VALUES ($1, $2, $3, $4, 'recorded', NULL, $5, $6)`,
           [
             String(newIntentId),
             TASK_IDS.workerAttempt,
             String(digestOf(newWorkerPayload)),
             String(newAttemptId),
             newIntentKey,
+            newDispatchNonce ? hashNonce(newDispatchNonce) : null,
           ],
         );
         // Close the incoming worker intent inside the transaction (F-5).

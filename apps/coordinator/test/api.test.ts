@@ -1048,3 +1048,131 @@ describe("GET /api/return-view — merge item carries integrations and workItemP
     assert.ok(Array.isArray(body.continuing), "continuing array present");
   });
 });
+
+// ---------------------------------------------------------------------------
+// W-15: POST /api/commands kind=import_host_project and revert_import
+// ---------------------------------------------------------------------------
+
+describe("POST /api/commands kind=import_host_project — routing and validation (W-15)", () => {
+  function makeImportCommands(): CommandsLike {
+    return {
+      stop: async () => ({ ok: true }),
+      approve: async () => ({ ok: true, decisionId: "dec-fake" }),
+      reject: async () => ({ ok: true, decisionId: "dec-fake" }),
+      invalidateAcceptance: async () => ({ ok: true, invalidationDecisionId: "inv-fake" }),
+      lastAckAt: async () => null,
+      createCampaign: async () => ({ ok: true, campaignId: "cmp-fake" }),
+      assignCampaign: async () => ({ ok: true }),
+      setMainEffort: async () => ({ ok: true }),
+      setWorkItemRank: async () => ({ ok: true }),
+      updateAuthority: async () => ({ ok: true, version: "2" }),
+      importHostProject: async () => ({ ok: true }),
+      revertImport: async () => ({ ok: true }),
+      pause: async () => ({ ok: true }),
+      resume: async () => ({ ok: true }),
+      createWorkItem: async () => ({ ok: true, workItemId: "wi-fake" }),
+      disposition: async () => ({ ok: true }),
+      ackVisit: async () => ({ ok: true }),
+    };
+  }
+
+  it("routes import_host_project and returns 200 with result", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeImportCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-import-1",
+        kind: "import_host_project",
+        projectId: "prj-test-123",
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { commandId: string; result: { ok: boolean } };
+    assert.equal(body.commandId, "cmd-import-1");
+    assert.equal(body.result.ok, true);
+  });
+
+  it("returns 400 without projectId for import_host_project", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeImportCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-import-noproj",
+        kind: "import_host_project",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /projectId/);
+  });
+
+  it("routes revert_import and returns 200 with result", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeImportCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-revert-1",
+        kind: "revert_import",
+        projectId: "prj-test-456",
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { commandId: string; result: { ok: boolean } };
+    assert.equal(body.commandId, "cmd-revert-1");
+    assert.equal(body.result.ok, true);
+  });
+
+  it("returns 400 without projectId for revert_import", async () => {
+    const app = createApp({
+      pool: makeCommandPool(),
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(),
+      clock: () => NOW,
+      loadSnapshot: async () => EMPTY_SNAPSHOT,
+      commands: makeImportCommands(),
+    });
+    const res = await app.request("/api/commands", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandId: "cmd-revert-noproj",
+        kind: "revert_import",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /projectId/);
+  });
+});

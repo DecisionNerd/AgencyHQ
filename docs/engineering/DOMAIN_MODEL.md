@@ -47,8 +47,8 @@ Nullable `text` column (migration `0009_dispatch_nonce.sql`). Stores the
 SHA-256 hex hash of the 32-byte random dispatch nonce generated at dispatch time
 for mirror-mode projects. The raw nonce is passed to the task container and never
 persisted. The broker verifies `sha256(presented_nonce) == dispatch_nonce_hash`
-(timing-safe) before issuing any lease. Null for host-clone dispatches
-(backward-compatible; the broker allows null).
+(timing-safe) before issuing any lease. Null for host-clone dispatches;
+the broker rejects any request where the hash is null (no null bypass).
 
 ### `dispatch_intents.seq`
 
@@ -70,10 +70,11 @@ Time-bounded credential grants issued to worker containers (migration
 | `generation` | int | The authority generation for which the lease was issued. |
 | `run_id` | text | Trigger run id of the requesting container. |
 | `purpose` | enum | `provider`, `git-read`, `integrate`, `upload`. |
-| `nonce_hash` | text | SHA-256 hex of the worker's request nonce (not the raw nonce). |
+| `nonce_hash` | text | SHA-256 hex of the worker's lease request nonce. |
+| `token_hash` | text | SHA-256 hex of the upload bearer token (upload leases only). |
 | `issued_at` | timestamptz | Insertion timestamp. |
 | `expires_at` | timestamptz | Hard expiry; not renewable. |
-| `used_at` | timestamptz | Set when the worker materializes the credential. |
+| `used_at` | timestamptz | Reserved; `markLeaseUsed` has no callers (not set in current code). |
 | `revoked_at` | timestamptz | Set by the coordinator on generation advance or stop. |
 
 **Invariants:** Each `(attempt_id, generation, purpose, nonce_hash)` is unique
@@ -91,7 +92,7 @@ starts. The raw nonce is never stored; only its SHA-256 hash.
   repository.
 - `integrate` — same shape as `git-read`, TTL is `AGENCYHQ_INTEGRATE_LEASE_TTL_MS`
   (default 5 min) rather than the standard TTL.
-- `upload` — `token`: random 32-byte hex; SHA-256 stored in `nonce_hash` for
+- `upload` — `token`: random 32-byte hex; SHA-256 stored in `token_hash` for
   bearer-token lookup on artifact/stop-evidence routes.
 
 **Revocation policy.** Leases are not hard-deleted; `revoked_at` is set instead.
@@ -140,13 +141,16 @@ shutdown (migration `0008_container_runtime.sql`). Fields:
 | `id` | text PK | Random UUID. |
 | `attempt_id` | text FK → `attempts` | |
 | `generation` | int | Authority generation at upload time. |
-| `steps` | jsonb | Ordered `{ at (ISO), step (enum), detail? }` array. |
+| `steps` | jsonb | Ordered `{ at (ISO), step (enum), detail?, survivors? (number[]), checkpointCommit? }` array. |
 | `received_at` | timestamptz | Last upsert timestamp. |
 
 **Invariants.** Unique on `(attempt_id, generation)`. Upserted idempotently;
 later uploads overwrite the `steps` and refresh `received_at`. Steps are one of:
 `signal_sent`, `process_exited`, `survivor_scan`, `checkpoint_committed`,
-`upload_done`, `aborted`.
+`upload_done`, `aborted`, `abort_signal`, `soft_deadline`, `on_cancel_entered`,
+`stop_start`, `killed`, `checkpoint`, `checkpoint_failed`, `stop_done`.
+`stop_done` may carry `survivors` (surviving PIDs). `checkpoint` and
+`checkpoint_committed` may carry `checkpointCommit` (git SHA).
 
 **Repository:** `packages/db/src/repos/attempt-stop-evidence.ts` —
 `upsertAttemptStopEvidence`, `listStopEvidenceForAttempt`.

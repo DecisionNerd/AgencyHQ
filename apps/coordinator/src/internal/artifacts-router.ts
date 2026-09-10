@@ -484,7 +484,12 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
         const code = preAdmission.error;
         // COMMIT_NOT_IN_MIRROR and DIGEST_MISMATCH are expected pre-import and handled below.
         if (code !== "COMMIT_NOT_IN_MIRROR" && code !== "DIGEST_MISMATCH") {
-          if (code === "STALE_GENERATION") return c.json({ error: code }, 409);
+          if (
+            code === "STALE_GENERATION" ||
+            code === "FUTURE_GENERATION" ||
+            code === "LEASE_GENERATION_MISMATCH"
+          )
+            return c.json({ error: code }, 409);
           if (
             code === "LEASE_MISSING" ||
             code === "LEASE_REVOKED" ||
@@ -654,10 +659,12 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
 
       // Map steps for domain admission (handle exactOptionalPropertyTypes)
       const domainSteps = uploaded.steps.map((s) => {
-        if (s.detail !== undefined) {
-          return { at: s.at, step: s.step, detail: s.detail };
-        }
-        return { at: s.at, step: s.step };
+        const base: { at: string; step: (typeof s)["step"]; detail?: string } = {
+          at: s.at,
+          step: s.step,
+        };
+        if (s.detail !== undefined) base.detail = s.detail;
+        return base;
       });
 
       // Validate via domain admission
@@ -700,12 +707,12 @@ export function mountArtifactRoutes(app: Hono, deps: ArtifactRouteDeps): void {
         return c.json({ error: code }, 400);
       }
 
-      // Map steps to the repo type (handle exactOptionalPropertyTypes)
+      // Map steps to the repo type — preserve all optional fields (X3-2 / E4).
       const steps = uploaded.steps.map((s) => {
-        const base = { at: s.at, step: s.step };
-        if (s.detail !== undefined) {
-          return { ...base, detail: s.detail };
-        }
+        const base: import("@agencyhq/db").StopEvidenceStep = { at: s.at, step: s.step };
+        if (s.detail !== undefined) base.detail = s.detail;
+        if (s.survivors !== undefined) base.survivors = s.survivors;
+        if (s.checkpointCommit !== undefined) base.checkpointCommit = s.checkpointCommit;
         return base;
       });
 

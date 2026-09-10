@@ -36,6 +36,7 @@ import {
   createPool,
   encryptSecret,
   issueLease,
+  listStopEvidenceForAttempt,
   putProjectCredential,
   revokeLeasesBelowGeneration,
   runMigrations,
@@ -63,7 +64,7 @@ import { BoundedRepairFlow } from "../../src/flow/bounded-repair.ts";
 import type { FlowDeps } from "../../src/flow/types.ts";
 import { ensureMirror, mirrorPath } from "../../src/git/mirror.ts";
 import { issueLeaseBroker } from "../../src/internal/leases.ts";
-import { goodPlanOutput } from "../helpers/fake-lead.ts";
+import { goodPlanOutput, workerCompletedOutput } from "../helpers/fake-lead.ts";
 
 const execFileAsync = promisify(execFile);
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -1051,6 +1052,14 @@ test("P9: dispatch_nonce_hash set in DB for mirror dispatch; payload leaseNonce 
           !permRulesStr.includes("/tmp/worker"),
           "mirror worker permissionRules must not embed /tmp/worker paths",
         );
+        // X3-5: no edit key must start with "/" (root-anchored) when worktreePath is empty.
+        const editRules = (permRules as { edit?: Record<string, string> }).edit ?? {};
+        for (const key of Object.keys(editRules)) {
+          assert.ok(
+            !key.startsWith("/"),
+            `mirror worker edit permission key "${key}" must not be root-anchored (X3-5)`,
+          );
+        }
       }
     } finally {
       await pool.end();
@@ -1338,5 +1347,468 @@ test("P10: integrate lease issued; push via real git advances remote; base-moved
     if (repoPath) {
       await rm(repoPath, { recursive: true, force: true }).catch(() => undefined);
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P12 (X3-1): fenced generation — old upload token refuses final artifact,
+//              accepts checkpoint and stop evidence for the old generation
+// ---------------------------------------------------------------------------
+
+test("P12: stop → generation+1 → old upload token: final artifact refused 409, checkpoint accepted", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL not set");
+    return;
+  }
+
+  const gitRoot = await mkdtemp(join(tmpdir(), "ahq-pe-p12-gr-"));
+  const base = await makeBaseRepo();
+
+  const schema = `ahq_pe_p12_${process.pid}_${Date.now()}`;
+  const directPool = new pg.Pool({ connectionString: DATABASE_URL });
+  const directClient = await directPool.connect();
+
+  try {
+    await directClient.query(`CREATE SCHEMA ${pg.escapeIdentifier(schema)}`);
+    await runMigrations(directClient, { schema });
+    await directClient.query(`SET search_path TO ${pg.escapeIdentifier(schema)}, public`);
+
+    const projectId = await seedMirrorProject(directClient, `file://${base.repoPath}`);
+    const wiId = await seedWorkItem(directClient, projectId);
+    const contractId = await seedContract(directClient, projectId, wiId, base.baseRev);
+    // Start at generation=0
+    const attemptId = await seedAttempt(directClient, contractId, 0);
+    const { uploadToken } = await issueUploadLease(directClient, attemptId, 0);
+
+    await ensureMirror({ id: projectId, remote: `file://${base.repoPath}` }, { gitRoot });
+
+    // Simulate stop: bump to generation 1 (operator stop).
+    // Revoke provider/integrate leases for gen 0 (upload lease kept).
+    await revokeLeasesBelowGeneration(
+      directClient as unknown as import("pg").PoolClient,
+      attemptId,
+      1,
+      ["provider", "integrate"],
+    );
+    // Update attempt to stopping status and generation 1.
+    await directClient.query(
+      "UPDATE attempts SET generation = 1, status = 'stopping' WHERE id = $1",
+      [attemptId],
+    );
+
+    const schemaPool = makeSchemaPool(DATABASE_URL, schema);
+    const app = createApp({
+      pool: schemaPool as never,
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(gitRoot),
+    });
+
+    // Make a worker commit for the old generation.
+    const clonePath = await mkdtemp(join(tmpdir(), "ahq-pe-p12-clone-"));
+    try {
+      await git(["clone", `file://${base.repoPath}`, clonePath], tmpdir());
+      await git(["config", "user.email", "test@example.com"], clonePath);
+      await git(["config", "user.name", "Test"], clonePath);
+      const { commitId, bundleBytes, diffDigest, bundleSha256 } = await makeWorkerCommit(
+        clonePath,
+        "p12-worker.ts",
+        base.baseRev,
+      );
+
+      // Attempt to upload a final "attempt" artifact with the OLD gen-0 token claiming gen 1.
+      // The lease is for gen 0, but claimed.generation = 1 → LEASE_GENERATION_MISMATCH → 409.
+      const attemptMeta: ArtifactUploadMeta = {
+        attemptId,
+        generation: 1, // claims new generation
+        kind: "attempt",
+        commitId,
+        diffDigest,
+        changedPaths: ["p12-worker.ts"],
+        bundleSha256,
+        bundleBytes: bundleBytes.length,
+      };
+      const badRes = await app.request(`/internal/attempts/${attemptId}/artifacts`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${uploadToken}`, // gen-0 token
+          "X-AgencyHQ-Meta": JSON.stringify(attemptMeta),
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(bundleBytes),
+      });
+      assert.equal(
+        badRes.status,
+        409,
+        `final artifact with wrong claimed gen must be refused 409 (LEASE_GENERATION_MISMATCH), got ${badRes.status}`,
+      );
+
+      // Now upload a checkpoint for gen 0 (old lease, old generation) — must be accepted.
+      const checkpointMeta: ArtifactUploadMeta = {
+        attemptId,
+        generation: 0, // old generation matches lease
+        kind: "checkpoint",
+        commitId,
+        diffDigest,
+        changedPaths: [], // checkpoint may have empty changedPaths
+        bundleSha256,
+        bundleBytes: bundleBytes.length,
+      };
+      const cpRes = await app.request(`/internal/attempts/${attemptId}/checkpoints`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${uploadToken}`, // gen-0 token
+          "X-AgencyHQ-Meta": JSON.stringify(checkpointMeta),
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(bundleBytes),
+      });
+      assert.equal(
+        cpRes.status,
+        201,
+        `checkpoint upload must be accepted 201, got ${cpRes.status}`,
+      );
+
+      // Verify no verified attempt artifact row for generation 1 (not admitted).
+      const { rows: badArtRows } = await directClient.query(
+        `SELECT id FROM attempt_artifacts WHERE attempt_id = $1 AND generation = 1 AND kind = 'attempt'`,
+        [attemptId],
+      );
+      assert.equal(badArtRows.length, 0, "no verified artifact row for gen 1 must exist");
+
+      // Verify checkpoint artifact row for generation 0 exists.
+      const { rows: cpArtRows } = await directClient.query(
+        `SELECT id FROM attempt_artifacts WHERE attempt_id = $1 AND generation = 0 AND kind = 'checkpoint'`,
+        [attemptId],
+      );
+      assert.equal(cpArtRows.length, 1, "checkpoint artifact row for gen 0 must exist");
+    } finally {
+      await rm(clonePath, { recursive: true, force: true });
+    }
+
+    await schemaPool.end();
+  } finally {
+    directClient.release();
+    await directPool.end();
+    await rm(gitRoot, { recursive: true, force: true });
+    await rm(base.repoPath, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P13 (X3-2): stop evidence with survivors stored in DB
+// ---------------------------------------------------------------------------
+
+test("P13: stop evidence with survivors and checkpointCommit stored in DB", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL not set");
+    return;
+  }
+
+  const gitRoot = await mkdtemp(join(tmpdir(), "ahq-pe-p13-gr-"));
+  const base = await makeBaseRepo();
+
+  const schema = `ahq_pe_p13_${process.pid}_${Date.now()}`;
+  const directPool = new pg.Pool({ connectionString: DATABASE_URL });
+  const directClient = await directPool.connect();
+
+  try {
+    await directClient.query(`CREATE SCHEMA ${pg.escapeIdentifier(schema)}`);
+    await runMigrations(directClient, { schema });
+    await directClient.query(`SET search_path TO ${pg.escapeIdentifier(schema)}, public`);
+
+    const projectId = await seedMirrorProject(directClient, `file://${base.repoPath}`);
+    const wiId = await seedWorkItem(directClient, projectId);
+    const contractId = await seedContract(directClient, projectId, wiId, base.baseRev);
+    const attemptId = await seedAttempt(directClient, contractId);
+    const { uploadToken } = await issueUploadLease(directClient, attemptId, 0);
+
+    await ensureMirror({ id: projectId, remote: `file://${base.repoPath}` }, { gitRoot });
+
+    const schemaPool = makeSchemaPool(DATABASE_URL, schema);
+    const app = createApp({
+      pool: schemaPool as never,
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(gitRoot),
+    });
+
+    const fakeCommit = "a".repeat(40);
+    const evidenceBody = {
+      attemptId,
+      generation: 0,
+      steps: [
+        {
+          at: new Date().toISOString(),
+          step: "checkpoint_committed",
+          checkpointCommit: fakeCommit,
+        },
+        { at: new Date().toISOString(), step: "stop_done", survivors: [123, 456] },
+      ],
+    };
+
+    const evidenceRes = await app.request(`/internal/attempts/${attemptId}/stop-evidence`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${uploadToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(evidenceBody),
+    });
+    assert.equal(
+      evidenceRes.status,
+      201,
+      `stop evidence must be accepted, got ${evidenceRes.status}`,
+    );
+
+    // Read from DB and verify survivors and checkpointCommit are stored.
+    const rows = await listStopEvidenceForAttempt(
+      directClient as unknown as import("pg").PoolClient,
+      attemptId,
+    );
+    assert.equal(rows.length, 1, "one stop evidence row must exist");
+    const steps = rows[0]?.steps as Array<{
+      step: string;
+      survivors?: number[];
+      checkpointCommit?: string;
+    }>;
+    const stopDone = steps.find((s) => s.step === "stop_done");
+    const cpCommitted = steps.find((s) => s.step === "checkpoint_committed");
+    assert.ok(stopDone, "stop_done step must exist");
+    assert.deepEqual(stopDone?.survivors, [123, 456], "survivors must be stored");
+    assert.ok(cpCommitted, "checkpoint_committed step must exist");
+    assert.equal(cpCommitted?.checkpointCommit, fakeCommit, "checkpointCommit must be stored");
+
+    await schemaPool.end();
+  } finally {
+    directClient.release();
+    await directPool.end();
+    await rm(gitRoot, { recursive: true, force: true });
+    await rm(base.repoPath, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P14 (X3-7): mirror-mode retry dispatch carries payloadVersion: 2, new nonce
+// ---------------------------------------------------------------------------
+
+// P14 needs a second attempt in the budget so the artifact_not_admitted retry can dispatch.
+const P14_AUTHORITY = {
+  ...HOST_TRIAL_AUTHORITY,
+  budget: { ...HOST_TRIAL_AUTHORITY.budget, maxAttempts: 2 },
+};
+
+test("P14: mirror-mode artifact_not_admitted retry dispatch carries payloadVersion: 2 and nonce", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL not set");
+    return;
+  }
+
+  await withTestSchema(t, async ({ client, schema }) => {
+    await client.query(`SET search_path TO "${schema}", public`);
+
+    const poolUrl = new URL(DATABASE_URL!);
+    poolUrl.searchParams.set("options", `-c search_path=${schema},public`);
+    const pool = createPool(poolUrl.toString());
+
+    try {
+      // Mirror project — source_mode = 'mirror', no clone_path needed for this flow path.
+      const projectId = newId("prj");
+      const baseRev = "a".repeat(40);
+      await client.query(
+        `INSERT INTO projects
+           (id, remote, clone_path, worktree_base, allowed_refs, authority, authority_version,
+            profile_catalog, source_mode)
+         VALUES ($1, NULL, '/repo', '/wt', $2::jsonb, $3::jsonb, '1', '["default"]'::jsonb, 'mirror')`,
+        [projectId, JSON.stringify({ main: baseRev }), JSON.stringify(P14_AUTHORITY)],
+      );
+
+      const wiId = newId("wi");
+      await client.query(
+        `INSERT INTO work_items
+           (id, project_id, rank, intent, boundary, lifecycle, condition, main_effort, version)
+         VALUES ($1, $2, 1, 'Fix the parser', 'artifact', 'proposed', 'healthy', true, 1)`,
+        [wiId, projectId],
+      );
+
+      const fake = new FakeExecutionRuntime();
+
+      // Script leadPlan to return goodPlanOutput and workerAttempt to COMPLETED
+      // with a fake commitId that has no verified artifact row.
+      fake.script(TASK_IDS.leadPlan, () => ({ status: "COMPLETED", output: goodPlanOutput() }));
+      const workerCommitId = "b".repeat(40);
+      // A complete worker output (as the adapter produces it) whose commit has no
+      // verified artifact row: the flow must classify artifact_not_admitted.
+      fake.script(TASK_IDS.workerAttempt, (payload: unknown) => ({
+        status: "COMPLETED",
+        output: workerCompletedOutput((payload as { attemptId: string }).attemptId, {
+          commitId: workerCommitId,
+          diffDigest: `sha256:${"c".repeat(64)}`,
+          changedPaths: ["src/fix.ts"],
+        }),
+      }));
+
+      const deps = makeFlowDeps(pool, fake);
+      const flow = new BoundedRepairFlow(deps);
+
+      // Drive: plan → advance plan → onLeadPlanOutput (creates contract + dispatches worker).
+      const { intentId: planIntentId, runId: planRunId } = await flow.plan(wiId, newId("cmd"));
+      fake.advance(planRunId);
+      fake.advance(planRunId);
+      await flow.onLeadPlanOutput(planIntentId, goodPlanOutput(), newId("cmd"));
+
+      // Get the worker dispatch (should now exist in DB).
+      const { rows: wRows } = await client.query<{ run_id: string }>(
+        "SELECT run_id FROM dispatch_intents WHERE task = $1",
+        [TASK_IDS.workerAttempt],
+      );
+      assert.ok(wRows[0]?.run_id, "worker dispatch_intent must have run_id");
+      const workerRunId = wRows[0]!.run_id;
+
+      // Advance worker run to COMPLETED (QUEUED → EXECUTING → COMPLETED via script).
+      fake.advance(workerRunId);
+      fake.advance(workerRunId);
+
+      // Retrieve the observation and call onWorkerFinal.
+      // No verified artifact row exists → artifact_not_admitted path fires → retry dispatch.
+      const workerObs = await fake.retrieve(workerRunId);
+      await flow.onWorkerFinal(workerObs, newId("cmd"));
+
+      // The retry trigger call must carry payloadVersion: 2, leaseNonce, no repoPath.
+      const triggerCalls = fake.calls.filter(
+        (c) =>
+          c.method === "trigger" && (c.args[0] as { task: string }).task === TASK_IDS.workerAttempt,
+      );
+      // First call = initial dispatch from onLeadPlanOutput; second = retry from onWorkerFinal.
+      assert.ok(
+        triggerCalls.length >= 2,
+        `expected >= 2 worker trigger calls, got ${triggerCalls.length} (X3-7)`,
+      );
+      const retryArg = triggerCalls[1]!.args[0] as { payload: Record<string, unknown> };
+      const retryPayload = retryArg.payload;
+      assert.equal(
+        retryPayload.payloadVersion,
+        2,
+        "retry payload must be payloadVersion: 2 (X3-7)",
+      );
+      assert.ok(
+        typeof retryPayload.leaseNonce === "string" &&
+          (retryPayload.leaseNonce as string).length >= 32,
+        "retry payload must include leaseNonce of at least 32 chars (X3-7)",
+      );
+      assert.ok(!("repoPath" in retryPayload), "mirror retry must not include repoPath (X3-7)");
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P15 / W-9: checkpoint with empty changedPaths admitted
+// ---------------------------------------------------------------------------
+
+test("P15 (W-9): checkpoint with empty changedPaths and real empty-diff digest admitted", async (t) => {
+  if (!DATABASE_URL) {
+    t.skip("DATABASE_URL not set");
+    return;
+  }
+
+  const gitRoot = await mkdtemp(join(tmpdir(), "ahq-pe-p15-gr-"));
+  const base = await makeBaseRepo();
+
+  const schema = `ahq_pe_p15_${process.pid}_${Date.now()}`;
+  const directPool = new pg.Pool({ connectionString: DATABASE_URL });
+  const directClient = await directPool.connect();
+
+  try {
+    await directClient.query(`CREATE SCHEMA ${pg.escapeIdentifier(schema)}`);
+    await runMigrations(directClient, { schema });
+    await directClient.query(`SET search_path TO ${pg.escapeIdentifier(schema)}, public`);
+
+    const projectId = await seedMirrorProject(directClient, `file://${base.repoPath}`);
+    const wiId = await seedWorkItem(directClient, projectId);
+    const contractId = await seedContract(directClient, projectId, wiId, base.baseRev);
+    const attemptId = await seedAttempt(directClient, contractId);
+    const { uploadToken } = await issueUploadLease(directClient, attemptId, 0);
+
+    await ensureMirror({ id: projectId, remote: `file://${base.repoPath}` }, { gitRoot });
+
+    const schemaPool = makeSchemaPool(DATABASE_URL, schema);
+    const app = createApp({
+      pool: schemaPool as never,
+      flow: makeFakeFlow(),
+      reconciler: makeFakeReconciler(),
+      runtime: makeFakeRuntime(),
+      config: makeConfig(gitRoot),
+    });
+
+    // Make a worker clone and compute an empty-diff checkpoint (HEAD = base).
+    const clonePath = await mkdtemp(join(tmpdir(), "ahq-pe-p15-clone-"));
+    try {
+      await git(["clone", `file://${base.repoPath}`, clonePath], tmpdir());
+      await git(["config", "user.email", "test@example.com"], clonePath);
+      await git(["config", "user.name", "Test"], clonePath);
+
+      // Commit HEAD equals base revision — zero-diff checkpoint.
+      const commitId = base.baseRev.trim();
+
+      // Compute empty diff digest (base === commit, so diff is empty string).
+      const emptyDiffDigest = `sha256:${createHash("sha256").update("").digest("hex")}`;
+
+      // Bundle the base commit.
+      const exportRef = bundleRefFor(commitId);
+      await git(["update-ref", exportRef, commitId], clonePath);
+      const bundleTmp = join(tmpdir(), `pe-p15-bundle-${Date.now()}.bundle`);
+      await git(["bundle", "create", bundleTmp, exportRef], clonePath);
+      const bundleBytes = await readFile(bundleTmp);
+      await rm(bundleTmp, { force: true });
+      const bundleSha256 = createHash("sha256").update(bundleBytes).digest("hex");
+
+      const checkpointMeta: ArtifactUploadMeta = {
+        attemptId,
+        generation: 0,
+        kind: "checkpoint",
+        commitId,
+        diffDigest: emptyDiffDigest,
+        changedPaths: [], // empty — valid for checkpoints
+        bundleSha256,
+        bundleBytes: bundleBytes.length,
+      };
+
+      const res = await app.request(`/internal/attempts/${attemptId}/checkpoints`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${uploadToken}`,
+          "X-AgencyHQ-Meta": JSON.stringify(checkpointMeta),
+          "Content-Type": "application/octet-stream",
+        },
+        body: bundleBytes,
+      });
+
+      assert.equal(
+        res.status,
+        201,
+        `checkpoint with empty changedPaths must be admitted 201, got ${res.status}`,
+      );
+
+      // Assert artifact row is kind: checkpoint.
+      const { rows: artRows } = await directClient.query(
+        `SELECT kind FROM attempt_artifacts WHERE attempt_id = $1 AND generation = 0`,
+        [attemptId],
+      );
+      assert.equal(artRows.length, 1, "one artifact row must exist");
+      assert.equal(artRows[0]?.kind, "checkpoint", "artifact row must be kind: checkpoint");
+    } finally {
+      await rm(clonePath, { recursive: true, force: true });
+    }
+
+    await schemaPool.end();
+  } finally {
+    directClient.release();
+    await directPool.end();
+    await rm(gitRoot, { recursive: true, force: true });
+    await rm(base.repoPath, { recursive: true, force: true });
   }
 });

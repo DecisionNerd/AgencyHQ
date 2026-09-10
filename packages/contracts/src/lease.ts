@@ -27,7 +27,10 @@ export type LeasePurpose = z.infer<typeof LeasePurposeSchema>;
 
 export const LeaseRequestSchema = z.object({
   runId: z.string().min(1),
-  attemptId: z.string().min(1),
+  /** Worker-attempt requests carry attemptId; lead.plan requests omit it and carry workItemId instead. */
+  attemptId: z.string().min(1).optional(),
+  /** Lead.plan requests carry workItemId (no attemptId); worker-attempt requests omit it. */
+  workItemId: z.string().min(1).optional(),
   generation: z.number().int().min(0),
   purpose: LeasePurposeSchema,
   /** Random nonce proving the worker knows the current generation. Min 32 chars. */
@@ -174,6 +177,8 @@ export const LeaseRefusalSchema = z.object({
     "unknown_attempt",
     "revoked",
     "unavailable",
+    /** Intent found but run_id not yet written (race window between INSERT and trigger). Retry after a short delay. */
+    "run_pending",
   ]),
 });
 export type LeaseRefusal = z.infer<typeof LeaseRefusalSchema>;

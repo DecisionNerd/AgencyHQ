@@ -103,15 +103,165 @@ export async function issueLeaseBroker(
     },
   } = deps;
 
-  const { runId, attemptId, generation, purpose, nonce } = request;
+  const { runId, attemptId, workItemId, generation, purpose, nonce } = request;
   const nonceHash = sha256hex(nonce);
 
   const client = await pool.connect();
   try {
+    // ---------------------------------------------------------------------------
+    // Lead.plan path (X3-6): request carries workItemId, no attemptId.
+    // Look up the intent by runId (unique after trigger) with attempt_id IS NULL.
+    // Only "provider" and "review" are grantable; generation must be 0.
+    // Leases are stored with attempt_id = intent.id (no FK on leases.attempt_id).
+    // ---------------------------------------------------------------------------
+    if (!attemptId && workItemId) {
+      if (purpose !== "provider" && purpose !== "review") {
+        const refusal: LeaseRefusal = { purpose, reason: "unavailable" };
+        return { ok: false, status: 409, refusal };
+      }
+
+      const { rows: leadIntentRows } = await client.query<{
+        id: string;
+        idempotency_key: string;
+        dispatch_nonce_hash: string | null;
+      }>(
+        `SELECT di.id, di.idempotency_key, di.dispatch_nonce_hash
+         FROM dispatch_intents di
+         WHERE di.run_id = $1
+           AND di.attempt_id IS NULL
+           AND di.status = 'triggered'
+         LIMIT 1`,
+        [runId],
+      );
+
+      const leadIntent = leadIntentRows[0];
+      if (!leadIntent) {
+        // Check for an intent that exists but run_id not yet written (X3-4 race window).
+        const refusal: LeaseRefusal = { purpose, reason: "unknown_run" };
+        return { ok: false, status: 403, refusal };
+      }
+
+      // Verify workItemId is encoded in the idempotency key (format: leadplan:<wid>:<intentId>).
+      const expectedPrefix = `leadplan:${workItemId}:`;
+      if (!leadIntent.idempotency_key.startsWith(expectedPrefix)) {
+        const refusal: LeaseRefusal = { purpose, reason: "unknown_run" };
+        return { ok: false, status: 403, refusal };
+      }
+
+      // Verify nonce (W-1: no null bypass).
+      if (leadIntent.dispatch_nonce_hash === null) {
+        const refusal: LeaseRefusal = { purpose, reason: "unknown_run" };
+        return { ok: false, status: 403, refusal };
+      }
+      if (!verifyNonce(nonce, leadIntent.dispatch_nonce_hash)) {
+        const refusal: LeaseRefusal = { purpose, reason: "unknown_run" };
+        return { ok: false, status: 403, refusal };
+      }
+
+      // Lead.plan leases use intent.id as the effective "attempt_id" for storage.
+      const leadAttemptKey = leadIntent.id;
+      const existingLeases = await findLeasesByAttemptGeneration(client, leadAttemptKey, 0);
+      const existingLease = existingLeases.find(
+        (l) => l.purpose === purpose && l.nonce_hash === nonceHash,
+      );
+      if (existingLease) {
+        if (existingLease.revoked_at !== null) {
+          const refusal: LeaseRefusal = { purpose, reason: "revoked" };
+          return { ok: false, status: 409, refusal };
+        }
+        if (existingLease.expires_at < new Date()) {
+          const refusal: LeaseRefusal = { purpose, reason: "expired" };
+          return { ok: false, status: 409, refusal };
+        }
+        let reissueToken: string | undefined;
+        if (purpose === "provider" || purpose === "review") {
+          if (purpose === "review") {
+            reissueToken = randomHex(32);
+            const reissueHash = sha256hex(reissueToken);
+            await client.query("UPDATE leases SET token_hash = $1 WHERE id = $2", [
+              reissueHash,
+              existingLease.id,
+            ]);
+          }
+        }
+        const grant = await buildGrant(
+          existingLease.id,
+          existingLease.expires_at,
+          purpose,
+          { attemptId: leadAttemptKey, runId, generation: 0 },
+          deps,
+          client,
+          reissueToken,
+        );
+        if (!grant) {
+          const refusal: LeaseRefusal = { purpose, reason: "unavailable" };
+          return { ok: false, status: 409, refusal };
+        }
+        log("[lease] lead.plan idempotent re-issue", { leaseId: existingLease.id, purpose });
+        return { ok: true, grant };
+      }
+
+      // Issue new lease for lead.plan.
+      if (purpose === "provider") {
+        const ps = await providerState();
+        if (ps !== "ready") {
+          const refusal: LeaseRefusal = {
+            purpose,
+            reason:
+              ps === "login_required"
+                ? "login_required"
+                : ps === "expired"
+                  ? "expired"
+                  : "unavailable",
+          };
+          return { ok: false, status: 409, refusal };
+        }
+      }
+
+      const leadTtl = leaseTtlMs;
+      const leadExpiresAt = new Date(Date.now() + leadTtl);
+      const leadLeaseId = `lease_${randomHex(16)}`;
+      const leadUploadToken = purpose === "review" ? randomHex(32) : undefined;
+      const leadTokenHash = leadUploadToken ? sha256hex(leadUploadToken) : undefined;
+
+      await issueLease(client, {
+        id: leadLeaseId,
+        attempt_id: leadAttemptKey,
+        generation: 0,
+        run_id: runId,
+        purpose,
+        nonce_hash: nonceHash,
+        token_hash: leadTokenHash ?? null,
+        expires_at: leadExpiresAt,
+      });
+
+      const leadGrant = await buildGrant(
+        leadLeaseId,
+        leadExpiresAt,
+        purpose,
+        { attemptId: leadAttemptKey, runId, generation: 0 },
+        deps,
+        client,
+        leadUploadToken,
+      );
+      if (!leadGrant) {
+        const refusal: LeaseRefusal = { purpose, reason: "unavailable" };
+        return { ok: false, status: 409, refusal };
+      }
+
+      log("[lease] lead.plan issued", { leaseId: leadLeaseId, purpose });
+      return { ok: true, grant: leadGrant };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Worker.attempt path: attemptId is required.
+    // ---------------------------------------------------------------------------
+    const resolvedAttemptId = attemptId ?? "";
+
     // 1. Load the open dispatch intent
     const { rows: intentRows } = await client.query<{
       id: string;
-      attempt_id: string;
+      attempt_id: string | null;
       run_id: string | null;
       status: string;
       dispatch_nonce_hash: string | null;
@@ -123,11 +273,22 @@ export async function issueLeaseBroker(
          AND di.status = 'triggered'
        ORDER BY di.created_at DESC
        LIMIT 1`,
-      [attemptId, runId],
+      [resolvedAttemptId, runId],
     );
 
     const intent = intentRows[0];
     if (!intent) {
+      // X3-4: check for intent that exists but run_id not yet written (race window).
+      const { rows: pendingRows } = await client.query<{ id: string }>(
+        `SELECT id FROM dispatch_intents
+         WHERE attempt_id = $1 AND run_id IS NULL AND status = 'recorded'
+         LIMIT 1`,
+        [resolvedAttemptId],
+      );
+      if (pendingRows[0]) {
+        const refusal: LeaseRefusal = { purpose, reason: "run_pending" };
+        return { ok: false, status: 409, refusal };
+      }
       const refusal: LeaseRefusal = { purpose, reason: "unknown_attempt" };
       return { ok: false, status: 403, refusal };
     }
@@ -138,7 +299,7 @@ export async function issueLeaseBroker(
       generation: number;
       run_id: string | null;
       status: string;
-    }>(`SELECT id, generation, run_id, status FROM attempts WHERE id = $1`, [attemptId]);
+    }>(`SELECT id, generation, run_id, status FROM attempts WHERE id = $1`, [resolvedAttemptId]);
     const attempt = attemptRows[0];
     if (!attempt) {
       const refusal: LeaseRefusal = { purpose, reason: "unknown_attempt" };
@@ -169,7 +330,11 @@ export async function issueLeaseBroker(
     }
 
     // Check idempotency: return existing lease for same (attempt, generation, purpose, nonce_hash)
-    const existingLeases = await findLeasesByAttemptGeneration(client, attemptId, generation);
+    const existingLeases = await findLeasesByAttemptGeneration(
+      client,
+      resolvedAttemptId,
+      generation,
+    );
     const existingLease = existingLeases.find(
       (l) => l.purpose === purpose && l.nonce_hash === nonceHash,
     );
@@ -198,7 +363,7 @@ export async function issueLeaseBroker(
         existingLease.id,
         existingLease.expires_at,
         purpose,
-        { attemptId, runId, generation },
+        { attemptId: resolvedAttemptId, runId, generation },
         deps,
         client,
         reissueUploadToken,
@@ -236,7 +401,7 @@ export async function issueLeaseBroker(
          JOIN attempts a ON a.contract_id = sc.id
          WHERE a.id = $1 AND project_credentials.purpose = $2
          LIMIT 1`,
-        [attemptId, purpose],
+        [resolvedAttemptId, purpose],
       );
       if (!credRows[0]) {
         const refusal: LeaseRefusal = { purpose, reason: "unavailable" };
@@ -255,7 +420,7 @@ export async function issueLeaseBroker(
 
     await issueLease(client, {
       id: leaseId,
-      attempt_id: attemptId,
+      attempt_id: resolvedAttemptId,
       generation,
       run_id: runId,
       purpose,
@@ -268,7 +433,7 @@ export async function issueLeaseBroker(
       leaseId,
       expiresAt,
       purpose,
-      { attemptId, runId, generation },
+      { attemptId: resolvedAttemptId, runId, generation },
       deps,
       client,
       uploadToken,
