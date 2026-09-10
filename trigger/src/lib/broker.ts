@@ -6,6 +6,8 @@
 //   - Secret values (auth tokens, nonces) are never logged.
 //   - Base URL is read from AGENCYHQ_COORDINATOR_INTERNAL_URL at call time.
 //   - Only idempotent GETs (downloadSourceBundle) are retried; POSTs are not.
+//   - requestLease retries run_pending / unknown_run / unknown_attempt with
+//     bounded backoff (5 attempts, 2 s apart by default, configurable).
 //   - Bounded timeouts on every request (default 30 s; 60 s for bundle DL).
 //
 // No Trigger SDK usage; no direct file-system calls.
@@ -15,14 +17,33 @@ import { createHash } from "node:crypto";
 import type {
   ArtifactUploadMeta,
   LeaseGrant,
+  LeasePurpose,
   LeaseRefusal,
-  LeaseRequest,
   StopEvidenceUpload,
 } from "@agencyhq/contracts";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+/**
+ * Extended lease request type for broker-local use only.
+ *
+ * Adds an optional `workItemId` field for attempt-less intents (e.g. lead.plan
+ * with attempt_id NULL). When present, `attemptId` may be omitted. Purposes
+ * `provider` and `review` only for workItemId-based requests (shared contract).
+ *
+ * Do NOT edit packages/contracts — this is a trigger-local extension that is
+ * structurally compatible with the contracts LeaseRequest.
+ */
+export type LeaseRequestExtended = {
+  runId: string;
+  attemptId?: string;
+  workItemId?: string;
+  generation: number;
+  purpose: LeasePurpose;
+  nonce: string;
+};
 
 /** Result of requestLease: either a grant or a refusal with the HTTP status. */
 export type LeaseResult =
@@ -51,9 +72,10 @@ export type SourceBundleResult = {
 export interface Broker {
   /**
    * POST /internal/leases — request a credential lease.
-   * Never retried. Returns the lease grant or a refusal with its HTTP status.
+   * Retries on run_pending (409), unknown_run, and unknown_attempt with bounded
+   * backoff (5 attempts, 2 s apart by default). Returns grant or final refusal.
    */
-  requestLease(request: LeaseRequest): Promise<LeaseResult>;
+  requestLease(request: LeaseRequestExtended): Promise<LeaseResult>;
 
   /**
    * GET /internal/source/:projectId?rev= — download a source bundle.
@@ -117,12 +139,30 @@ export interface Broker {
 const DEFAULT_TIMEOUT_MS = 30_000;
 const BUNDLE_TIMEOUT_MS = 60_000;
 const MAX_GET_ATTEMPTS = 3;
+const LEASE_MAX_ATTEMPTS = 5;
+const LEASE_RETRY_DELAY_MS = 2_000;
+
+/**
+ * Refusal reasons that are transient and should be retried.
+ * HTTP 409 (run_pending): coordinator has not yet recorded the run id.
+ * unknown_run: run id not found yet (fast container race window).
+ * unknown_attempt: attempt id not found yet.
+ */
+const RETRYABLE_REFUSAL_REASONS = new Set(["run_pending", "unknown_run", "unknown_attempt"]);
 
 /**
  * Create a real Broker pointing at the coordinator internal API.
  * @param baseUrl  e.g. "http://coordinator:3000" (no trailing slash).
+ * @param options  Optional configuration.
+ *   - timeoutMs: per-request timeout in ms (default 30 000).
+ *   - retryDelayMs: delay between retryable lease attempts in ms (default 2 000).
  */
-export function createBroker(baseUrl: string): Broker {
+export function createBroker(
+  baseUrl: string,
+  options?: { timeoutMs?: number; retryDelayMs?: number },
+): Broker {
+  const requestTimeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const retryDelayMs = options?.retryDelayMs ?? LEASE_RETRY_DELAY_MS;
   async function fetchWithTimeout(
     url: string,
     init: RequestInit,
@@ -140,26 +180,44 @@ export function createBroker(baseUrl: string): Broker {
   return {
     async requestLease(request) {
       const url = `${baseUrl}/internal/leases`;
-      const res = await fetchWithTimeout(
-        url,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(request),
-        },
-        DEFAULT_TIMEOUT_MS,
-      );
 
-      const body = (await res.json()) as unknown;
+      for (let attempt = 0; attempt < LEASE_MAX_ATTEMPTS; attempt++) {
+        const res = await fetchWithTimeout(
+          url,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(request),
+          },
+          requestTimeoutMs,
+        );
 
-      if (res.ok) {
-        // Validate as LeaseGrant by checking the expected shape
-        const grant = body as LeaseGrant;
-        return { ok: true, grant };
+        const body = (await res.json()) as unknown;
+
+        if (res.ok) {
+          const grant = body as LeaseGrant;
+          return { ok: true, grant };
+        }
+
+        const refusal = body as LeaseRefusal;
+
+        // Check if this is a retryable transient refusal.
+        // run_pending / unknown_run / unknown_attempt are transient coordinator states.
+        // The HTTP status alone does not determine retryability — check the reason.
+        const isRetryable = RETRYABLE_REFUSAL_REASONS.has(
+          (refusal as { reason?: string }).reason ?? "",
+        );
+
+        if (!isRetryable || attempt >= LEASE_MAX_ATTEMPTS - 1) {
+          return { ok: false, status: res.status, refusal };
+        }
+
+        // Transient failure — wait before retrying.
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
       }
 
-      // Refusal
-      return { ok: false, status: res.status, refusal: body as LeaseRefusal };
+      // Unreachable (loop always returns), but satisfies TypeScript.
+      throw new Error("requestLease: unexpected loop exit");
     },
 
     async downloadSourceBundle({ projectId, rev, token }) {
@@ -246,7 +304,7 @@ export function createBroker(baseUrl: string): Broker {
           },
           body: new Uint8Array(bundleBytes),
         },
-        DEFAULT_TIMEOUT_MS,
+        requestTimeoutMs,
       );
 
       if (!res.ok) {
@@ -273,7 +331,7 @@ export function createBroker(baseUrl: string): Broker {
           },
           body: new Uint8Array(bundleBytes),
         },
-        DEFAULT_TIMEOUT_MS,
+        requestTimeoutMs,
       );
 
       if (!res.ok) {
@@ -300,7 +358,7 @@ export function createBroker(baseUrl: string): Broker {
           },
           body: JSON.stringify(evidence),
         },
-        DEFAULT_TIMEOUT_MS,
+        requestTimeoutMs,
       );
 
       if (!res.ok) {
@@ -324,7 +382,13 @@ export function createBroker(baseUrl: string): Broker {
  * are redacted to prevent secret leakage in test output.
  */
 export type BrokerCall =
-  | { op: "requestLease"; purpose: string; attemptId: string; generation: number }
+  | {
+      op: "requestLease";
+      purpose: string;
+      attemptId: string | undefined;
+      workItemId: string | undefined;
+      generation: number;
+    }
   | { op: "downloadSourceBundle"; projectId: string; rev: string }
   | { op: "downloadAttemptBundle"; attemptId: string; generation: number }
   | { op: "uploadArtifact"; attemptId: string; metaKind: string; bundleBytes: number }
@@ -361,11 +425,12 @@ export class FakeBroker implements Broker {
    */
   leaseRefusal: { reason: string } | undefined = undefined;
 
-  async requestLease(request: LeaseRequest): Promise<LeaseResult> {
+  async requestLease(request: LeaseRequestExtended): Promise<LeaseResult> {
     this.calls.push({
       op: "requestLease",
       purpose: request.purpose,
       attemptId: request.attemptId,
+      workItemId: request.workItemId,
       generation: request.generation,
     });
 
@@ -384,7 +449,9 @@ export class FakeBroker implements Broker {
       };
     }
 
-    const key = `${request.purpose}:${request.attemptId}`;
+    // Key lookup: prefer workItemId over attemptId for workItemId-based requests.
+    const id = request.workItemId ?? request.attemptId ?? "";
+    const key = `${request.purpose}:${id}`;
     const grant = this.grants.get(key);
     if (!grant) {
       return {

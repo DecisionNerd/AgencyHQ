@@ -21,7 +21,7 @@ import { execFile as execFileCb } from "node:child_process";
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { LeadPlanPayload } from "@agencyhq/contracts";
+import type { LeadPlanOutput, LeadPlanPayload, LeadPlanPayloadV2 } from "@agencyhq/contracts";
 import {
   isV2LeadPlanPayload,
   LEAD_OUTPUT_JSON_SCHEMAS,
@@ -30,6 +30,7 @@ import {
   leadAgentPermissions,
 } from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
+import type { Broker } from "../lib/broker.ts";
 import { createBroker } from "../lib/broker.ts";
 import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
 import { scrubbedChildEnv } from "../lib/env.ts";
@@ -90,19 +91,26 @@ export const leadPlan = task({
         (() => {
           throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
         })();
-      // E2 / W-6: request an upload lease using the nonce from the payload.
-      // ctx.run.id (captured as runId above) is the only correct run ID.
+      // X3-6 / W-6: lead-plan intents have attempt_id NULL; use workItemId (not
+      // attemptId) in the lease request per the shared contract. Purpose "review"
+      // gives a bearer token usable for source download. Fail loudly if refused —
+      // no silent empty token that allows source download without authentication.
       const broker = createBroker(coordinatorUrl);
       let uploadToken = "";
       if (payload.leaseNonce) {
         const leaseResult = await broker.requestLease({
           runId,
-          attemptId: payload.workItemId,
+          workItemId: payload.workItemId,
           generation: 0,
-          purpose: "upload",
+          purpose: "review",
           nonce: payload.leaseNonce,
         });
-        if (leaseResult.ok && leaseResult.grant.material.purpose === "upload") {
+        if (!leaseResult.ok) {
+          throw new AbortTaskRunError(
+            `lead.plan: lease refused: ${leaseResult.refusal.reason} — cannot proceed without source access`,
+          );
+        }
+        if (leaseResult.grant.material.purpose === "review") {
           uploadToken = leaseResult.grant.material.token;
         }
       }
@@ -268,3 +276,110 @@ export const leadPlan = task({
     return output;
   },
 });
+
+// ---------------------------------------------------------------------------
+// runLeadPlanV2WithBroker: broker-injectable entry point for the v2 plan path.
+// Exported so tests can exercise the lease + source materialization + core
+// pipeline with FakeBroker and a stub leadPromptFn, without needing env vars.
+// X3-6: throws loudly on lease refusal (no silent empty token).
+// ---------------------------------------------------------------------------
+
+export async function runLeadPlanV2WithBroker(
+  payload: LeadPlanPayloadV2,
+  runId: string,
+  broker: Broker,
+  runRoot: string,
+  opts?: { variant?: string },
+): Promise<LeadPlanOutput> {
+  const variant = opts?.variant ?? process.env.AGENCYHQ_LEAD_VARIANT ?? "low";
+  const env = scrubbedChildEnv({ attemptId: `lead-${payload.workItemId}` });
+  const ruleset = leadAgentPermissions();
+  const schema = LEAD_OUTPUT_JSON_SCHEMAS.leadPlanOutput;
+
+  let uploadToken = "";
+  if (payload.leaseNonce) {
+    const leaseResult = await broker.requestLease({
+      runId,
+      workItemId: payload.workItemId,
+      generation: 0,
+      purpose: "review",
+      nonce: payload.leaseNonce,
+    });
+    if (!leaseResult.ok) {
+      throw new AbortTaskRunError(
+        `lead.plan: lease refused: ${leaseResult.refusal.reason} — cannot proceed without source access`,
+      );
+    }
+    if (leaseResult.grant.material.purpose === "review") {
+      uploadToken = leaseResult.grant.material.token;
+    }
+  }
+
+  const tempParent = join(runRoot, "runs", `lead-${payload.workItemId}-${runId}`);
+  const cloneDir = join(tempParent, "src");
+
+  const sourceResult = await materializeSource({
+    source: payload.source,
+    dir: cloneDir,
+    broker,
+    token: uploadToken,
+  });
+
+  if (!sourceResult.ok) {
+    throw new AbortTaskRunError(
+      `lead.plan source materialization failed: ${sourceResult.failureKind}`,
+    );
+  }
+
+  const clonedDir = sourceResult.clonedDir;
+
+  const v1Payload: LeadPlanPayload = {
+    ...payload,
+    payloadVersion: 1 as const,
+    repoPath: clonedDir,
+    worktreeBase: tempParent,
+  };
+
+  try {
+    const output = await runLeadPlanCore({
+      payload: v1Payload,
+      runId,
+      env,
+      ruleset,
+      schema,
+      leadPromptFn: (input) =>
+        leadPrompt({
+          ...input,
+          variant: typeof variant === "string" ? variant : undefined,
+        }),
+      worktreeAdd: async () => {},
+      worktreeRemove: async () => {},
+      gitLsFiles: async ({ limit }) => {
+        const { stdout } = await execFileAsync("git", ["ls-files"], {
+          cwd: clonedDir,
+          maxBuffer: 16 * 1024 * 1024,
+        });
+        return stdout.trim().split("\n").filter(Boolean).slice(0, limit);
+      },
+      readFile: async (path) => {
+        try {
+          return await readFile(path, "utf8");
+        } catch {
+          return undefined;
+        }
+      },
+      buildPrompt: (p, repoContext) => buildLeadPlanPrompt(p, repoContext),
+      parseOutput: (raw) => {
+        const result = parseWithSchema(LeadPlanOutputSchema, raw);
+        if (result.ok) return result.value;
+        throw new Error(`LeadPlanOutputSchema parse failed: ${result.reason}`);
+      },
+      onPhase: () => {},
+      timeoutMs: 270_000,
+      worktreePath: clonedDir,
+    });
+    return output;
+  } finally {
+    await rm(tempParent, { recursive: true, force: true }).catch(() => undefined);
+  }
+}

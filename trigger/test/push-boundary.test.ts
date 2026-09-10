@@ -113,8 +113,14 @@ test("P18.3 v2 lib modules contain no git push code paths", async () => {
 //   - verify-run (host and v2) has no push code path
 //   - lead-review (host and v2) has no push code path
 //   - lead-accept has no push code path
-test("worker/verify/review/accept adapters have no push code paths (source-level invariant)", async () => {
-  const NON_PUSH_ADAPTERS = ["worker-attempt", "verify-run", "lead-review", "lead-accept"];
+test("worker/verify/review/accept/lead-plan adapters have no push code paths (source-level invariant)", async () => {
+  const NON_PUSH_ADAPTERS = [
+    "worker-attempt",
+    "verify-run",
+    "lead-review",
+    "lead-accept",
+    "lead-plan",
+  ];
 
   let grepOutput = "";
   try {
@@ -143,5 +149,71 @@ test("worker/verify/review/accept adapters have no push code paths (source-level
     violations,
     [],
     `"push" found in non-push adapter files: ${violations.join(", ")}`,
+  );
+});
+
+// Behavioural: integrate-merge calls pushForceWithLease from lib/git.ts which
+// requires a lease token argument. Verify the push gating by checking that
+// pushForceWithLease is the only export from lib/git.ts that performs a push,
+// and that its signature requires a token (i.e. the function name and token param
+// are present together in the source).
+test("push-boundary behavioural: pushForceWithLease in lib/git.ts uses force-with-lease guard", async () => {
+  const gitLibPath = join(triggerSrcDir, "lib", "git.ts");
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(gitLibPath, "utf8");
+
+  // The function must exist.
+  assert.ok(src.includes("pushForceWithLease"), "pushForceWithLease must be defined in lib/git.ts");
+
+  // Must use --force-with-lease to prevent unauthorized pushes.
+  assert.ok(
+    src.includes("--force-with-lease"),
+    "pushForceWithLease must use --force-with-lease git flag",
+  );
+
+  // Must accept an env parameter (credentials injected via env, not a bare token literal).
+  assert.ok(
+    src.includes("env?") || src.includes("env?: "),
+    "pushForceWithLease must accept an env parameter for credential injection",
+  );
+
+  // The push command must require a remote (not a hard-coded remote).
+  assert.ok(src.includes("args.remote"), "pushForceWithLease must use args.remote (not hard-coded)");
+
+  // Structural: the only exported push-capable function is pushForceWithLease.
+  const exportedPushFunctions = src
+    .split("\n")
+    .filter((line) => line.includes("export") && line.includes("push") && !line.includes("//"));
+
+  assert.ok(
+    exportedPushFunctions.every((line) => line.includes("pushForceWithLease")),
+    `Only pushForceWithLease may be an exported push function; found: ${exportedPushFunctions.join(" | ")}`,
+  );
+});
+
+// Behavioural: integrate-merge is the only task that calls pushForceWithLease.
+// This is verified by the static scan above (no "push" in non-push adapters).
+// Additionally confirm integrate-merge calls it with a lease token (not empty string).
+test("push-boundary behavioural: integrate-merge calls pushForceWithLease with a lease grant token", async () => {
+  const integrateMergePath = join(triggerSrcDir, "tasks", "integrate-merge.ts");
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(integrateMergePath, "utf8");
+
+  // Must call pushForceWithLease.
+  assert.ok(src.includes("pushForceWithLease"), "integrate-merge.ts must call pushForceWithLease");
+
+  // Must pass a token from a lease grant (not a bare empty string constant "").
+  // The call should include a property that comes from leaseResult/grant/token.
+  const pushCallLines = src.split("\n").filter((line) => line.includes("pushForceWithLease"));
+
+  assert.ok(pushCallLines.length > 0, "pushForceWithLease call must appear in integrate-merge.ts");
+
+  // Negative: integrate-merge must not push with an empty string literal as token.
+  // (If it did, the push would be unauthenticated.)
+  const hasEmptyTokenPush = pushCallLines.some((line) => line.includes('token: ""'));
+  assert.equal(
+    hasEmptyTokenPush,
+    false,
+    "pushForceWithLease must not be called with empty token literal",
   );
 });

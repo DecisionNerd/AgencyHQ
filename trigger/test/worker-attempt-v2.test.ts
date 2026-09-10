@@ -15,12 +15,13 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import type { LeaseGrant } from "@agencyhq/contracts";
+import type { LeaseGrant, WorkerAttemptPayloadV2 } from "@agencyhq/contracts";
 import { exportAttemptBundle, uploadAttemptArtifact } from "../src/lib/artifact-upload.ts";
 import { FakeBroker } from "../src/lib/broker.ts";
 import { uploadStopEvidence } from "../src/lib/evidence.ts";
 import { prepareRuntime } from "../src/lib/runtime.ts";
 import { materializeSource } from "../src/lib/source.ts";
+import { runWorkerAttemptV2WithBroker } from "../src/tasks/worker-attempt.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -367,5 +368,77 @@ test("P11: broker issuance → exportAttemptBundle → upload → verified row",
     assert.ok(!callsStr.includes(UPLOAD_TOKEN), "upload token must not appear in call records");
   } finally {
     await rm(repoDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// W-16: runWorkerAttemptV2WithBroker is broker-injectable.
+// Proves the exported entry point uses the injected FakeBroker, not createBroker.
+// ---------------------------------------------------------------------------
+
+test("worker-attempt v2 W-16: runWorkerAttemptV2WithBroker uses injected broker and rejects on missing source", async () => {
+  // FakeBroker with no source bundle → materializeSource returns empty bytes → clone fails.
+  const broker = new FakeBroker();
+  const runRoot = await makeTmpDir();
+
+  // Minimal payload shape (host-profile mode: no provider lease needed).
+  // Using a type cast — the function accesses fields directly, not via schema.
+  const payload = {
+    payloadVersion: 2,
+    attemptId: "attempt-w16",
+    generation: 0,
+    contractId: "contract-w16",
+    contractVersion: "1.0.0",
+    source: { projectId: "proj-w16", revision: "a".repeat(40), bundlePath: "source.bundle" },
+    baseRev: "a".repeat(40),
+    prompt: "stub prompt",
+    allowedPaths: ["**"],
+    bounds: {
+      paths: { allow: ["**"], deny: [] },
+      capabilities: { bash: { allow: [], deny: [] }, tools: {} },
+      boundary: { kind: "allow_all" },
+      budget: { maxAttempts: 1, maxDurationSeconds: 60, estimatedSpendUsd: 0 },
+      review: { required: false },
+      changeClass: { kind: "any" },
+      models: { worker: "claude-3-5-sonnet-20241022", reviewer: "claude-3-5-sonnet-20241022" },
+    },
+    permissionRules: { rules: [] },
+    model: "claude-3-5-sonnet-20241022",
+  } as unknown as WorkerAttemptPayloadV2;
+
+  const abortController = new AbortController();
+  const nonceOverride = "n".repeat(32);
+
+  try {
+    // The function should reject because FakeBroker has no source bundle.
+    // prepareRuntime succeeds in host mode without broker calls.
+    // materializeSource gets empty bytes → clone fails → AbortTaskRunError.
+    await assert.rejects(
+      () =>
+        runWorkerAttemptV2WithBroker(
+          payload,
+          "run-w16",
+          abortController.signal,
+          broker,
+          runRoot,
+          nonceOverride,
+        ),
+      (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Any failure from source or model resolution is acceptable.
+        return msg.length > 0;
+      },
+      "runWorkerAttemptV2WithBroker must reject when source bundle unavailable",
+    );
+
+    // Verify the injected broker was actually used (downloadSourceBundle called).
+    const sourceCalls = broker.calls.filter((c) => c.op === "downloadSourceBundle");
+    assert.ok(
+      sourceCalls.length > 0,
+      "broker.downloadSourceBundle must be called (proves injection)",
+    );
+  } finally {
+    abortController.abort();
+    await rm(runRoot, { recursive: true, force: true });
   }
 });

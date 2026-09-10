@@ -31,6 +31,7 @@ import { join } from "node:path";
 import type { WorkerAttemptPayloadV2 } from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
 import { uploadAttemptArtifact } from "../lib/artifact-upload.ts";
+import type { Broker } from "../lib/broker.ts";
 import { createBroker } from "../lib/broker.ts";
 import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
 import { scrubbedChildEnv } from "../lib/env.ts";
@@ -508,10 +509,31 @@ async function runV2(payload: WorkerAttemptPayloadV2, params: any): Promise<Work
   const runRoot = requireEnv("AGENCYHQ_RUN_ROOT");
 
   const broker = createBroker(coordinatorUrl);
+  return runWorkerAttemptV2WithBroker(payload, ctx.run.id, signal, broker, runRoot, nonce);
+}
+
+/**
+ * runWorkerAttemptV2WithBroker — broker-injectable entry point for the v2
+ * worker path (W-16). Accepts an injected broker so tests can run with
+ * FakeBroker without needing coordinator env vars.
+ * No Trigger SDK metadata calls — testable in isolation.
+ */
+export async function runWorkerAttemptV2WithBroker(
+  payload: WorkerAttemptPayloadV2,
+  runId: string,
+  signal: AbortSignal,
+  broker: Broker,
+  runRoot: string,
+  nonceOverride?: string,
+): Promise<WorkerAttemptOutput> {
+  const nonce = nonceOverride ?? payload.leaseNonce;
+  if (nonce === undefined) {
+    throw new AbortTaskRunError("v2 payload without leaseNonce: dispatch did not record a nonce");
+  }
 
   // Step 1: prepareRuntime — provider auth + per-run HOME
   const runtimeResult = await prepareRuntime({
-    runId: ctx.run.id,
+    runId,
     attemptId: payload.attemptId,
     generation: payload.generation,
     nonce,
@@ -531,7 +553,7 @@ async function runV2(payload: WorkerAttemptPayloadV2, params: any): Promise<Work
       ? (uploadLease.material as { purpose: "upload"; token: string }).token
       : "";
 
-  const runDir = join(runRoot, "runs", ctx.run.id);
+  const runDir = join(runRoot, "runs", runId);
   const cloneDir = join(runDir, "src");
 
   try {
@@ -592,7 +614,7 @@ async function runV2(payload: WorkerAttemptPayloadV2, params: any): Promise<Work
     });
 
     // For v2, repoPath === clonedDir (clone is the standalone repo; no host repo).
-    registerRunState(RUN_STATES, ctx.run.id, {
+    registerRunState(RUN_STATES, runId, {
       pid,
       pgid,
       worktreePath: clonedDir,
@@ -616,11 +638,11 @@ async function runV2(payload: WorkerAttemptPayloadV2, params: any): Promise<Work
 
     const onAbort = () => {
       void stopEvidence(runDir)({ at: new Date().toISOString(), step: "abort_signal" });
-      abortState.stopPromise = checkpointAndKill(RUN_STATES, ctx.run.id, "kill-first", stopDeps);
+      abortState.stopPromise = checkpointAndKill(RUN_STATES, runId, "kill-first", stopDeps);
     };
     signal.addEventListener("abort", onAbort, { once: true });
 
-    const maxDurationSeconds = ctx.run.maxDuration ?? 600;
+    const maxDurationSeconds = 600;
     const softDeadlineMs =
       Math.max(SOFT_DEADLINE_MIN_SECONDS, maxDurationSeconds - SOFT_DEADLINE_MARGIN_SECONDS) * 1000;
     const softTimer = setTimeout(() => {
@@ -631,7 +653,7 @@ async function runV2(payload: WorkerAttemptPayloadV2, params: any): Promise<Work
         maxDurationSeconds,
         softDeadlineMs,
       });
-      abortState.stopPromise = checkpointAndKill(RUN_STATES, ctx.run.id, "kill-first", stopDeps);
+      abortState.stopPromise = checkpointAndKill(RUN_STATES, runId, "kill-first", stopDeps);
     }, softDeadlineMs);
 
     const exitCode = await new Promise<number | null>((resolve) => {

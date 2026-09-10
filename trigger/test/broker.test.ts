@@ -321,45 +321,41 @@ test("createBroker: requestLease maps JSON 403 body to typed LeaseRefusal", asyn
   }
 });
 
-test("createBroker: AbortController aborts a hung request (bounded timeout mechanism)", async () => {
-  // This test verifies the AbortController mechanism used by fetchWithTimeout.
-  // We manually abort a fetch with a tiny timeout, same way the broker does
-  // internally with DEFAULT_TIMEOUT_MS, and assert an AbortError is thrown.
+test("createBroker: requestLease aborts via timeoutMs option (bounded timeout)", async () => {
+  // X3-4 / W2 wire: createBroker accepts a timeoutMs option; a stub server that
+  // never responds causes the lease call to reject with AbortError within that
+  // bounded window.  This proves the option is wired into fetchWithTimeout.
   const stub = await makeStubServer((_req, _res) => {
-    // Intentionally never respond.
+    // Intentionally never respond — forces the timeout to fire.
   });
 
   try {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 50);
-
-    const fetchCall = fetch(`${stub.baseUrl}/internal/leases`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        runId: "r",
-        attemptId: "a",
-        generation: 0,
-        purpose: "upload",
-        nonce: "n".repeat(32),
-      }),
-      signal: controller.signal,
-    });
+    // Use a very short timeout so the test runs fast.
+    const broker = createBroker(stub.baseUrl, { timeoutMs: 50 });
 
     await assert.rejects(
-      () => fetchCall,
+      () =>
+        broker.requestLease({
+          runId: "r",
+          attemptId: "a",
+          generation: 0,
+          purpose: "upload",
+          nonce: "n".repeat(32),
+        }),
       (err: unknown) => {
         const e = err as { name?: string; code?: string };
         return e.name === "AbortError" || e.code === "ABORT_ERR";
       },
-      "fetch with AbortSignal must reject with AbortError when controller fires",
+      "requestLease with timeoutMs:50 must reject with AbortError on a hung server",
     );
   } finally {
     stub.close();
   }
 });
 
-test("createBroker: requestLease POST is never retried (single attempt only)", async () => {
+test("createBroker: requestLease does not retry non-retryable reason (unavailable)", async () => {
+  // X3-4: only run_pending / unknown_run / unknown_attempt are retried.
+  // "unavailable" is non-retryable → single attempt, refusal surfaced.
   let callCount = 0;
 
   const stub = await makeStubServer(async (req, res) => {
@@ -371,15 +367,65 @@ test("createBroker: requestLease POST is never retried (single attempt only)", a
   });
 
   try {
-    const broker = createBroker(stub.baseUrl);
-    await broker.requestLease({
+    const broker = createBroker(stub.baseUrl, { retryDelayMs: 10 });
+    const result = await broker.requestLease({
       runId: "run-no-retry",
       attemptId: "attempt-no-retry",
       generation: 0,
       purpose: "upload",
       nonce: "c".repeat(32),
     });
-    assert.equal(callCount, 1, "POST requestLease must be called exactly once (no retry)");
+    assert.equal(callCount, 1, "unavailable refusal must not be retried");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.refusal.reason, "unavailable");
+    }
+  } finally {
+    stub.close();
+  }
+});
+
+test("createBroker: requestLease retries run_pending (409) and grants on 3rd attempt", async () => {
+  // X3-4: run_pending is a retryable transient state; broker retries up to 5 times.
+  // First two responses return 409 run_pending, third returns a grant.
+  let callCount = 0;
+
+  const grant = {
+    leaseId: "lease-retry-1",
+    purpose: "upload",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    material: { purpose: "upload", token: "retry-tok" },
+  };
+
+  const stub = await makeStubServer(async (req, res) => {
+    callCount++;
+    await readBody(req);
+    if (callCount < 3) {
+      const refusal = { purpose: "upload", reason: "run_pending" };
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(refusal));
+    } else {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(grant));
+    }
+  });
+
+  try {
+    // Use retryDelayMs: 5 so the test doesn't take 10 s.
+    const broker = createBroker(stub.baseUrl, { retryDelayMs: 5 });
+    const result = await broker.requestLease({
+      runId: "run-retry",
+      attemptId: "attempt-retry",
+      generation: 0,
+      purpose: "upload",
+      nonce: "d".repeat(32),
+    });
+
+    assert.equal(callCount, 3, "must attempt exactly 3 times (2 retries)");
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.grant.leaseId, "lease-retry-1");
+    }
   } finally {
     stub.close();
   }

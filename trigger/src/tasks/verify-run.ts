@@ -10,17 +10,22 @@
 //   - This task reads nothing from the worker's report.
 //   - The verify worktree is removed in a finally block; the attempt worktree is retained.
 
-import { rm } from "node:fs/promises";
-import { join } from "node:path";
-import type { VerifyRunOutput } from "@agencyhq/contracts";
+import { mkdir, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import type { VerifyRunOutput, VerifyRunPayloadV2 } from "@agencyhq/contracts";
 import { isV2VerifyRunPayload, VerifyRunPayloadAnySchema } from "@agencyhq/contracts";
 import { buildVerificationResult, environmentFingerprint, runCheck } from "@agencyhq/verification";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
+import type { Broker } from "../lib/broker.ts";
 import { createBroker } from "../lib/broker.ts";
 import { scrubbedChildEnv } from "../lib/env.ts";
 import { changedPaths, diffDigest, worktreeAdd, worktreeRemove } from "../lib/git.ts";
 import { materializeSource } from "../lib/source.ts";
-import type { RunProfileInput, VerificationRunner } from "./verify-run-core.ts";
+import type {
+  RunProfileInput,
+  RunVerificationOutput,
+  VerificationRunner,
+} from "./verify-run-core.ts";
 import { runVerification } from "./verify-run-core.ts";
 
 // ---------------------------------------------------------------------------
@@ -112,84 +117,19 @@ export const verifyRun = task({
           throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
         })();
       const broker = createBroker(coordinatorUrl);
-      const cloneDir = join(runRoot, "runs", `verify-${payload.attemptId}`, "src");
-
-      // E2 / X2-2 / W-6: use ctx.run.id for the lease request. TRIGGER_RUN_ID is
-      // not set by the Trigger.dev SDK 4.5 runtime; ctx.run.id is the correct value.
-      let uploadToken = "";
-      if (payload.leaseNonce) {
-        const leaseResult = await broker.requestLease({
-          runId: ctx.run.id as string,
-          attemptId: payload.attemptId,
-          generation: payload.generation,
-          purpose: "upload",
-          nonce: payload.leaseNonce,
-        });
-        if (leaseResult.ok && leaseResult.grant.material.purpose === "upload") {
-          uploadToken = leaseResult.grant.material.token;
-        }
-      }
-
-      const sourceResult = await materializeSource({
-        source: { ...payload.source, revision: payload.attemptRevision },
-        dir: cloneDir,
+      const env = scrubbedChildEnv({ attemptId: payload.attemptId });
+      const runner = createRealRunner(env);
+      signal.addEventListener("abort", () => runner.abort?.(), { once: true });
+      const output = await runVerifyV2WithBroker(
+        payload,
+        ctx.run.id as string,
         broker,
-        token: uploadToken,
-      });
-
-      if (!sourceResult.ok) {
-        throw new AbortTaskRunError(
-          `verify source materialization failed: ${sourceResult.failureKind}`,
-        );
-      }
-
-      const clonedDir = sourceResult.clonedDir;
-
-      try {
-        const env = scrubbedChildEnv({ attemptId: payload.attemptId });
-        const runner = createRealRunner(env);
-        signal.addEventListener("abort", () => runner.abort?.(), { once: true });
-        metadata.set("phase", "integrity_checked");
-
-        // Synthesize a v1-compatible payload for runVerification (which expects
-        // repoPath and worktreeBase). The actual worktree path is overridden via
-        // deps.worktreePath so these placeholder values are unused for git ops.
-        const v1Payload = {
-          ...payload,
-          repoPath: clonedDir,
-          worktreeBase: clonedDir,
-          payloadVersion: 1 as const,
-        };
-
-        const output = await runVerification(v1Payload, {
-          worktreeAdd: async () => {
-            // v2: clone is already materialized; no worktree needed.
-          },
-          worktreeRemove: async () => {
-            // v2: cleanup handled in finally.
-          },
-          diffDigest: async (args) => {
-            const hex = await diffDigest({
-              worktreePath: clonedDir,
-              baseRev: args.baseRev,
-            });
-            return hex;
-          },
-          changedPaths: (args) => changedPaths({ worktreePath: clonedDir, baseRev: args.baseRev }),
-          runner,
-          fingerprint: buildFingerprint,
-          now: () => new Date().toISOString(),
-          // Override worktree path with the clone dir.
-          worktreePath: clonedDir,
-        });
-
-        metadata.set("phase", "done");
-        metadata.set("integrity", output.integrity);
-        const { diffDigestMatches: _dm, ...contractIntegrity } = output.integrity;
-        return { results: output.results, integrity: contractIntegrity };
-      } finally {
-        await rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
-      }
+        runRoot,
+        runner,
+      );
+      metadata.set("phase", "done");
+      metadata.set("integrity", output.integrity);
+      return { results: output.results, integrity: output.integrity };
     }
 
     // Extract coordinator-supplied manifest extension fields from the raw payload.
@@ -251,3 +191,143 @@ export const verifyRun = task({
     return { results: output.results, integrity: contractIntegrity };
   },
 });
+
+// ---------------------------------------------------------------------------
+// runVerifyV2WithBroker — broker-injectable entry point (W-16).
+//
+// Materializes the main source and any manifest sibling sources using the
+// broker (W-15: no manifestRepoPaths read on v2), then runs verification.
+// No Trigger SDK metadata calls — testable in isolation with FakeBroker.
+// ---------------------------------------------------------------------------
+
+export type RunVerifyV2Output = Pick<RunVerificationOutput, "results" | "integrity">;
+
+export async function runVerifyV2WithBroker(
+  payload: VerifyRunPayloadV2,
+  runId: string,
+  broker: Broker,
+  runRoot: string,
+  runner: VerificationRunner,
+): Promise<RunVerifyV2Output> {
+  const runDir = join(runRoot, "runs", `verify-${payload.attemptId}`);
+  const cloneDir = join(runDir, "src");
+
+  // Request upload lease for authenticated source downloads.
+  let uploadToken = "";
+  if (payload.leaseNonce) {
+    const leaseResult = await broker.requestLease({
+      runId,
+      attemptId: payload.attemptId,
+      generation: payload.generation,
+      purpose: "upload",
+      nonce: payload.leaseNonce,
+    });
+    if (leaseResult.ok && leaseResult.grant.material.purpose === "upload") {
+      uploadToken = leaseResult.grant.material.token;
+    }
+  }
+
+  // Materialize main source at attemptRevision.
+  const sourceResult = await materializeSource({
+    source: { ...payload.source, revision: payload.attemptRevision },
+    dir: cloneDir,
+    broker,
+    token: uploadToken,
+  });
+
+  if (!sourceResult.ok) {
+    throw new Error(`verify source materialization failed: ${sourceResult.failureKind}`);
+  }
+
+  const clonedDir = sourceResult.clonedDir;
+
+  // W-15: Materialize manifest sibling sources using the broker (no manifestRepoPaths).
+  // Each sibling is cloned into ${runDir}/siblings/${position} then used as the
+  // repoPath for worktreeAdd to create the actual sibling worktree.
+  let manifestRepoPaths: Record<string, string> | undefined;
+  const siblingCloneDirs: string[] = [];
+
+  if (payload.manifest && payload.manifest.entries.length > 0) {
+    const siblingBaseDir = join(runDir, "siblings");
+    await mkdir(siblingBaseDir, { recursive: true });
+    manifestRepoPaths = {};
+
+    for (const entry of payload.manifest.entries) {
+      // Skip the main project (already materialized above).
+      if (entry.projectId === payload.source.projectId) continue;
+
+      const rev = entry.resultRevision ?? entry.expectedBaseRevision;
+      const siblingCloneDir = join(siblingBaseDir, String(entry.position));
+
+      const sibResult = await materializeSource({
+        source: {
+          projectId: entry.projectId,
+          revision: rev,
+          bundlePath: "source.bundle",
+        },
+        dir: siblingCloneDir,
+        broker,
+        token: uploadToken,
+      });
+
+      if (!sibResult.ok) {
+        throw new Error(
+          `verify manifest sibling ${entry.projectId} materialization failed: ${sibResult.failureKind}`,
+        );
+      }
+
+      manifestRepoPaths[entry.projectId] = sibResult.clonedDir;
+      siblingCloneDirs.push(sibResult.clonedDir);
+    }
+  }
+
+  try {
+    // Synthesize a v1-compatible payload. worktreeBase set to runDir so
+    // the core's manifestDir is ${runDir}/manifest-... (outside clone).
+    const v1Payload = {
+      ...payload,
+      repoPath: clonedDir,
+      worktreeBase: runDir,
+      payloadVersion: 1 as const,
+    };
+
+    const output = await runVerification(v1Payload, {
+      // Main worktreeAdd: no-op when repoPath === worktreePath (clone IS the worktree).
+      // Sibling worktreeAdd: real add from sibling clone into manifestDir/${position}.
+      // Ensure parent of worktreePath exists (git worktree add does not create grandparents).
+      worktreeAdd: async (args) => {
+        if (args.repoPath === args.worktreePath) {
+          return; // no-op: main clone is already at worktreePath
+        }
+        await mkdir(dirname(args.worktreePath), { recursive: true });
+        await worktreeAdd(args);
+      },
+      worktreeRemove: async () => {
+        // v2: sibling worktrees are inside runDir; cleaned up in finally.
+      },
+      diffDigest: async (args) => {
+        const hex = await diffDigest({
+          worktreePath: clonedDir,
+          baseRev: args.baseRev,
+        });
+        return hex;
+      },
+      changedPaths: (args) => changedPaths({ worktreePath: clonedDir, baseRev: args.baseRev }),
+      runner,
+      fingerprint: buildFingerprint,
+      now: () => new Date().toISOString(),
+      // Override worktree path with the clone dir (repoPath === worktreePath → no-op above).
+      worktreePath: clonedDir,
+      ...(manifestRepoPaths !== undefined
+        ? {
+            manifestProjectId: payload.source.projectId,
+            manifestRepoPaths,
+          }
+        : {}),
+    });
+
+    return { results: output.results, integrity: output.integrity };
+  } finally {
+    await rm(runDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}

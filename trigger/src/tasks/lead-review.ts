@@ -14,8 +14,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { LeadReviewPayload, LeadReviewPayloadV2 } from "@agencyhq/contracts";
-import { isV2LeadReviewPayload, LeadReviewPayloadAnySchema } from "@agencyhq/contracts";
+import {
+  bundleRefFor,
+  isV2LeadReviewPayload,
+  LeadReviewPayloadAnySchema,
+} from "@agencyhq/contracts";
 import { AbortTaskRunError, metadata, task } from "@trigger.dev/sdk";
+import type { Broker } from "../lib/broker.ts";
 import { createBroker } from "../lib/broker.ts";
 import { classifyCapacity, providerFromModel } from "../lib/capacity.ts";
 import { worktreeAdd, worktreeRemove } from "../lib/git.ts";
@@ -56,9 +61,9 @@ export const leadReview = task({
   queue: { name: "lead", concurrencyLimit: 1 },
   retry: { maxAttempts: 1 },
 
-  // biome-ignore lint/suspicious/noExplicitAny: ctx shape is opaque from Trigger SDK
   run: async (
     rawPayload: unknown,
+    // biome-ignore lint/suspicious/noExplicitAny: ctx shape is opaque from Trigger SDK
     { ctx }: any,
   ): Promise<ReviewTaskOutput & { reviewerModel: string }> => {
     // Validate with the union schema (accepts v1 and v2).
@@ -81,7 +86,38 @@ export const leadReview = task({
 
     // v2 path: materialize source from coordinator bundle, compute diff in clone.
     if (isV2LeadReviewPayload(payload)) {
-      return runReviewV2(payload, variant, ctx.run.id as string);
+      const coordinatorUrl =
+        process.env.AGENCYHQ_COORDINATOR_INTERNAL_URL ??
+        (() => {
+          throw new AbortTaskRunError("missing AGENCYHQ_COORDINATOR_INTERNAL_URL");
+        })();
+      const runRoot =
+        process.env.AGENCYHQ_RUN_ROOT ??
+        (() => {
+          throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
+        })();
+      const v2Result = await runReviewV2WithBroker(
+        payload,
+        variant,
+        ctx.run.id as string,
+        createBroker(coordinatorUrl),
+        runRoot,
+      );
+      if ("kind" in v2Result && v2Result.kind === "invalid_output") {
+        metadata.set("phase", "invalid_output");
+        const syntheticEvent = { type: "error", error: { message: v2Result.reason } };
+        const capacity = classifyCapacity([syntheticEvent], {
+          provider: providerFromModel(payload.model),
+          model: payload.model,
+          now: new Date(),
+        });
+        if (capacity !== null) {
+          metadata.set("capacity", capacity);
+        }
+      } else {
+        metadata.set("phase", "done");
+      }
+      return v2Result;
     }
 
     // v1 path: host filesystem repo and patchPath.
@@ -119,29 +155,23 @@ export const leadReview = task({
 });
 
 // ---------------------------------------------------------------------------
-// runReviewV2: materialize source from coordinator bundle, run review in clone.
+// runReviewV2WithBroker: broker-injectable entry point for the v2 review path.
+// Accepts an injected broker so tests can run with FakeBroker without needing
+// coordinator env vars. No Trigger SDK metadata calls — testable in isolation.
 // ---------------------------------------------------------------------------
 
-async function runReviewV2(
+export async function runReviewV2WithBroker(
   payload: LeadReviewPayloadV2,
   variant: string,
   runId: string,
+  broker: Broker,
+  runRoot: string,
 ): Promise<ReviewTaskOutput & { reviewerModel: string }> {
-  const coordinatorUrl =
-    process.env.AGENCYHQ_COORDINATOR_INTERNAL_URL ??
-    (() => {
-      throw new AbortTaskRunError("missing AGENCYHQ_COORDINATOR_INTERNAL_URL");
-    })();
-  const runRoot =
-    process.env.AGENCYHQ_RUN_ROOT ??
-    (() => {
-      throw new AbortTaskRunError("missing AGENCYHQ_RUN_ROOT");
-    })();
-
   // E2 / X2-2: use ctx.run.id (passed as runId) to request the review lease.
   // E7 / W-10: request a review-purpose lease (not upload) — the review task
   // only needs to download bundles, not upload artifacts.
-  const broker = createBroker(coordinatorUrl);
+  // X3-3: the attempt bundle uses refs/agencyhq/export/<commitId> — use
+  // bundleRefFor(commitId) returned by downloadAttemptBundle, not the attempt ref.
   let reviewToken = "";
   if (payload.leaseNonce) {
     const leaseResult = await broker.requestLease({
@@ -187,9 +217,12 @@ async function runReviewV2(
     });
     bundleTmpPath = join(tmpdir(), `agencyhq-review-${payload.attemptId}-${Date.now()}.bundle`);
     await writeFile(bundleTmpPath, bundleResult.bundleBytes);
-    // Fetch the attempt ref into the clone so base..attempt diff works.
-    const attemptRef = `refs/agencyhq/attempts/${payload.patch.attemptId}/g${payload.patch.generation}/attempt`;
-    await execFileAsync("git", ["fetch", bundleTmpPath, `${attemptRef}:${attemptRef}`], {
+    // X3-3: the coordinator exports the bundle with refs/agencyhq/export/<commitId>
+    // (bundleRefFor), NOT refs/agencyhq/attempts/.../attempt. Fetch that ref into
+    // the base clone under a local label so base..attempt diff works.
+    const exportRef = bundleRefFor(bundleResult.commitId);
+    const localAttemptRef = `refs/agencyhq/attempts/${payload.patch.attemptId}/g${payload.patch.generation}/attempt`;
+    await execFileAsync("git", ["fetch", bundleTmpPath, `${exportRef}:${localAttemptRef}`], {
       cwd: clonedDir,
     });
   } catch (err) {
@@ -201,8 +234,6 @@ async function runReviewV2(
   }
 
   try {
-    metadata.set("phase", "source_materialized");
-
     // Synthesize a v1-compatible payload. repoPath and worktreeBase reference
     // the clone dir; patchPath is a placeholder (not read by the core — the core
     // computes the diff via gitDiff then writes it to runDir/attempt.patch).
@@ -229,21 +260,6 @@ async function runReviewV2(
       // Override worktree path: the lead session runs in the clone dir.
       worktreePath: clonedDir,
     });
-
-    if ("kind" in result && result.kind === "invalid_output") {
-      metadata.set("phase", "invalid_output");
-      const syntheticEvent = { type: "error", error: { message: result.reason } };
-      const capacity = classifyCapacity([syntheticEvent], {
-        provider: providerFromModel(payload.model),
-        model: payload.model,
-        now: new Date(),
-      });
-      if (capacity !== null) {
-        metadata.set("capacity", capacity);
-      }
-    } else {
-      metadata.set("phase", "done");
-    }
 
     return result;
   } finally {

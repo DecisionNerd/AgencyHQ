@@ -14,10 +14,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import type { LeadPlanOutput, LeadPlanPayload } from "@agencyhq/contracts";
+import type { LeadPlanOutput, LeadPlanPayload, LeadPlanPayloadV2 } from "@agencyhq/contracts";
 import { HOST_TRIAL_AUTHORITY, leadAgentPermissions } from "@agencyhq/contracts";
 import { FakeBroker } from "../src/lib/broker.ts";
 import { materializeSource } from "../src/lib/source.ts";
+import { runLeadPlanV2WithBroker } from "../src/tasks/lead-plan.ts";
 import type { LeadPromptFn } from "../src/tasks/lead-plan-core.ts";
 import { runLeadPlanCore } from "../src/tasks/lead-plan-core.ts";
 
@@ -197,5 +198,52 @@ test("lead-plan v2: gitLsFiles from clone lists tracked files", async () => {
     assert.ok(!filesStr.includes("/home/"), "no linux home paths in file list");
   } finally {
     await rm(cloneDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// X3-6: runLeadPlanV2WithBroker fails loudly on lease refusal.
+// ---------------------------------------------------------------------------
+
+test("lead-plan v2 X3-6: runLeadPlanV2WithBroker throws on lease refusal (no silent empty token)", async () => {
+  // FakeBroker with no grant → requestLease returns unavailable refusal.
+  const broker = new FakeBroker();
+  const runRoot = await makeTmpDir();
+
+  // Minimal LeadPlanPayloadV2: leaseNonce triggers the lease request.
+  const payload: LeadPlanPayloadV2 = {
+    payloadVersion: 2,
+    workItemId: "work-plan-x3-6",
+    projectId: "proj-x3-6",
+    baseRevision: "a".repeat(40),
+    authority: HOST_TRIAL_AUTHORITY,
+    operatorIntent: "Test loud failure on lease refusal.",
+    model: "claude-3-5-sonnet-20241022",
+    source: { projectId: "proj-x3-6", revision: "a".repeat(40), bundlePath: "source.bundle" },
+    leaseNonce: "n".repeat(32),
+  };
+
+  try {
+    await assert.rejects(
+      () => runLeadPlanV2WithBroker(payload, "run-x3-6", broker, runRoot),
+      (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        return msg.includes("lease refused");
+      },
+      "runLeadPlanV2WithBroker must throw with 'lease refused' when FakeBroker has no grant",
+    );
+
+    // Verify the lease was actually attempted.
+    const leaseCall = broker.calls.find((c) => c.op === "requestLease");
+    assert.ok(leaseCall, "requestLease must have been called");
+    if (leaseCall?.op === "requestLease") {
+      assert.equal(
+        leaseCall.workItemId,
+        "work-plan-x3-6",
+        "workItemId passed in lease request (X3-6)",
+      );
+    }
+  } finally {
+    await rm(runRoot, { recursive: true, force: true });
   }
 });
